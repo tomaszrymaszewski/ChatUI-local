@@ -1,15 +1,45 @@
-import { useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ArrowUp,
-  Brain,
-  FileText,
-  HatGlasses,
+  ArrowLeft,
   Paperclip,
-  Sparkles,
+  ChartColumnBig,
+  Check,
+  ClockFading,
+  Copy,
+  ChevronDown,
+  ChevronRight,
+  Image as ImageIcon,
+  Microscope,
+  MessageSquare,
+  MoreHorizontal,
+  Pencil,
+  Plus,
+  Puzzle,
+  ScrollText,
+  GalleryVerticalEnd,
+  Search,
+  Share,
+  FolderPlus,
+  FileText,
+  Trash2,
   X,
+  RotateCcw,
+  ChevronLeft,
+  SquareTerminal,
+  Brain,
+  Globe,
+  CloudSun,
+  Clock,
+  Calendar,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/app-sidebar";
+import { AgentView } from "@/components/AgentView";
+import { MarkdownRenderer } from "@/components/markdown-renderer";
+import { SettingsDialog } from "@/pages/settings";
+import { InteractiveGrid } from "@/components/interactive-grid";
 import {
   Attachment,
   AttachmentAction,
@@ -20,18 +50,46 @@ import {
   AttachmentMedia,
   AttachmentTitle,
 } from "@/components/ui/attachment";
-import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuShortcut,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   InputGroup,
   InputGroupAddon,
   InputGroupButton,
   InputGroupTextarea,
 } from "@/components/ui/input-group";
+import { Input } from "@/components/ui/input";
+import { Separator } from "@/components/ui/separator";
+import { ScrollArea } from "@/components/ui/scroll-area";
 import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import {
   Message,
-  MessageAvatar,
   MessageContent,
   MessageFooter,
 } from "@/components/ui/message";
@@ -56,12 +114,23 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
-import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import type {
-  ChatSession,
   Message as ChatMessage,
   MessageAttachment,
 } from "@/types";
+import { useSessions } from "@/hooks/use-sessions";
+import { useMessages } from "@/hooks/use-messages";
+import { useProjects } from "@/hooks/use-projects";
+import { useProviders } from "@/hooks/use-providers";
+import { useUserSettings } from "@/hooks/use-user-settings";
+import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage } from "@/lib/llm";
+import { getAllTools } from "@/lib/tools";
+import {
+  buildMessageTree,
+  getActivePath,
+  getSiblings,
+} from "@/lib/message-tree";
 
 function generateId() {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
@@ -81,56 +150,176 @@ function formatBytes(bytes: number) {
   return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-const WELCOME_MESSAGE: ChatMessage = {
-  id: generateId(),
-  role: "assistant",
-  content: "Hello! How can I help you today?",
-  timestamp: new Date(),
-};
-
-const initialSessions: ChatSession[] = [
-  {
-    id: generateId(),
-    title: "Project ideas",
-    updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 2),
-  },
-  {
-    id: generateId(),
-    title: "SwiftUI tips",
-    updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 24),
-  },
+const WELCOME_PROMPTS = [
+  "What do you want to know?",
+  "What's on your mind?",
+  "Something you want to learn?",
+  "What are we tackling today?",
+  "Curious about something?",
+  "What's brewing in that brain of yours?",
+  "Hit me with your best question.",
+  "What's the next big idea?",
+  "Ready when you are. What's up?",
+  "What mystery shall we unravel?",
+  "Got a question? Fire away.",
+  "What's keeping you up at night?",
+  "Ready to bend some neurons?",
+  "What existential crisis are we solving today?",
+  "Let's go down a rabbit hole. Which one?",
+  "What's the riddle today?",
+  "What's worth exploring right now?",
+  "Ask away, the floor is yours.",
 ];
 
-const initialAgentSessions: ChatSession[] = [
-  {
-    id: generateId(),
-    title: "Code Review Agent",
-    updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 3),
-  },
-  {
-    id: generateId(),
-    title: "Data Analysis Agent",
-    updatedAt: new Date(Date.now() - 1000 * 60 * 60 * 8),
-  },
+const SKILLS = [
+  { id: "web-search", name: "Web Search", Icon: Search },
+  { id: "code-interpreter", name: "Code Interpreter", Icon: FileText },
+  { id: "image-gen", name: "Image Generation", Icon: ImageIcon },
+  { id: "data-analysis", name: "Data Analysis", Icon: ChartColumnBig },
+];
+
+const ALWAYS_ON_TOOLS_INFO = [
+  { name: "Time", Icon: Clock },
+  { name: "Date", Icon: Calendar },
+  { name: "Weather", Icon: CloudSun },
 ];
 
 export function ChatView() {
-  const [sessions, setSessions] = useState<ChatSession[]>(initialSessions);
-  const [agentSessions, setAgentSessions] = useState<ChatSession[]>(initialAgentSessions);
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<ChatMessage[]>([WELCOME_MESSAGE]);
+  const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
+  const { sessions, createSession, deleteSession, updateSession } =
+    useSessions(activeTab);
+  const { sessions: agentSessions } = useSessions("agent");
+  const { projects, createProject, updateProject, deleteProject, addProjectFile, deleteProjectFile, addProjectImage, deleteProjectImage, refetch: refetchProjects } =
+    useProjects();
+  const { providers } = useProviders();
+  const { settings } = useUserSettings();
+
+  const [activeSessionByTab, setActiveSessionByTab] = useState<
+    Record<"chat" | "agent", string | null>
+  >({ chat: null, agent: null });
+  const activeSessionId = activeSessionByTab[activeTab] ?? null;
+  const setActiveSessionId = useCallback(
+    (id: string | null) =>
+      setActiveSessionByTab((prev) => ({ ...prev, [activeTab]: id })),
+    [activeTab],
+  );
+  const { messages, addMessage, deleteTemporaryMessages } = useMessages(activeSessionId);
   const [inputText, setInputText] = useState("");
   const [files, setFiles] = useState<MessageAttachment[]>([]);
   const [isThinking, setIsThinking] = useState(false);
-  const [model, setModel] = useState("GPT-4o");
-  const [reasoning, setReasoning] = useState(false);
+  const [streamingContent, setStreamingContent] = useState("");
+  const [streamingReasoning, setStreamingReasoning] = useState("");
+  const [showThinkingProcess, setShowThinkingProcess] = useState(false);
+  const [webFetchEnabled, setWebFetchEnabled] = useState(true);
+  const [isEditingTitle, setIsEditingTitle] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [welcomePrompt, setWelcomePrompt] = useState(
+    () => WELCOME_PROMPTS[Math.floor(Math.random() * WELCOME_PROMPTS.length)],
+  );
+  const [isTemporary, setIsTemporary] = useState(false);
+  const [isResearch, setIsResearch] = useState(false);
+  const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
+  const [projectsOpen, setProjectsOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [projectSearch, setProjectSearch] = useState("");
+  const [historySearch, setHistorySearch] = useState("");
+  const [projectInputText, setProjectInputText] = useState("");
+  const [selectedModel, setSelectedModel] = useState<string>("");
+  const [abortController, setAbortController] =
+    useState<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
+  const [selectedChildMap, setSelectedChildMap] = useState<
+    Map<string | null, string>
+  >(new Map());
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+  const [showRawOutput, setShowRawOutput] = useState<Set<string>>(new Set());
+  const [expandedReasoning, setExpandedReasoning] = useState<Set<string>>(new Set());
+  const projectFileInputRef = useRef<HTMLInputElement>(null);
+  const projectImageInputRef = useRef<HTMLInputElement>(null);
+  const [editingProjectField, setEditingProjectField] = useState<string | null>(null);
+  const [projectNameDraft, setProjectNameDraft] = useState("");
+  const [projectInstructionsDraft, setProjectInstructionsDraft] = useState("");
+
+  useEffect(() => {
+    if (settings.temporaryByDefault) setIsTemporary(true);
+  }, [settings.temporaryByDefault]);
+
+  useEffect(() => {
+    if (!selectedModel && settings.defaultModel) {
+      setSelectedModel(settings.defaultModel);
+    }
+  }, [settings.defaultModel, selectedModel]);
+
+  const allModels = providers.flatMap((p) =>
+    p.models.map((m) => ({
+      id: m.id,
+      name: m.name,
+      displayName: m.displayName,
+      providerId: p.id,
+      providerName: p.name,
+      baseUrl: p.baseUrl,
+    }))
+  );
 
   const activeSession = sessions.find(
     (session) => session.id === activeSessionId,
   );
+  const activeProject = projects.find((p) => p.id === activeProjectId);
+  const currentProjectId =
+    activeSession?.projectId ?? pendingProjectId ?? undefined;
+  const currentProjectName = projects.find(
+    (p) => p.id === currentProjectId,
+  )?.name;
+
+  const displayMessages: ChatMessage[] = activeSessionId
+    ? messages
+    : ([] as ChatMessage[]);
+
+  const { roots, nodeMap } = useMemo(
+    () => buildMessageTree(displayMessages),
+    [displayMessages],
+  );
+
+  const activePath = useMemo(
+    () => getActivePath(roots, nodeMap, selectedChildMap),
+    [roots, nodeMap, selectedChildMap],
+  );
+
+  useEffect(() => {
+    setSelectedChildMap(new Map());
+    setEditingMessageId(null);
+    setShowRawOutput(new Set());
+    setExpandedReasoning(new Set());
+  }, [activeSessionId]);
 
   const comingSoon = (feature: string) => toast(`${feature} is coming soon`);
+
+  const startDrag = (e: React.MouseEvent) => {
+    if (e.button === 0) getCurrentWindow().startDragging();
+  };
+
+  const startEditingTitle = () => {
+    if (!activeSession) return;
+    setTitleDraft(activeSession.title);
+    setIsEditingTitle(true);
+  };
+
+  const commitTitle = () => {
+    if (!isEditingTitle) return;
+    const trimmed = titleDraft.trim();
+    if (trimmed && activeSessionId) {
+      updateSession(activeSessionId, { title: trimmed });
+    }
+    setIsEditingTitle(false);
+  };
+
+  const cancelTitleEdit = () => {
+    setIsEditingTitle(false);
+  };
 
   const handleFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(e.target.files ?? []);
@@ -159,228 +348,1319 @@ export function ChatView() {
     });
   };
 
-  const handleSend = () => {
+  const findProviderForModel = (modelName: string) => {
+    const model = allModels.find((m) => m.name === modelName);
+    if (!model) return null;
+    return providers.find((p) => p.id === model.providerId) ?? null;
+  };
+
+  const handleSend = async () => {
     const text = inputText.trim();
     if ((!text && files.length === 0) || isThinking) return;
 
+    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    if (!provider) {
+      toast.error("No provider configured. Add one in Settings.");
+      setSettingsOpen(true);
+      return;
+    }
+
     const attachments = files.length > 0 ? files : undefined;
-    const userMsg: ChatMessage = {
-      id: generateId(),
-      role: "user",
-      content: text,
-      timestamp: new Date(),
-      attachments,
-    };
-    setMessages((prev) => [...prev, userMsg]);
     setInputText("");
     setFiles([]);
     setIsThinking(true);
+    setStreamingContent("");
+    setStreamingReasoning("");
+    setShowThinkingProcess(false);
 
-    if (activeSessionId) {
-      setSessions((prev) =>
-        prev.map((session) =>
-          session.id === activeSessionId
-            ? { ...session, updatedAt: new Date() }
-            : session,
-        ),
+    let sessionId = activeSessionId;
+    let sessionPersisted = Promise.resolve();
+    let isNewSession = false;
+
+    if (!sessionId) {
+      const newSession = createSession(
+        (text || "Attachments").slice(0, 30),
+        pendingProjectId ?? undefined,
       );
-    } else {
-      // A new chat is only saved once the first message is actually sent
-      const newSession: ChatSession = {
-        id: generateId(),
-        title: (text || "Attachments").slice(0, 30),
-        updatedAt: new Date(),
-      };
-      setSessions((prev) => [newSession, ...prev]);
+      sessionId = newSession.id;
       setActiveSessionId(newSession.id);
+      setPendingProjectId(null);
+      sessionPersisted = newSession.persisted;
+      isNewSession = true;
     }
 
-    window.setTimeout(() => {
-      const attachmentNote = attachments?.length
-        ? ` with ${attachments.length} attachment${attachments.length > 1 ? "s" : ""}`
-        : "";
-      const reply: ChatMessage = {
-        id: generateId(),
-        role: "assistant",
-        content: text
-          ? `You said: "${text}"${attachmentNote}. This is a simulated AI response.`
-          : `Received ${attachments?.length ?? 0} attachment${(attachments?.length ?? 0) > 1 ? "s" : ""}. This is a simulated AI response.`,
-        timestamp: new Date(),
-      };
-      setMessages((prev) => [...prev, reply]);
+    if (!sessionId) throw new Error("Failed to create session");
+
+    const userAttachments = attachments?.map((a) => ({
+      id: a.id,
+      name: a.name,
+      size: a.size,
+      type: a.type,
+    }));
+
+    try {
+      await sessionPersisted;
+      const parentId = activePath.length > 0
+        ? activePath[activePath.length - 1].message.id
+        : null;
+      const userMsg = await addMessage(
+        sessionId,
+        "user",
+        text,
+        undefined,
+        userAttachments,
+        parentId,
+        isTemporary,
+      );
+
+      const completionMessages: ChatCompletionMessage[] = [
+        ...activePath.map((n) => ({
+          role: n.message.role as "user" | "assistant" | "system",
+          content: n.message.content,
+        })),
+        { role: "user" as const, content: text },
+      ];
+
+      const controller = new AbortController();
+      setAbortController(controller);
+
+      const tools = getAllTools(webFetchEnabled);
+
+      let fullResponse = "";
+      let fullReasoning = "";
+      try {
+        for await (const chunk of streamChatCompletion(
+          provider,
+          selectedModel,
+          completionMessages,
+          controller.signal,
+          tools,
+        )) {
+          if (chunk.content) {
+            fullResponse += chunk.content;
+            setStreamingContent(fullResponse);
+          }
+          if (chunk.reasoning) {
+            fullReasoning += chunk.reasoning;
+            setStreamingReasoning(fullReasoning);
+          }
+        }
+      } catch (err) {
+        if (controller.signal.aborted) {
+          if (fullResponse) {
+            await addMessage(sessionId, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
+          }
+          return;
+        }
+        throw err;
+      }
+
+      if (fullResponse) {
+        await addMessage(sessionId, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
+      }
+
+      if (isNewSession && fullResponse) {
+        generateChatTitle(provider, selectedModel, text, fullResponse)
+          .then((title) => {
+            if (title && sessionId) {
+              updateSession(sessionId, { title });
+            }
+          })
+          .catch(() => {});
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to send message",
+      );
+    } finally {
       setIsThinking(false);
-    }, 1200);
+      setStreamingContent("");
+      setStreamingReasoning("");
+      setShowThinkingProcess(false);
+      setAbortController(null);
+    }
+  };
+
+  const handleStop = () => {
+    abortController?.abort();
+  };
+
+  const handleCopyMessage = async (content: string) => {
+    try {
+      await navigator.clipboard.writeText(content);
+      toast.success("Copied to clipboard");
+    } catch {
+      toast.error("Failed to copy");
+    }
+  };
+
+  const handleStartEdit = (msg: ChatMessage) => {
+    setEditingMessageId(msg.id);
+    setEditText(msg.content);
+  };
+
+  const handleCancelEdit = () => {
+    setEditingMessageId(null);
+    setEditText("");
+  };
+
+  const handleSaveEdit = async (msg: ChatMessage) => {
+    const text = editText.trim();
+    if (!text || !activeSessionId) return;
+    setEditingMessageId(null);
+    setEditText("");
+
+    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    if (!provider) {
+      toast.error("No provider configured. Add one in Settings.");
+      setSettingsOpen(true);
+      return;
+    }
+
+    setIsThinking(true);
+    setStreamingContent("");
+    setStreamingReasoning("");
+    setShowThinkingProcess(false);
+
+    try {
+      const parentId = msg.parent_id ?? null;
+      const userMsg = await addMessage(
+        activeSessionId,
+        "user",
+        text,
+        undefined,
+        undefined,
+        parentId,
+        isTemporary,
+      );
+
+      const completionMessages: ChatCompletionMessage[] = [];
+      const pathToParent = activePath.slice(
+        0,
+        activePath.findIndex((n) => n.message.id === msg.id),
+      );
+      for (const n of pathToParent) {
+        completionMessages.push({
+          role: n.message.role as "user" | "assistant" | "system",
+          content: n.message.content,
+        });
+      }
+      completionMessages.push({ role: "user" as const, content: text });
+
+      const controller = new AbortController();
+      setAbortController(controller);
+
+      const tools = getAllTools(webFetchEnabled);
+
+      let fullResponse = "";
+      let fullReasoning = "";
+      try {
+        for await (const chunk of streamChatCompletion(
+          provider,
+          selectedModel,
+          completionMessages,
+          controller.signal,
+          tools,
+        )) {
+          if (chunk.content) {
+            fullResponse += chunk.content;
+            setStreamingContent(fullResponse);
+          }
+          if (chunk.reasoning) {
+            fullReasoning += chunk.reasoning;
+            setStreamingReasoning(fullReasoning);
+          }
+        }
+      } catch (err) {
+        if (controller.signal.aborted) {
+          if (fullResponse) {
+            await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
+          }
+          return;
+        }
+        throw err;
+      }
+
+      if (fullResponse) {
+        await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to regenerate response",
+      );
+    } finally {
+      setIsThinking(false);
+      setStreamingContent("");
+      setStreamingReasoning("");
+      setShowThinkingProcess(false);
+      setAbortController(null);
+    }
+  };
+
+  const handleRegenerate = async (msg: ChatMessage) => {
+    if (!activeSessionId || isThinking) return;
+
+    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    if (!provider) {
+      toast.error("No provider configured. Add one in Settings.");
+      setSettingsOpen(true);
+      return;
+    }
+
+    setIsThinking(true);
+    setStreamingContent("");
+    setStreamingReasoning("");
+    setShowThinkingProcess(false);
+
+    try {
+      const parentId = msg.parent_id ?? null;
+      const msgIsTemporary = msg.is_temporary ?? false;
+
+      const completionMessages: ChatCompletionMessage[] = [];
+      const pathToParent = activePath.slice(
+        0,
+        activePath.findIndex((n) => n.message.id === msg.id),
+      );
+      for (const n of pathToParent) {
+        completionMessages.push({
+          role: n.message.role as "user" | "assistant" | "system",
+          content: n.message.content,
+        });
+      }
+
+      const controller = new AbortController();
+      setAbortController(controller);
+
+      const tools = getAllTools(webFetchEnabled);
+
+      let fullResponse = "";
+      let fullReasoning = "";
+      try {
+        for await (const chunk of streamChatCompletion(
+          provider,
+          selectedModel,
+          completionMessages,
+          controller.signal,
+          tools,
+        )) {
+          if (chunk.content) {
+            fullResponse += chunk.content;
+            setStreamingContent(fullResponse);
+          }
+          if (chunk.reasoning) {
+            fullReasoning += chunk.reasoning;
+            setStreamingReasoning(fullReasoning);
+          }
+        }
+      } catch (err) {
+        if (controller.signal.aborted) {
+          if (fullResponse) {
+            await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, parentId, msgIsTemporary, fullReasoning || undefined);
+          }
+          return;
+        }
+        throw err;
+      }
+
+      if (fullResponse) {
+        await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, parentId, msgIsTemporary, fullReasoning || undefined);
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to regenerate response",
+      );
+    } finally {
+      setIsThinking(false);
+      setStreamingContent("");
+      setStreamingReasoning("");
+      setShowThinkingProcess(false);
+      setAbortController(null);
+    }
+  };
+
+  const handleBranchNavigate = (msg: ChatMessage, direction: "prev" | "next") => {
+    const { siblings, currentIndex } = getSiblings(nodeMap, msg, roots);
+    if (siblings.length <= 1) return;
+
+    let newIndex: number;
+    if (direction === "prev") {
+      newIndex = currentIndex > 0 ? currentIndex - 1 : siblings.length - 1;
+    } else {
+      newIndex = currentIndex < siblings.length - 1 ? currentIndex + 1 : 0;
+    }
+
+    const newSibling = siblings[newIndex];
+    setSelectedChildMap((prev) => {
+      const next = new Map(prev);
+      next.set(msg.parent_id ?? null, newSibling.message.id);
+      return next;
+    });
+  };
+
+  const toggleRawOutput = (msgId: string) => {
+    setShowRawOutput((prev) => {
+      const next = new Set(prev);
+      if (next.has(msgId)) next.delete(msgId);
+      else next.add(msgId);
+      return next;
+    });
   };
 
   const handleNewChat = () => {
-    // Start an unsaved draft — nothing is added to the sidebar until a
-    // message is actually sent
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
     setActiveSessionId(null);
-    setMessages([WELCOME_MESSAGE]);
+    setActiveProjectId(null);
+    setWelcomePrompt(
+      WELCOME_PROMPTS[Math.floor(Math.random() * WELCOME_PROMPTS.length)],
+    );
   };
 
   const selectSession = (id: string) => {
+    if (activeSessionId && activeSessionId !== id) {
+      deleteTemporaryMessages(activeSessionId);
+    }
     setActiveSessionId(id);
-    setMessages([WELCOME_MESSAGE]);
+    setActiveProjectId(null);
   };
 
-  const deleteSession = (id: string) => {
-    setSessions((prev) => prev.filter((session) => session.id !== id));
-    setAgentSessions((prev) => prev.filter((session) => session.id !== id));
-    if (activeSessionId === id) {
-      setActiveSessionId(null);
-      setMessages([WELCOME_MESSAGE]);
+  const handleDeleteSession = async (id: string) => {
+    try {
+      await deleteSession(id);
+      if (activeSessionId === id) {
+        setActiveSessionId(null);
+      }
+    } catch (err) {
+      toast.error("Failed to delete chat");
+    }
+  };
+
+  const assignProject = (projectId: string | undefined) => {
+    if (activeSessionId) {
+      updateSession(activeSessionId, { project_id: projectId ?? null });
+      if (projectId) {
+        const project = projects.find((p) => p.id === projectId);
+        toast(project ? `Added to ${project.name}` : "Project assigned");
+      } else {
+        toast("Removed from project");
+      }
+    } else {
+      setPendingProjectId(projectId ?? null);
+      if (projectId) {
+        const project = projects.find((p) => p.id === projectId);
+        toast(project ? `Next chat will be in ${project.name}` : "Project assigned");
+      }
     }
   };
 
   const formatTime = (date: Date) =>
     date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "u") {
+        e.preventDefault();
+        fileInputRef.current?.click();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  const modelSelectContent = (
+    <SelectContent>
+      {allModels.length === 0 ? (
+        <SelectItem value="__no_models__" disabled>
+          No models — add a provider in Settings
+        </SelectItem>
+      ) : (
+        allModels.map((m) => (
+          <SelectItem key={m.id} value={m.name}>
+            {m.displayName || m.name} ({m.providerName})
+          </SelectItem>
+        ))
+      )}
+    </SelectContent>
+  );
+
+  const selectedModelLabel = allModels.find((m) => m.name === selectedModel);
+
+  const modelSelect = (variant: "light" | "dark" = "light") => (
+    <Select value={selectedModel} onValueChange={setSelectedModel}>
+      <SelectTrigger
+        size="sm"
+        className={
+          variant === "dark"
+            ? "border-0 bg-transparent text-white/70 shadow-none hover:text-white"
+            : "border-0 bg-transparent shadow-none dark:bg-transparent"
+        }
+      >
+        <SelectValue placeholder="Select model">
+          {selectedModelLabel
+            ? `${selectedModelLabel.displayName || selectedModelLabel.name}`
+            : "Select model"}
+        </SelectValue>
+      </SelectTrigger>
+      {modelSelectContent}
+    </Select>
+  );
+
+  const renderMessage = (msg: ChatMessage) => {
+    const { siblings, currentIndex } = getSiblings(nodeMap, msg, roots);
+    const hasBranches = siblings.length > 1;
+    const isEditing = editingMessageId === msg.id;
+    const isRaw = showRawOutput.has(msg.id);
+
+    return (
+      <MessageScrollerItem
+        key={msg.id}
+        messageId={msg.id}
+        scrollAnchor={msg.role === "user"}
+      >
+        {msg.role === "user" ? (
+          <Message align="end">
+            <MessageContent>
+              {msg.attachments?.map((attachment) => (
+                <Attachment key={attachment.id} size="sm">
+                  <AttachmentMedia
+                    variant={attachment.previewUrl ? "image" : "icon"}
+                  >
+                    {attachment.previewUrl ? (
+                      <img src={attachment.previewUrl} alt={attachment.name} />
+                    ) : (
+                      <FileText />
+                    )}
+                  </AttachmentMedia>
+                  <AttachmentContent>
+                    <AttachmentTitle>{attachment.name}</AttachmentTitle>
+                    <AttachmentDescription>
+                      {formatBytes(attachment.size)}
+                    </AttachmentDescription>
+                  </AttachmentContent>
+                </Attachment>
+              ))}
+              {isEditing ? (
+                <div className="flex w-full max-w-[80%] flex-col gap-2 self-end">
+                  <Textarea
+                    value={editText}
+                    onChange={(e) => setEditText(e.currentTarget.value)}
+                    className="min-h-20 resize-none text-sm"
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSaveEdit(msg);
+                      }
+                      if (e.key === "Escape") handleCancelEdit();
+                    }}
+                  />
+                  <div className="flex justify-end gap-2">
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      onClick={handleCancelEdit}
+                    >
+                      Cancel
+                    </Button>
+                    <Button
+                      size="xs"
+                      onClick={() => handleSaveEdit(msg)}
+                      disabled={!editText.trim()}
+                    >
+                      Send
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                msg.content && (
+                  <Bubble>
+                    <BubbleContent>
+                      <MarkdownRenderer content={msg.content} />
+                    </BubbleContent>
+                  </Bubble>
+                )
+              )}
+              {!isEditing && (
+                <MessageFooter className="gap-0.5 [&_button]:size-5 [&_button]:p-0 opacity-0 transition-opacity group-hover/message:opacity-100">
+                  {hasBranches && (
+                    <div className="flex items-center gap-0.5 mr-1 text-xs text-muted-foreground">
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        onClick={() => handleBranchNavigate(msg, "prev")}
+                        aria-label="Previous branch"
+                      >
+                        <ChevronLeft />
+                      </Button>
+                      <span className="tabular-nums">
+                        {currentIndex + 1}/{siblings.length}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="icon-xs"
+                        onClick={() => handleBranchNavigate(msg, "next")}
+                        aria-label="Next branch"
+                      >
+                        <ChevronRight />
+                      </Button>
+                    </div>
+                  )}
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    onClick={() => handleStartEdit(msg)}
+                    aria-label="Edit message"
+                    title="Edit"
+                  >
+                    <Pencil />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    onClick={() => handleCopyMessage(msg.content)}
+                    aria-label="Copy message"
+                    title="Copy"
+                  >
+                    <Copy />
+                  </Button>
+                </MessageFooter>
+              )}
+            </MessageContent>
+          </Message>
+        ) : (
+          <Message>
+            <MessageContent>
+              {msg.reasoning && (
+                <div className="mb-1">
+                  <button
+                    onClick={() =>
+                      setExpandedReasoning((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(msg.id)) next.delete(msg.id);
+                        else next.add(msg.id);
+                        return next;
+                      })
+                    }
+                    className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                  >
+                    <Brain className="size-3.5" />
+                    <span>Thinking</span>
+                    {expandedReasoning.has(msg.id) ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+                  </button>
+                  {expandedReasoning.has(msg.id) && (
+                    <div className="mt-1 rounded-lg border bg-muted/30 p-3 max-h-60 overflow-y-auto">
+                      <MarkdownRenderer content={msg.reasoning} className="text-xs text-muted-foreground" />
+                    </div>
+                  )}
+                </div>
+              )}
+              <Bubble variant="ghost">
+                <BubbleContent>
+                  {isRaw ? (
+                    <pre className="whitespace-pre-wrap text-xs font-mono">
+                      {msg.content}
+                    </pre>
+                  ) : (
+                    <MarkdownRenderer content={msg.content} />
+                  )}
+                </BubbleContent>
+              </Bubble>
+              <MessageFooter className="gap-1.5 [&_button]:size-5 [&_button]:p-0 opacity-0 transition-opacity group-hover/message:opacity-100">
+                {hasBranches && (
+                  <div className="flex items-center gap-0.5 text-xs text-muted-foreground">
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      onClick={() => handleBranchNavigate(msg, "prev")}
+                      aria-label="Previous branch"
+                    >
+                      <ChevronLeft />
+                    </Button>
+                    <span className="tabular-nums">
+                      {currentIndex + 1}/{siblings.length}
+                    </span>
+                    <Button
+                      variant="ghost"
+                      size="icon-xs"
+                      onClick={() => handleBranchNavigate(msg, "next")}
+                      aria-label="Next branch"
+                    >
+                      <ChevronRight />
+                    </Button>
+                  </div>
+                )}
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={() => handleRegenerate(msg)}
+                  aria-label="Regenerate response"
+                  title="Regenerate"
+                  disabled={isThinking}
+                >
+                  <RotateCcw />
+                </Button>
+                {msg.model && (
+                  <Badge variant="secondary" className="text-[10px] py-0">
+                    {allModels.find((m) => m.name === msg.model)?.displayName || msg.model}
+                  </Badge>
+                )}
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={() => toggleRawOutput(msg.id)}
+                  aria-label="Toggle raw output"
+                  title={isRaw ? "Show rendered" : "Show raw"}
+                >
+                  <SquareTerminal />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  onClick={() => handleCopyMessage(msg.content)}
+                  aria-label="Copy response"
+                  title="Copy"
+                >
+                  <Copy />
+                </Button>
+              </MessageFooter>
+            </MessageContent>
+          </Message>
+        )}
+      </MessageScrollerItem>
+    );
+  };
+
   return (
     <SidebarProvider
-      className="relative h-full min-h-0 overflow-hidden"
+      className="relative h-dvh min-h-0 overflow-hidden"
       style={{ "--sidebar-width-icon": "3rem" } as React.CSSProperties}
     >
       <AppSidebar
         sessions={sessions}
         agentSessions={agentSessions}
         activeSessionId={activeSessionId}
+        activeTab={activeTab}
+        onTabChange={setActiveTab}
         onSelectSession={selectSession}
         onNewChat={handleNewChat}
-        onDeleteChat={deleteSession}
-        onSettings={() => comingSoon("Settings")}
+        onDeleteChat={handleDeleteSession}
+        onSettings={() => setSettingsOpen(true)}
+        onProjects={() => setProjectsOpen(true)}
+        onHistory={() => setHistoryOpen(true)}
         onComingSoon={comingSoon}
+        projects={projects}
       />
 
-      <SidebarTrigger className="fixed left-20 top-1.5 z-50 peer-data-[state=expanded]:text-sidebar-foreground peer-data-[state=expanded]:hover:bg-sidebar-accent peer-data-[state=expanded]:hover:text-sidebar-accent-foreground" />
+      <SidebarTrigger className="fixed left-18 top-1.5 z-50 size-4.5 [&_svg]:size-3 hover:bg-accent hover:text-accent-foreground peer-data-[state=expanded]:text-sidebar-foreground peer-data-[state=expanded]:hover:bg-sidebar-accent peer-data-[state=expanded]:hover:text-sidebar-accent-foreground" />
 
       <SidebarInset>
-        <header className="relative flex h-10 shrink-0 items-center border-b pl-16 pr-4">
-          <div data-tauri-drag-region className="absolute inset-0" />
-          <h1 className="relative truncate text-sm font-medium">
-            {activeSession?.title ?? "New chat"}
-          </h1>
-          <div className="relative ml-auto flex items-center gap-2">
-            {!activeSession && (
-              <HatGlasses
-                className="size-4 text-muted-foreground"
-                aria-label="New chat — not saved yet"
-              />
-            )}
-          </div>
+        <header
+          data-tauri-drag-region
+          onMouseDown={startDrag}
+          className="relative flex h-10 shrink-0 select-none items-center px-4"
+        >
+          {(activeSession || activeProject) && (
+            <div className="absolute left-1/2 -translate-x-1/2">
+              {activeProject ? (
+                <span className="max-w-xs truncate px-3 py-1 text-sm font-medium">
+                  {activeProject.name}
+                </span>
+              ) : isEditingTitle ? (
+                <input
+                  autoFocus
+                  value={titleDraft}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  onChange={(e) => setTitleDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") commitTitle();
+                    if (e.key === "Escape") cancelTitleEdit();
+                  }}
+                  onBlur={commitTitle}
+                  className="max-w-xs rounded-md border px-3 py-1 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              ) : (
+                <button
+                  onClick={startEditingTitle}
+                  onMouseDown={(e) => e.stopPropagation()}
+                  className="max-w-xs truncate rounded-md px-3 py-1 text-sm font-medium transition-colors hover:bg-accent"
+                >
+                  {activeSession!.title}
+                </button>
+              )}
+            </div>
+          )}
+          <div className="ml-auto flex items-center gap-2" />
         </header>
 
-        <div className="flex min-h-0 flex-1 flex-col">
-          <MessageScrollerProvider
-            autoScroll
-            defaultScrollPosition="last-anchor"
-            scrollPreviousItemPeek={64}
-          >
-            <MessageScroller className="flex-1">
-              <MessageScrollerViewport>
-                <MessageScrollerContent className="mx-auto w-full max-w-3xl px-4 py-6">
-                  {messages.map((msg) => (
-                    <MessageScrollerItem
-                      key={msg.id}
-                      messageId={msg.id}
-                      scrollAnchor={msg.role === "user"}
-                    >
-                      {msg.role === "user" ? (
-                        <Message align="end">
-                          <MessageContent>
-                            {msg.attachments?.map((attachment) => (
-                              <Attachment key={attachment.id} size="sm">
-                                <AttachmentMedia
-                                  variant={
-                                    attachment.previewUrl ? "image" : "icon"
-                                  }
-                                >
-                                  {attachment.previewUrl ? (
-                                    <img
-                                      src={attachment.previewUrl}
-                                      alt={attachment.name}
-                                    />
-                                  ) : (
-                                    <FileText />
-                                  )}
-                                </AttachmentMedia>
-                                <AttachmentContent>
-                                  <AttachmentTitle>
-                                    {attachment.name}
-                                  </AttachmentTitle>
-                                  <AttachmentDescription>
-                                    {formatBytes(attachment.size)}
-                                  </AttachmentDescription>
-                                </AttachmentContent>
-                              </Attachment>
-                            ))}
-                            {msg.content && (
-                              <Bubble>
-                                <BubbleContent>{msg.content}</BubbleContent>
-                              </Bubble>
-                            )}
-                            <MessageFooter>
-                              {formatTime(msg.timestamp)}
-                            </MessageFooter>
-                          </MessageContent>
-                        </Message>
-                      ) : (
+        <div className={activeTab === "agent" ? "hidden" : "flex min-h-0 flex-1 flex-col"}>
+        {activeSession ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <MessageScrollerProvider
+              autoScroll
+              defaultScrollPosition="last-anchor"
+              scrollPreviousItemPeek={64}
+            >
+              <MessageScroller className="flex-1">
+                <MessageScrollerViewport>
+                  <MessageScrollerContent className="mx-auto w-full max-w-3xl px-4 py-6">
+                    {activePath.map((node) => renderMessage(node.message))}
+
+                    {isThinking && (
+                      <MessageScrollerItem messageId="thinking">
                         <Message>
-                          <MessageAvatar>
-                            <Avatar>
-                              <AvatarFallback>
-                                <Sparkles />
-                              </AvatarFallback>
-                            </Avatar>
-                          </MessageAvatar>
                           <MessageContent>
-                            <Bubble variant="ghost">
-                              <BubbleContent>{msg.content}</BubbleContent>
-                            </Bubble>
-                            <MessageFooter>
-                              {formatTime(msg.timestamp)}
-                            </MessageFooter>
+                            {streamingReasoning && !streamingContent && (
+                              <button
+                                onClick={() => setShowThinkingProcess((prev) => !prev)}
+                                className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                              >
+                                <Brain className="size-3.5" />
+                                <span className="shimmer">Thinking…</span>
+                                {showThinkingProcess ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+                              </button>
+                            )}
+                            {streamingReasoning && showThinkingProcess && !streamingContent && (
+                              <div className="mt-1 mb-2 rounded-lg border bg-muted/30 p-3 max-h-60 overflow-y-auto">
+                                <MarkdownRenderer content={streamingReasoning} className="text-xs text-muted-foreground" />
+                              </div>
+                            )}
+                            {streamingContent ? (
+                              <Bubble variant="ghost">
+                                <BubbleContent>
+                                  <MarkdownRenderer content={streamingContent} />
+                                </BubbleContent>
+                              </Bubble>
+                            ) : !streamingReasoning ? (
+                              <Marker role="status">
+                                <MarkerIcon>
+                                  <Spinner />
+                                </MarkerIcon>
+                                <MarkerContent className="shimmer">
+                                  Thinking…
+                                </MarkerContent>
+                              </Marker>
+                            ) : null}
                           </MessageContent>
                         </Message>
+                      </MessageScrollerItem>
+                    )}
+                  </MessageScrollerContent>
+                </MessageScrollerViewport>
+                <MessageScrollerButton />
+              </MessageScroller>
+            </MessageScrollerProvider>
+
+            <div className="shrink-0 px-4 pb-4">
+              <div className="mx-auto w-full max-w-3xl">
+                {files.length > 0 && (
+                  <AttachmentGroup className="mb-2">
+                    {files.map((file) => (
+                      <Attachment key={file.id}>
+                        <AttachmentMedia
+                          variant={file.previewUrl ? "image" : "icon"}
+                        >
+                          {file.previewUrl ? (
+                            <img src={file.previewUrl} alt={file.name} />
+                          ) : (
+                            <FileText />
+                          )}
+                        </AttachmentMedia>
+                        <AttachmentContent>
+                          <AttachmentTitle>{file.name}</AttachmentTitle>
+                          <AttachmentDescription>
+                            {formatBytes(file.size)}
+                          </AttachmentDescription>
+                        </AttachmentContent>
+                        <AttachmentActions>
+                          <AttachmentAction
+                            aria-label={`Remove ${file.name}`}
+                            onClick={() => removeFile(file.id)}
+                          >
+                            <X />
+                          </AttachmentAction>
+                        </AttachmentActions>
+                      </Attachment>
+                    ))}
+                  </AttachmentGroup>
+                )}
+
+                <InputGroup className={isTemporary ? "border-dashed" : undefined}>
+                  <InputGroupTextarea
+                    value={inputText}
+                    onChange={(e) => setInputText(e.currentTarget.value)}
+                    onKeyDown={(e) => {
+                      if (settings.sendOnEnter && e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        handleSend();
+                      }
+                    }}
+                    placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything"}
+                    className="max-h-40 min-h-12"
+                  />
+                  <InputGroupAddon align="block-end">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <InputGroupButton size="icon-xs" aria-label="Add">
+                          <Plus />
+                        </InputGroupButton>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent side="top" align="start">
+                        <DropdownMenuSub>
+                          <DropdownMenuSubTrigger>
+                            <FolderPlus />
+                            Add to Project
+                          </DropdownMenuSubTrigger>
+                          <DropdownMenuSubContent>
+                            <DropdownMenuItem onClick={() => assignProject(undefined)}>
+                              {currentProjectId === undefined ? <Check /> : <span className="size-4" />}
+                              No project
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            {projects.map((p) => (
+                              <DropdownMenuItem key={p.id} onClick={() => assignProject(p.id)}>
+                                {currentProjectId === p.id ? <Check /> : <span className="size-4" />}
+                                {p.name}
+                              </DropdownMenuItem>
+                            ))}
+                          </DropdownMenuSubContent>
+                        </DropdownMenuSub>
+                        <DropdownMenuSub>
+                          <DropdownMenuSubTrigger>
+                            <Puzzle />
+                            Skills
+                          </DropdownMenuSubTrigger>
+                          <DropdownMenuSubContent>
+                            <DropdownMenuSeparator className="mb-1" />
+                            {ALWAYS_ON_TOOLS_INFO.map((tool) => (
+                              <DropdownMenuItem key={tool.name} className="opacity-60" disabled>
+                                <tool.Icon />
+                                {tool.name}
+                                <DropdownMenuShortcut>Always on</DropdownMenuShortcut>
+                              </DropdownMenuItem>
+                            ))}
+                            <DropdownMenuSeparator className="my-1" />
+                            <DropdownMenuItem onClick={() => setWebFetchEnabled((prev) => !prev)}>
+                              <Globe />
+                              Web Fetch
+                              {webFetchEnabled ? <Check className="ml-auto" /> : <span className="ml-auto size-4" />}
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator className="my-1" />
+                            {SKILLS.map((skill) => (
+                              <DropdownMenuItem key={skill.id} onClick={() => comingSoon(`Skill: ${skill.name}`)}>
+                                <skill.Icon />
+                                {skill.name}
+                              </DropdownMenuItem>
+                            ))}
+                          </DropdownMenuSubContent>
+                        </DropdownMenuSub>
+                        <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
+                          <Paperclip />
+                          Add files
+                          <DropdownMenuShortcut>⌘U</DropdownMenuShortcut>
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                    {currentProjectName && (
+                      <InputGroupButton
+                        size="xs"
+                        variant="ghost"
+                        className="group bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500"
+                        onClick={() => assignProject(undefined)}
+                      >
+                        <span className="group-hover:line-through">{currentProjectName}</span>
+                      </InputGroupButton>
+                    )}
+                    <InputGroupButton
+                      size={isTemporary ? "xs" : "icon-xs"}
+                      variant="ghost"
+                      aria-label="Toggle temporary chat"
+                      title="Temporary message - will be deleted when you close the chat"
+                      onClick={() => setIsTemporary((prev) => !prev)}
+                      className={`group ${isTemporary ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
+                    >
+                      <ClockFading className={isTemporary ? "fill-blue-500/30" : ""} />
+                      {isTemporary && <span className="group-hover:line-through">Temporary</span>}
+                    </InputGroupButton>
+                    <InputGroupButton
+                      size={isResearch ? "xs" : "icon-xs"}
+                      variant="ghost"
+                      aria-label="Toggle research mode"
+                      title="Research"
+                      onClick={() => setIsResearch((prev) => !prev)}
+                      className={`group ${isResearch ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
+                    >
+                      <Microscope className={isResearch ? "fill-blue-500/30" : ""} />
+                      {isResearch && <span className="group-hover:line-through">Research</span>}
+                    </InputGroupButton>
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      multiple
+                      className="hidden"
+                      onChange={handleFiles}
+                    />
+                    <input
+                      ref={imageInputRef}
+                      type="file"
+                      multiple
+                      accept="image/*"
+                      className="hidden"
+                      onChange={handleFiles}
+                    />
+
+                    <div className="flex-1" />
+
+                    {modelSelect()}
+
+                    {isThinking ? (
+                      <InputGroupButton
+                        variant="outline"
+                        size="icon-xs"
+                        className="rounded-lg"
+                        onClick={handleStop}
+                        aria-label="Stop generation"
+                      >
+                        <span className="size-3 rounded-sm bg-current" />
+                      </InputGroupButton>
+                    ) : (
+                      <InputGroupButton
+                        variant="default"
+                        size="icon-xs"
+                        className="rounded-lg"
+                        onClick={handleSend}
+                        disabled={
+                          (!inputText.trim() && files.length === 0) || isThinking
+                        }
+                        aria-label="Send message"
+                      >
+                        <ArrowUp />
+                      </InputGroupButton>
+                    )}
+                  </InputGroupAddon>
+                </InputGroup>
+
+                <p className="mt-2 text-center text-xs text-muted-foreground">
+                  ChatUI can make mistakes. Check important information.
+                </p>
+              </div>
+            </div>
+          </div>
+        ) : activeProject ? (
+          <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex items-center gap-2 px-4 py-2.5 border-b shrink-0">
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onClick={() => setActiveProjectId(null)}
+                aria-label="Back to chat"
+              >
+                <ArrowLeft />
+              </Button>
+              {editingProjectField === "name" ? (
+                <input
+                  autoFocus
+                  value={projectNameDraft}
+                  onChange={(e) => setProjectNameDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      const trimmed = projectNameDraft.trim();
+                      if (trimmed) updateProject(activeProject.id, { name: trimmed });
+                      setEditingProjectField(null);
+                    }
+                    if (e.key === "Escape") setEditingProjectField(null);
+                  }}
+                  onBlur={() => {
+                    const trimmed = projectNameDraft.trim();
+                    if (trimmed) updateProject(activeProject.id, { name: trimmed });
+                    setEditingProjectField(null);
+                  }}
+                  className="text-sm font-medium rounded-md border px-2 py-1 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                />
+              ) : (
+                <button
+                  onClick={() => {
+                    setProjectNameDraft(activeProject.name);
+                    setEditingProjectField("name");
+                  }}
+                  className="text-sm font-medium rounded-md px-2 py-1 transition-colors hover:bg-accent"
+                >
+                  {activeProject.name}
+                </button>
+              )}
+            </div>
+            <div className="flex min-h-0 flex-1">
+              <div className="flex flex-col w-2/3 min-h-0 border-r">
+                <div className="shrink-0 p-4">
+                  <InputGroup className={isTemporary ? "border-dashed" : undefined}>
+                    <InputGroupTextarea
+                      value={projectInputText}
+                      onChange={(e) => setProjectInputText(e.currentTarget.value)}
+                      onKeyDown={(e) => {
+                        if (settings.sendOnEnter && e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          const text = projectInputText.trim();
+                          if (!text || isThinking) return;
+                          setProjectInputText("");
+                          handleProjectSend(text);
+                        }
+                      }}
+                      placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything about this project..."}
+                      className="max-h-40 min-h-12"
+                    />
+                    <InputGroupAddon align="block-end">
+                      <InputGroupButton
+                        size={isTemporary ? "xs" : "icon-xs"}
+                        variant="ghost"
+                        aria-label="Toggle temporary chat"
+                        title="Temporary message - will be deleted when you close the chat"
+                        onClick={() => setIsTemporary((prev) => !prev)}
+                        className={`group ${isTemporary ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
+                      >
+                        <ClockFading className={isTemporary ? "fill-blue-500/30" : ""} />
+                        {isTemporary && <span className="group-hover:line-through">Temporary</span>}
+                      </InputGroupButton>
+                      <div className="flex-1" />
+                      {modelSelect()}
+                      <InputGroupButton
+                        variant="default"
+                        size="icon-xs"
+                        className="rounded-lg"
+                        onClick={() => {
+                          const text = projectInputText.trim();
+                          if (!text || isThinking) return;
+                          setProjectInputText("");
+                          handleProjectSend(text);
+                        }}
+                        disabled={!projectInputText.trim() || isThinking}
+                        aria-label="Send message"
+                      >
+                        <ArrowUp />
+                      </InputGroupButton>
+                    </InputGroupAddon>
+                  </InputGroup>
+                </div>
+                <ScrollArea className="flex-1">
+                  <div className="px-4 pb-4">
+                    <div className="mb-3 flex items-center gap-2">
+                      <MessageSquare className="size-4 text-muted-foreground" />
+                      <span className="text-sm font-medium">Chats in this project</span>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      {sessions
+                        .filter((s) => s.projectId === activeProject.id)
+                        .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+                        .map((session) => (
+                          <Card
+                            key={session.id}
+                            className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent"
+                            onClick={() => {
+                              selectSession(session.id);
+                              setActiveProjectId(null);
+                            }}
+                          >
+                            <CardHeader className="flex-row items-center justify-between py-3.5">
+                              <span className="truncate text-sm font-medium">
+                                {session.title}
+                              </span>
+                              <span className="ml-4 shrink-0 text-xs text-muted-foreground">
+                                {session.updatedAt.toLocaleDateString([], {
+                                  month: "short",
+                                  day: "numeric",
+                                })}{" "}
+                                {formatTime(session.updatedAt)}
+                              </span>
+                            </CardHeader>
+                          </Card>
+                        ))}
+                      {sessions.filter((s) => s.projectId === activeProject.id).length === 0 && (
+                        <p className="py-8 text-center text-sm text-muted-foreground">
+                          No conversations in this project yet. Start one above.
+                        </p>
                       )}
-                    </MessageScrollerItem>
-                  ))}
-
-                  {isThinking && (
-                    <MessageScrollerItem messageId="thinking">
-                      <Message>
-                        <MessageAvatar>
-                          <Avatar>
-                            <AvatarFallback>
-                              <Sparkles />
-                            </AvatarFallback>
-                          </Avatar>
-                        </MessageAvatar>
-                        <MessageContent>
-                          <Marker role="status">
-                            <MarkerIcon>
-                              <Spinner />
-                            </MarkerIcon>
-                            <MarkerContent className="shimmer">
-                              Thinking…
-                            </MarkerContent>
-                          </Marker>
-                        </MessageContent>
-                      </Message>
-                    </MessageScrollerItem>
-                  )}
-                </MessageScrollerContent>
-              </MessageScrollerViewport>
-              <MessageScrollerButton />
-            </MessageScroller>
-          </MessageScrollerProvider>
-
-          <div className="shrink-0 px-4 pb-4">
-            <div className="mx-auto w-full max-w-3xl">
+                    </div>
+                  </div>
+                </ScrollArea>
+              </div>
+              <div className="w-1/3 min-h-0 flex flex-col">
+                <ScrollArea className="flex-1">
+                  <div className="p-4 space-y-6">
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <ScrollText className="size-4 text-muted-foreground" />
+                          <span className="text-sm font-medium">Instructions</span>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => {
+                            if (editingProjectField === "instructions") {
+                              updateProject(activeProject.id, { instructions: projectInstructionsDraft });
+                              setEditingProjectField(null);
+                            } else {
+                              setProjectInstructionsDraft(activeProject.instructions);
+                              setEditingProjectField("instructions");
+                            }
+                          }}
+                          aria-label="Edit instructions"
+                        >
+                          {editingProjectField === "instructions" ? <Check /> : <Pencil />}
+                        </Button>
+                      </div>
+                      {editingProjectField === "instructions" ? (
+                        <Textarea
+                          autoFocus
+                          value={projectInstructionsDraft}
+                          onChange={(e) => setProjectInstructionsDraft(e.currentTarget.value)}
+                          onBlur={() => {
+                            updateProject(activeProject.id, { instructions: projectInstructionsDraft });
+                            setEditingProjectField(null);
+                          }}
+                          className="min-h-32 text-xs"
+                        />
+                      ) : (
+                        <div className="rounded-lg border bg-muted/30 p-3">
+                          <pre className="whitespace-pre-wrap text-xs text-muted-foreground font-sans leading-relaxed">
+                            {activeProject.instructions || "(No instructions set)"}
+                          </pre>
+                        </div>
+                      )}
+                    </div>
+                    <Separator />
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <FileText className="size-4 text-muted-foreground" />
+                          <span className="text-sm font-medium">Files</span>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => projectFileInputRef.current?.click()}
+                          aria-label="Add file"
+                        >
+                          <Plus />
+                        </Button>
+                      </div>
+                      <div className="flex flex-col gap-2">
+                        {activeProject.files.map((file) => (
+                          <div key={file.id} className="flex items-center gap-2 rounded-lg border p-2.5">
+                            <FileText className="size-4 shrink-0 text-muted-foreground" />
+                            <div className="flex flex-col min-w-0 flex-1">
+                              <span className="truncate text-xs font-medium">{file.name}</span>
+                              <span className="text-[10px] text-muted-foreground">{formatBytes(file.size)}</span>
+                            </div>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              className="shrink-0 text-muted-foreground hover:text-destructive"
+                              onClick={() => deleteProjectFile(activeProject.id, file.id)}
+                              aria-label="Delete file"
+                            >
+                              <X />
+                            </Button>
+                          </div>
+                        ))}
+                        {activeProject.files.length === 0 && (
+                          <p className="text-xs text-muted-foreground">No files uploaded.</p>
+                        )}
+                      </div>
+                    </div>
+                    <Separator />
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2">
+                          <ImageIcon className="size-4 text-muted-foreground" />
+                          <span className="text-sm font-medium">Images</span>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => projectImageInputRef.current?.click()}
+                          aria-label="Add image"
+                        >
+                          <Plus />
+                        </Button>
+                      </div>
+                      <div className="grid grid-cols-2 gap-2">
+                        {activeProject.images.map((img) => (
+                          <div key={img.id} className="relative aspect-square rounded-lg border overflow-hidden bg-muted/30 flex items-center justify-center group">
+                            {img.url ? (
+                              <img src={img.url} alt={img.name} className="size-full object-cover" />
+                            ) : (
+                              <div className="flex flex-col items-center gap-1">
+                                <ImageIcon className="size-6 text-muted-foreground/50" />
+                                <span className="text-[10px] text-muted-foreground truncate max-w-full px-1">{img.name}</span>
+                              </div>
+                            )}
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              className="absolute top-1 right-1 bg-background/80 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive"
+                              onClick={() => deleteProjectImage(activeProject.id, img.id)}
+                              aria-label="Delete image"
+                            >
+                              <X />
+                            </Button>
+                          </div>
+                        ))}
+                        {activeProject.images.length === 0 && (
+                          <p className="col-span-2 text-xs text-muted-foreground">No images uploaded.</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </ScrollArea>
+              </div>
+            </div>
+            <input
+              ref={projectFileInputRef}
+              type="file"
+              multiple
+              className="hidden"
+              onChange={async (e) => {
+                const selected = Array.from(e.target.files ?? []);
+                for (const file of selected) {
+                  try {
+                    await addProjectFile(activeProject.id, file);
+                  } catch {
+                    toast.error("Failed to upload file");
+                  }
+                }
+                e.target.value = "";
+              }}
+            />
+            <input
+              ref={projectImageInputRef}
+              type="file"
+              multiple
+              accept="image/*"
+              className="hidden"
+              onChange={async (e) => {
+                const selected = Array.from(e.target.files ?? []);
+                for (const file of selected) {
+                  try {
+                    await addProjectImage(activeProject.id, file);
+                  } catch {
+                    toast.error("Failed to upload image");
+                  }
+                }
+                e.target.value = "";
+              }}
+            />
+          </div>
+        ) : (
+          <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden bg-black px-4 pb-8">
+            <InteractiveGrid className="absolute inset-0" mode={activeTab} />
+            <h2 className="select-none cursor-default relative font-serif z-10 mb-12 text-center text-4xl text-white/70">
+              {welcomePrompt}
+            </h2>
+            <div className="relative z-10 w-full max-w-3xl">
               {files.length > 0 && (
                 <AttachmentGroup className="mb-2">
                   {files.map((file) => (
-                    <Attachment key={file.id}>
+                    <Attachment key={file.id} className="opacity-50">
                       <AttachmentMedia
                         variant={file.previewUrl ? "image" : "icon"}
                       >
@@ -409,26 +1689,113 @@ export function ChatView() {
                 </AttachmentGroup>
               )}
 
-              <InputGroup>
+              <InputGroup className={`bg-white/5 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
                 <InputGroupTextarea
                   value={inputText}
                   onChange={(e) => setInputText(e.currentTarget.value)}
                   onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
+                    if (settings.sendOnEnter && e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
                       handleSend();
                     }
                   }}
-                  placeholder="Ask anything"
-                  className="max-h-40 min-h-12"
+                  placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything"}
+                  className="max-h-40 min-h-12 placeholder:text-white/30"
                 />
                 <InputGroupAddon align="block-end">
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <InputGroupButton size="icon-xs" aria-label="Add">
+                        <Plus />
+                      </InputGroupButton>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent side="top" align="start">
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>
+                          <FolderPlus />
+                          Add to Project
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent>
+                          <DropdownMenuItem onClick={() => assignProject(undefined)}>
+                            {currentProjectId === undefined ? <Check /> : <span className="size-4" />}
+                            No project
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator />
+                          {projects.map((p) => (
+                            <DropdownMenuItem key={p.id} onClick={() => assignProject(p.id)}>
+                              {currentProjectId === p.id ? <Check /> : <span className="size-4" />}
+                              {p.name}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>
+                          <Puzzle />
+                          Skills
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent>
+                          <DropdownMenuSeparator className="mb-1" />
+                          {ALWAYS_ON_TOOLS_INFO.map((tool) => (
+                            <DropdownMenuItem key={tool.name} className="opacity-60" disabled>
+                              <tool.Icon />
+                              {tool.name}
+                              <DropdownMenuShortcut>Always on</DropdownMenuShortcut>
+                            </DropdownMenuItem>
+                          ))}
+                          <DropdownMenuSeparator className="my-1" />
+                          <DropdownMenuItem onClick={() => setWebFetchEnabled((prev) => !prev)}>
+                            <Globe />
+                            Web Fetch
+                            {webFetchEnabled ? <Check className="ml-auto" /> : <span className="ml-auto size-4" />}
+                          </DropdownMenuItem>
+                          <DropdownMenuSeparator className="my-1" />
+                          {SKILLS.map((skill) => (
+                            <DropdownMenuItem key={skill.id} onClick={() => comingSoon(`Skill: ${skill.name}`)}>
+                              <skill.Icon />
+                              {skill.name}
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
+                      <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
+                        <Paperclip />
+                        Add files
+                        <DropdownMenuShortcut>⌘U</DropdownMenuShortcut>
+                      </DropdownMenuItem>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
+                  {currentProjectName && (
+                    <InputGroupButton
+                      size="xs"
+                      variant="ghost"
+                      className="group bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500"
+                      onClick={() => assignProject(undefined)}
+                    >
+                      <span className="group-hover:line-through">{currentProjectName}</span>
+                    </InputGroupButton>
+                  )}
                   <InputGroupButton
-                    size="icon-xs"
-                    aria-label="Attach files"
-                    onClick={() => fileInputRef.current?.click()}
+                    size={isTemporary ? "xs" : "icon-xs"}
+                    variant="ghost"
+                    aria-label="Toggle temporary chat"
+                    title="Temporary chat"
+                    onClick={() => setIsTemporary((prev) => !prev)}
+                    className={`group ${isTemporary ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
                   >
-                    <Paperclip />
+                    <ClockFading className={isTemporary ? "fill-blue-500/30" : ""} />
+                    {isTemporary && <span className="group-hover:line-through">Temporary</span>}
+                  </InputGroupButton>
+                  <InputGroupButton
+                    size={isResearch ? "xs" : "icon-xs"}
+                    variant="ghost"
+                    aria-label="Toggle research mode"
+                    title="Research"
+                    onClick={() => setIsResearch((prev) => !prev)}
+                    className={`group ${isResearch ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
+                  >
+                    <Microscope className={isResearch ? "fill-blue-500/30" : ""} />
+                    {isResearch && <span className="group-hover:line-through">Research</span>}
                   </InputGroupButton>
                   <input
                     ref={fileInputRef}
@@ -437,60 +1804,367 @@ export function ChatView() {
                     className="hidden"
                     onChange={handleFiles}
                   />
-
-                  <Select value={model} onValueChange={setModel}>
-                    <SelectTrigger
-                      size="sm"
-                      className="border-0 bg-transparent shadow-none dark:bg-transparent"
-                    >
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="GPT-4o">GPT-4o</SelectItem>
-                      <SelectItem value="Claude 3.5">Claude 3.5</SelectItem>
-                      <SelectItem value="Llama 3">Llama 3</SelectItem>
-                    </SelectContent>
-                  </Select>
-
-                  <div className="ml-1 flex items-center gap-1.5">
-                    <Switch
-                      id="reasoning"
-                      checked={reasoning}
-                      onCheckedChange={setReasoning}
-                    />
-                    <label
-                      htmlFor="reasoning"
-                      className="flex items-center gap-1 text-sm text-muted-foreground"
-                    >
-                      <Brain className="size-3.5" />
-                      Reasoning
-                    </label>
-                  </div>
+                  <input
+                    ref={imageInputRef}
+                    type="file"
+                    multiple
+                    accept="image/*"
+                    className="hidden"
+                    onChange={handleFiles}
+                  />
 
                   <div className="flex-1" />
 
-                  <InputGroupButton
-                    variant="default"
-                    size="icon-xs"
-                    className="rounded-full"
-                    onClick={handleSend}
-                    disabled={
-                      (!inputText.trim() && files.length === 0) || isThinking
-                    }
-                    aria-label="Send message"
-                  >
-                    <ArrowUp />
-                  </InputGroupButton>
+                  {modelSelect("dark")}
+
+                  {isThinking ? (
+                    <InputGroupButton
+                      variant="outline"
+                      size="icon-xs"
+                      className="rounded-lg"
+                      onClick={handleStop}
+                      aria-label="Stop generation"
+                    >
+                      <span className="size-3 rounded-sm bg-current" />
+                    </InputGroupButton>
+                  ) : (
+                    <InputGroupButton
+                      variant="default"
+                      size="icon-xs"
+                      className="rounded-lg"
+                      onClick={handleSend}
+                      disabled={
+                        (!inputText.trim() && files.length === 0) || isThinking
+                      }
+                      aria-label="Send message"
+                    >
+                      <ArrowUp />
+                    </InputGroupButton>
+                  )}
                 </InputGroupAddon>
               </InputGroup>
 
-              <p className="mt-2 text-center text-xs text-muted-foreground">
-                ChatUI can make mistakes. Check important information.
+              <p className="mt-2 text-center text-xs text-white/30 bg-black w-fit mx-auto">
+                AI can make mistakes. Check important information.
               </p>
             </div>
           </div>
+        )}
+        </div>
+        <div className={activeTab === "agent" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+          <AgentView />
         </div>
       </SidebarInset>
+
+      <Dialog open={projectsOpen} onOpenChange={setProjectsOpen}>
+        <DialogContent>
+          <DialogHeader className="shrink-0 gap-0 pr-10">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex flex-col gap-1">
+                <DialogTitle className="flex items-center gap-2">
+                  <ChartColumnBig className="size-5" />
+                  Projects
+                </DialogTitle>
+                <DialogDescription>
+                  Organize your conversations into projects.
+                </DialogDescription>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="relative">
+                  <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={projectSearch}
+                    onChange={(e) => setProjectSearch(e.target.value)}
+                    placeholder="Search projects..."
+                    className="h-9 w-56 pl-9"
+                  />
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={async () => {
+                    try {
+                      await createProject(
+                        `New Project ${projects.length + 1}`,
+                        "A brand new project",
+                        "",
+                      );
+                    } catch {
+                      toast.error("Failed to create project");
+                    }
+                  }}
+                >
+                  <Plus />
+                  New Project
+                </Button>
+              </div>
+            </div>
+          </DialogHeader>
+          <div className="flex-1 overflow-y-auto">
+            <div className="grid grid-cols-2 gap-3 pb-1">
+              {projects
+                .filter((p) =>
+                  p.name.toLowerCase().includes(projectSearch.toLowerCase()) ||
+                  p.description.toLowerCase().includes(projectSearch.toLowerCase())
+                )
+                .map((project) => (
+                  <Card key={project.id} className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent/50" onClick={() => {
+                    setActiveSessionId(null);
+                    setActiveProjectId(project.id);
+                    setProjectsOpen(false);
+                  }}>
+                    <CardHeader className="py-4">
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="flex flex-col gap-1">
+                          <CardTitle className="text-sm">{project.name}</CardTitle>
+                          <CardDescription>{project.description}</CardDescription>
+                        </div>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              className="shrink-0"
+                              aria-label="More options"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <MoreHorizontal />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); comingSoon("Rename Project"); }}>
+                              <Pencil />
+                              Rename
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); comingSoon("Share Project"); }}>
+                              <Share />
+                              Share
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                try {
+                                  await deleteProject(project.id);
+                                  refetchProjects();
+                                } catch {
+                                  toast.error("Failed to delete project");
+                                }
+                              }}
+                            >
+                              <Trash2 />
+                              Delete
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    </CardHeader>
+                    <CardContent className="pb-4 pt-0">
+                      <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs text-secondary-foreground">
+                        {sessions.filter((s) => s.projectId === project.id).length} chats
+                      </span>
+                    </CardContent>
+                  </Card>
+                ))}
+              {projects.filter((p) =>
+                p.name.toLowerCase().includes(projectSearch.toLowerCase()) ||
+                p.description.toLowerCase().includes(projectSearch.toLowerCase())
+              ).length === 0 && (
+                <div className="col-span-2 py-8 text-center text-sm text-muted-foreground">
+                  {projectSearch ? "No projects match your search." : "No projects yet. Create one to get started."}
+                </div>
+              )}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
+        <DialogContent>
+          <DialogHeader className="shrink-0 gap-0 pr-10">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex flex-col gap-1">
+                <DialogTitle className="flex items-center gap-2">
+                  <GalleryVerticalEnd className="size-5" />
+                  History
+                </DialogTitle>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="relative">
+                  <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                  <Input
+                    value={historySearch}
+                    onChange={(e) => setHistorySearch(e.target.value)}
+                    placeholder="Search history..."
+                    className="h-9 w-56 pl-9"
+                  />
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    handleNewChat();
+                    setHistoryOpen(false);
+                  }}
+                >
+                  <Plus />
+                  New Chat
+                </Button>
+              </div>
+            </div>
+          </DialogHeader>
+          <div className="flex-1 overflow-y-auto">
+            <div className="flex flex-col gap-2 pb-1">
+              {[...sessions, ...agentSessions]
+                .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+                .filter((s) =>
+                  s.title.toLowerCase().includes(historySearch.toLowerCase())
+                )
+                .map((session) => (
+                  <Card key={session.id} className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent" onClick={() => {
+                    selectSession(session.id);
+                    setHistoryOpen(false);
+                  }}>
+                    <CardHeader className="flex items-center justify-between py-3.5">
+                      <span className="truncate text-sm font-medium">
+                        {session.title}
+                      </span>
+                      <div className="ml-4 flex shrink-0 items-center gap-2">
+                        <span className="text-xs text-muted-foreground">
+                          {session.updatedAt.toLocaleDateString([], {
+                            month: "short",
+                            day: "numeric",
+                          })}{" "}
+                          {formatTime(session.updatedAt)}
+                        </span>
+                        <DropdownMenu>
+                          <DropdownMenuTrigger asChild>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              className="shrink-0"
+                              aria-label="More options"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              <MoreHorizontal />
+                            </Button>
+                          </DropdownMenuTrigger>
+                          <DropdownMenuContent align="end">
+                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); comingSoon("Rename Chat"); }}>
+                              <Pencil />
+                              Rename
+                            </DropdownMenuItem>
+                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); comingSoon("Share Chat"); }}>
+                              <Share />
+                              Share
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              variant="destructive"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDeleteSession(session.id);
+                              }}
+                            >
+                              <Trash2 />
+                              Delete
+                            </DropdownMenuItem>
+                          </DropdownMenuContent>
+                        </DropdownMenu>
+                      </div>
+                    </CardHeader>
+                  </Card>
+                ))}
+              {[...sessions, ...agentSessions]
+                .filter((s) =>
+                  s.title.toLowerCase().includes(historySearch.toLowerCase())
+                ).length === 0 && (
+                <p className="py-8 text-center text-sm text-muted-foreground">
+                  {historySearch ? "No conversations match your search." : "No conversation history yet."}
+                </p>
+              )}
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
     </SidebarProvider>
   );
+
+  async function handleProjectSend(text: string) {
+    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    if (!provider) {
+      toast.error("No provider configured. Add one in Settings.");
+      setSettingsOpen(true);
+      return;
+    }
+
+    setIsThinking(true);
+    setStreamingContent("");
+    setStreamingReasoning("");
+    setShowThinkingProcess(false);
+
+    try {
+      const newSession = createSession(text.slice(0, 30), activeProject?.id);
+      setActiveSessionId(newSession.id);
+      setActiveProjectId(null);
+
+      await newSession.persisted;
+      const userMsg = await addMessage(newSession.id, "user", text);
+
+      const completionMessages: ChatCompletionMessage[] = [
+        { role: "user" as const, content: text },
+      ];
+
+      const controller = new AbortController();
+      setAbortController(controller);
+
+      const tools = getAllTools(webFetchEnabled);
+
+      let fullResponse = "";
+      let fullReasoning = "";
+      try {
+        for await (const chunk of streamChatCompletion(
+          provider,
+          selectedModel,
+          completionMessages,
+          controller.signal,
+          tools,
+        )) {
+          if (chunk.content) {
+            fullResponse += chunk.content;
+            setStreamingContent(fullResponse);
+          }
+          if (chunk.reasoning) {
+            fullReasoning += chunk.reasoning;
+            setStreamingReasoning(fullReasoning);
+          }
+        }
+      } catch (err) {
+        if (controller.signal.aborted) {
+          if (fullResponse) {
+            await addMessage(newSession.id, "assistant", fullResponse, selectedModel, undefined, userMsg.id, undefined, fullReasoning || undefined);
+          }
+          return;
+        }
+        throw err;
+      }
+
+      if (fullResponse) {
+        await addMessage(newSession.id, "assistant", fullResponse, selectedModel, undefined, userMsg.id, undefined, fullReasoning || undefined);
+      }
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to send message",
+      );
+    } finally {
+      setIsThinking(false);
+      setStreamingContent("");
+      setStreamingReasoning("");
+      setShowThinkingProcess(false);
+      setAbortController(null);
+    }
+  }
 }

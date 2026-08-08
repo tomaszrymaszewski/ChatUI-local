@@ -1,18 +1,15 @@
 import * as React from "react"
 import {
-  BookOpen,
   Bot,
-  MessageSquare,
+  MessageCircle,
   CircleFadingPlus,
-  Settings2,
-  SquareTerminal,
   GalleryVerticalEnd,
   ChartColumnBig,
   Wrench,
   BotMessageSquare,
   Rocket,
 } from "lucide-react"
-
+import { getCurrentWindow } from "@tauri-apps/api/window"
 import { NavChats } from "@/components/nav-chats"
 import { NavUser } from "@/components/nav-user"
 import {
@@ -25,52 +22,10 @@ import {
   SidebarMenuItem,
   SidebarRail,
 } from "@/components/ui/sidebar"
-import type { ChatSession } from "@/types"
+import type { ChatSession, Project } from "@/types"
 import {Tabs, TabsList, TabsTrigger} from "@/components/ui/tabs.tsx";
-import {useState} from "react";
 
-const data = {
-  user: {
-    name: "shadcn",
-    email: "m@example.com",
-    avatar: "",
-  },
-  navMain: [
-    {
-      title: "Playground",
-      url: "#",
-      icon: SquareTerminal,
-      isActive: true,
-      items: [
-        { title: "History", url: "#" },
-        { title: "Starred", url: "#" },
-        { title: "Settings", url: "#" },
-      ],
-    },
-    {
-      title: "Documentation",
-      url: "#",
-      icon: BookOpen,
-      items: [
-        { title: "Introduction", url: "#" },
-        { title: "Get Started", url: "#" },
-        { title: "Tutorials", url: "#" },
-        { title: "Changelog", url: "#" },
-      ],
-    },
-    {
-      title: "Settings",
-      url: "#",
-      icon: Settings2,
-      items: [
-        { title: "General", url: "#" },
-        { title: "Team", url: "#" },
-        { title: "Billing", url: "#" },
-        { title: "Limits", url: "#" },
-      ],
-    },
-  ],
-}
+
 
 type Tab = "chat" | "agent";
 
@@ -78,37 +33,49 @@ export function AppSidebar({
   sessions,
   agentSessions,
   activeSessionId,
+  activeTab,
+  onTabChange,
   onSelectSession,
   onNewChat,
   onDeleteChat,
   onSettings,
+  onProjects,
+  onHistory,
   onComingSoon,
+  projects,
   ...props
 }: React.ComponentProps<typeof Sidebar> & {
   sessions: ChatSession[]
   agentSessions: ChatSession[]
   activeSessionId: string | null
+  activeTab: Tab
+  onTabChange: (tab: Tab) => void
   onSelectSession: (id: string) => void
   onNewChat: () => void
   onDeleteChat: (id: string) => void
   onSettings?: () => void
+  onProjects?: () => void
+  onHistory?: () => void
   onComingSoon?: (feature: string) => void
+  projects?: Project[]
 }) {
 
-  const [activeTab, setActiveTab] = useState<Tab>("chat");
+  const startDrag = (e: React.MouseEvent) => {
+    if (e.button === 0) getCurrentWindow().startDragging();
+  };
 
   return (
     <Sidebar collapsible="icon" {...props}>
-      <div data-tauri-drag-region className="h-10 w-full shrink-0" />
+      <div data-tauri-drag-region onMouseDown={startDrag} className="h-10 w-full shrink-0" />
       <SidebarHeader>
         <Tabs
           value={activeTab}
-          onValueChange={(value) => setActiveTab(value as Tab)}
+          onValueChange={(value) => onTabChange(value as Tab)}
           className="w-full group-data-[collapsible=icon]:hidden"
         >
           <TabsList className="w-full">
             <TabsTrigger value="chat">
-              <MessageSquare />
+              <MessageCircle />
               Chat
             </TabsTrigger>
             <TabsTrigger value="agent">
@@ -126,13 +93,13 @@ export function AppSidebar({
               </SidebarMenuButton>
             </SidebarMenuItem>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => onComingSoon?.("Projects")} tooltip="Projects">
+              <SidebarMenuButton onClick={() => onProjects?.()} tooltip="Projects">
                 <ChartColumnBig />
                 <span>Projects</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => onComingSoon?.("History")} tooltip="History">
+              <SidebarMenuButton onClick={() => onHistory?.()} tooltip="History">
                 <GalleryVerticalEnd />
                 <span>History</span>
               </SidebarMenuButton>
@@ -169,7 +136,8 @@ export function AppSidebar({
             activeSessionId={activeSessionId}
             onSelect={onSelectSession}
             onDelete={onDeleteChat}
-            label="Your Chats"
+            projects={projects}
+            label="Recent"
           />
         ) : (
           <NavChats
@@ -177,13 +145,14 @@ export function AppSidebar({
             activeSessionId={activeSessionId}
             onSelect={onSelectSession}
             onDelete={onDeleteChat}
-            label="Your Agents"
+            projects={projects}
+            label="Recent"
           />
         )}
       </SidebarContent>
 
       <SidebarFooter>
-        <NavUser user={data.user} onSettings={onSettings} />
+        <NavUser onSettings={onSettings} />
       </SidebarFooter>
       <SidebarRail />
     </Sidebar>

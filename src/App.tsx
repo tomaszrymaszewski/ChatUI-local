@@ -1,28 +1,57 @@
-import { useState } from "react";
+import { Routes, Route, Navigate } from "react-router-dom";
 import { Toaster } from "@/components/ui/sonner";
 import { ChatView } from "@/components/ChatView";
-import { AgentView } from "@/components/AgentView";
-import { cn } from "@/lib/utils";
+import { useAuth } from "@/lib/auth";
+import LoginPage from "@/pages/login";
+import SignupPage from "@/pages/signup";
+import { Spinner } from "@/components/ui/spinner";
 
-type Tab = "chat" | "agent";
+function ProtectedRoute({ children }: { children: React.ReactNode }) {
+  const { session, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Spinner className="size-8" />
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <Navigate to="/login" replace />;
+  }
+
+  return <>{children}</>;
+}
 
 function App() {
-  const [activeTab] = useState<Tab>("chat");
+  const { session, loading } = useAuth();
+
+  if (loading) {
+    return (
+      <div className="flex h-screen items-center justify-center">
+        <Spinner className="size-8" />
+      </div>
+    );
+  }
 
   return (
-    <div className="flex h-screen flex-col bg-background text-foreground">
-
-      <main className="min-h-0 flex-1">
-        <div className={cn("h-full", activeTab !== "chat" && "hidden")}>
-          <ChatView />
-        </div>
-        <div className={cn("h-full", activeTab !== "agent" && "hidden")}>
-          <AgentView />
-        </div>
-      </main>
-
+    <>
+      <Routes>
+        <Route path="/login" element={session ? <Navigate to="/" replace /> : <LoginPage />} />
+        <Route path="/signup" element={session ? <Navigate to="/" replace /> : <SignupPage />} />
+        <Route
+          path="/"
+          element={
+            <ProtectedRoute>
+              <ChatView />
+            </ProtectedRoute>
+          }
+        />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
       <Toaster />
-    </div>
+    </>
   );
 }
 

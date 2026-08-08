@@ -1,12 +1,13 @@
 import {
-  BadgeCheck,
-  Bell,
+  UserPen,
   ChevronsUpDown,
-  CreditCard,
+  ChartColumn,
   LogOut,
   Settings,
   Sparkles,
 } from "lucide-react"
+import { useNavigate } from "react-router-dom"
+import { toast } from "sonner"
 
 import {
   Avatar,
@@ -28,12 +29,12 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar"
+import { useAuth } from "@/lib/auth"
 
 export function NavUser({
-  user,
   onSettings,
 }: {
-  user: {
+  user?: {
     name: string
     email: string
     avatar: string
@@ -41,6 +42,22 @@ export function NavUser({
   onSettings?: () => void
 }) {
   const { isMobile } = useSidebar()
+  const { user, signOut } = useAuth()
+  const navigate = useNavigate()
+
+  const displayName = user?.user_metadata?.display_name ?? user?.email?.split("@")[0] ?? "User"
+  const email = user?.email ?? ""
+  const initials = displayName.slice(0, 2).toUpperCase()
+
+  const handleSignOut = async () => {
+    await signOut()
+    toast.success("Signed out")
+    navigate("/login")
+  }
+
+  const handleSettings = () => {
+    onSettings?.()
+  }
 
   return (
     <SidebarMenu>
@@ -52,12 +69,11 @@ export function NavUser({
               className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
             >
               <Avatar className="h-8 w-8 rounded-lg">
-                <AvatarImage src={user.avatar} alt={user.name} />
-                <AvatarFallback className="rounded-lg">CN</AvatarFallback>
+                <AvatarImage src="" alt={displayName} />
+                <AvatarFallback className="rounded-lg">{initials}</AvatarFallback>
               </Avatar>
               <div className="grid flex-1 text-left text-sm leading-tight">
-                <span className="truncate font-medium">{user.name}</span>
-                <span className="truncate text-xs">{user.email}</span>
+                <span className="truncate font-medium">{displayName}</span>
               </div>
               <ChevronsUpDown className="ml-auto size-4" />
             </SidebarMenuButton>
@@ -71,12 +87,12 @@ export function NavUser({
             <DropdownMenuLabel className="p-0 font-normal">
               <div className="flex items-center gap-2 px-1 py-1.5 text-left text-sm">
                 <Avatar className="h-8 w-8 rounded-lg">
-                  <AvatarImage src={user.avatar} alt={user.name} />
-                  <AvatarFallback className="rounded-lg">CN</AvatarFallback>
+                  <AvatarImage src="" alt={displayName} />
+                  <AvatarFallback className="rounded-lg">{initials}</AvatarFallback>
                 </Avatar>
                 <div className="grid flex-1 text-left text-sm leading-tight">
-                  <span className="truncate font-medium">{user.name}</span>
-                  <span className="truncate text-xs">{user.email}</span>
+                  <span className="truncate font-medium">{displayName}</span>
+                  <span className="truncate text-xs">{email}</span>
                 </div>
               </div>
             </DropdownMenuLabel>
@@ -84,30 +100,26 @@ export function NavUser({
             <DropdownMenuGroup>
               <DropdownMenuItem>
                 <Sparkles />
-                Upgrade to Pro
+                Donate
               </DropdownMenuItem>
             </DropdownMenuGroup>
             <DropdownMenuSeparator />
             <DropdownMenuGroup>
               <DropdownMenuItem>
-                <BadgeCheck />
+                <UserPen />
                 Account
               </DropdownMenuItem>
               <DropdownMenuItem>
-                <CreditCard />
-                Billing
+                <ChartColumn />
+                Usage
               </DropdownMenuItem>
-              <DropdownMenuItem>
-                <Bell />
-                Notifications
-              </DropdownMenuItem>
-              <DropdownMenuItem onClick={onSettings}>
+              <DropdownMenuItem onClick={handleSettings}>
                 <Settings />
                 Settings
               </DropdownMenuItem>
             </DropdownMenuGroup>
             <DropdownMenuSeparator />
-            <DropdownMenuItem>
+            <DropdownMenuItem onClick={handleSignOut}>
               <LogOut />
               Log out
             </DropdownMenuItem>
