@@ -19,7 +19,10 @@ import {
   abortSession,
   listAgents,
   subscribeToEvents,
+  summarizeSession,
 } from "@/lib/opencode";
+
+const AUTO_COMPACT_TOKENS = 100000;
 
 export function useOpencode() {
   const [config, setConfig] = useState<OpenCodeServerConfig | null>(() =>
@@ -34,8 +37,20 @@ export function useOpencode() {
   const [agents, setAgents] = useState<OCAgent[]>([]);
   const [selectedAgent, setSelectedAgent] = useState<string>("");
   const [loadingMessages, setLoadingMessages] = useState(false);
+  const [summarizing, setSummarizing] = useState(false);
   const eventUnsubscribeRef = useRef<(() => void) | null>(null);
   const autoConnectAttempted = useRef(false);
+  const activeSessionIdRef = useRef<string | null>(null);
+  const summarizingRef = useRef(false);
+  const lastAutoCompactMessageIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    summarizingRef.current = summarizing;
+  }, [summarizing]);
 
   const connect = useCallback(async (url: string, password?: string) => {
     setConnecting(true);
@@ -117,15 +132,17 @@ export function useOpencode() {
   );
 
   const handleNewSession = useCallback(async () => {
-    if (!config) return;
+    if (!config) return undefined;
     try {
       const sess = await apiCreateSession(config);
       setSessions((prev) => [sess, ...prev]);
       await selectSession(sess.id);
+      return sess.id;
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to create session"
       );
+      return undefined;
     }
   }, [config, selectSession]);
 
@@ -149,19 +166,20 @@ export function useOpencode() {
   );
 
   const handleSendMessage = useCallback(
-    async (text: string) => {
-      if (!config || !activeSessionId || !text.trim()) return;
+    async (text: string, sessionIdOverride?: string) => {
+      const sessionId = sessionIdOverride ?? activeSessionId;
+      if (!config || !sessionId || !text.trim()) return;
       const userEntry: OCMessageEntry = {
         info: {
           id: `local-${Date.now()}`,
-          sessionID: activeSessionId,
+          sessionID: sessionId,
           role: "user",
           time: { created: Date.now() },
         },
         parts: [
           {
             id: `local-part-${Date.now()}`,
-            sessionID: activeSessionId,
+            sessionID: sessionId,
             messageID: `local-${Date.now()}`,
             type: "text",
             text: text.trim(),
@@ -174,7 +192,7 @@ export function useOpencode() {
       try {
         await sendMessageAsync(
           config,
-          activeSessionId,
+          sessionId,
           text.trim(),
           selectedAgent || undefined
         );
@@ -190,11 +208,46 @@ export function useOpencode() {
 
   const handleAbort = useCallback(async () => {
     if (!config || !activeSessionId) return;
+    setIsBusy(false);
     try {
       await abortSession(config, activeSessionId);
     } catch {
     }
   }, [config, activeSessionId]);
+
+  const handleSummarize = useCallback(async () => {
+    if (!config || !activeSessionId) return;
+    const lastAssistant = [...messages]
+      .reverse()
+      .find(
+        (e) => e.info.role === "assistant" && e.info.providerID && e.info.modelID
+      );
+    if (!lastAssistant?.info.providerID || !lastAssistant.info.modelID) {
+      toast.error("Send a message first so a model is known for this session");
+      return;
+    }
+    setSummarizing(true);
+    try {
+      await summarizeSession(
+        config,
+        activeSessionId,
+        lastAssistant.info.providerID,
+        lastAssistant.info.modelID
+      );
+      toast.success("Session compacted");
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to compact session"
+      );
+    } finally {
+      setSummarizing(false);
+    }
+  }, [config, activeSessionId, messages]);
+
+  const summarizeRef = useRef(handleSummarize);
+  useEffect(() => {
+    summarizeRef.current = handleSummarize;
+  }, [handleSummarize]);
 
   useEffect(() => {
     if (!config || !connected) return;
@@ -230,7 +283,7 @@ export function useOpencode() {
             case "session.deleted": {
               const info = props.info as OCSession;
               setSessions((prev) => prev.filter((s) => s.id !== info.id));
-              if (activeSessionId === info.id) {
+              if (activeSessionIdRef.current === info.id) {
                 setActiveSessionId(null);
                 setMessages([]);
               }
@@ -239,7 +292,7 @@ export function useOpencode() {
 
             case "message.updated": {
               const info = props.info as OCMessageEntry["info"];
-              if (info.sessionID !== activeSessionId) break;
+              if (info.sessionID !== activeSessionIdRef.current) break;
               setMessages((prev) => {
                 const idx = prev.findIndex((e) => e.info.id === info.id);
                 if (idx === -1) {
@@ -249,12 +302,28 @@ export function useOpencode() {
                 updated[idx] = { ...updated[idx], info };
                 return updated;
               });
+
+              if (
+                info.role === "assistant" &&
+                info.time?.completed &&
+                info.tokens &&
+                info.id !== lastAutoCompactMessageIdRef.current &&
+                !summarizingRef.current
+              ) {
+                const totalTokens =
+                  info.tokens.input + info.tokens.output + info.tokens.reasoning;
+                if (totalTokens > AUTO_COMPACT_TOKENS) {
+                  lastAutoCompactMessageIdRef.current = info.id;
+                  toast.info("Auto-compacting session…");
+                  summarizeRef.current();
+                }
+              }
               break;
             }
 
             case "message.part.updated": {
               const part = props.part as OCPart;
-              if (part.sessionID !== activeSessionId) break;
+              if (part.sessionID !== activeSessionIdRef.current) break;
               setMessages((prev) => {
                 const msgIdx = prev.findIndex(
                   (e) => e.info.id === part.messageID
@@ -299,7 +368,7 @@ export function useOpencode() {
 
             case "session.idle": {
               const sid = props.sessionID as string;
-              if (sid === activeSessionId) {
+              if (sid === activeSessionIdRef.current) {
                 setIsBusy(false);
               }
               break;
@@ -333,7 +402,7 @@ export function useOpencode() {
       eventUnsubscribeRef.current = null;
       if (reconnectTimer) clearTimeout(reconnectTimer);
     };
-  }, [config, connected, activeSessionId]);
+  }, [config, connected]);
 
   return {
     connected,
@@ -353,5 +422,7 @@ export function useOpencode() {
     deleteSession: handleDeleteSession,
     sendMessage: handleSendMessage,
     abort: handleAbort,
+    summarize: handleSummarize,
+    summarizing,
   };
 }

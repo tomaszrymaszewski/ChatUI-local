@@ -7,6 +7,7 @@ import {
   CircleFadingPlus,
   Plug,
   Server,
+  Shrink,
   Trash2,
   Wrench,
   X,
@@ -422,9 +423,24 @@ export function AgentView() {
               <ChevronRight className="size-4 rotate-180" />
               Sessions
             </Button>
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Server className="size-3.5" />
-              <span className="max-w-xs truncate">Connected</span>
+            <div className="flex items-center gap-3">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={oc.summarize}
+                disabled={oc.summarizing}
+              >
+                {oc.summarizing ? (
+                  <Spinner className="size-3.5" />
+                ) : (
+                  <Shrink className="size-3.5" />
+                )}
+                Compact
+              </Button>
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Server className="size-3.5" />
+                <span className="max-w-xs truncate">Connected</span>
+              </div>
             </div>
           </div>
 

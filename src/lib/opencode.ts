@@ -467,6 +467,18 @@ export async function sendMessageAsync(
   });
 }
 
+export async function summarizeSession(
+  config: OpenCodeServerConfig,
+  sessionId: string,
+  providerID: string,
+  modelID: string
+): Promise<boolean> {
+  return apiFetch(config, `/session/${sessionId}/summarize`, {
+    method: "POST",
+    body: JSON.stringify({ providerID, modelID }),
+  });
+}
+
 export async function abortSession(
   config: OpenCodeServerConfig,
   sessionId: string,
