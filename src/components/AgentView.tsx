@@ -98,7 +98,7 @@ function renderPart(part: Part, key: string) {
 
     case "reasoning":
       return (
-        <details key={key} className="mb-1">
+        <details key={key} className="mb-1" open>
           <summary className="cursor-pointer select-none text-xs text-muted-foreground">
             Reasoning
           </summary>
