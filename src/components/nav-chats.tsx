@@ -1,7 +1,7 @@
+import { useState } from "react";
 import {
   MoreHorizontal,
   Pencil,
-  Share,
   Trash2,
 } from "lucide-react"
 
@@ -13,6 +13,12 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
   SidebarGroup,
   SidebarGroupLabel,
   SidebarMenu,
@@ -22,6 +28,8 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 import { Badge } from "@/components/ui/badge"
+import { Input } from "@/components/ui/input"
+import { Button } from "@/components/ui/button"
 import type { ChatSession, Project } from "@/types"
 
 export function NavChats({
@@ -29,6 +37,7 @@ export function NavChats({
   activeSessionId,
   onSelect,
   onDelete,
+  onRename,
   projects = [],
   label = "Recents",
 }: {
@@ -36,16 +45,34 @@ export function NavChats({
   activeSessionId: string | null
   onSelect: (id: string) => void
   onDelete: (id: string) => void
+  onRename?: (id: string, title: string) => void
   projects?: Project[]
   label?: string
 }) {
   const { isMobile } = useSidebar()
+  const [renameTarget, setRenameTarget] = useState<{ id: string; title: string } | null>(null)
+  const [renameDraft, setRenameDraft] = useState("")
 
   const projectNameFor = (projectId?: string) =>
     projects.find((p) => p.id === projectId)?.name
 
   const initialsFor = (name: string) =>
     name.split(/\s+/).map((w) => w[0]).join("").toUpperCase().slice(0, 3)
+
+  const handleStartRename = (id: string, currentTitle: string) => {
+    setRenameTarget({ id, title: currentTitle })
+    setRenameDraft(currentTitle)
+  }
+
+  const handleCommitRename = () => {
+    if (!renameTarget) return
+    const trimmed = renameDraft.trim()
+    if (trimmed && onRename) {
+      onRename(renameTarget.id, trimmed)
+    }
+    setRenameTarget(null)
+    setRenameDraft("")
+  }
 
   return (
     <SidebarGroup className="group-data-[collapsible=icon]:hidden">
@@ -74,18 +101,16 @@ export function NavChats({
                   </SidebarMenuAction>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent
-                  className="w-48 rounded-lg"
+                  className="w-40 rounded-lg"
                   side={isMobile ? "bottom" : "right"}
                   align={isMobile ? "end" : "start"}
                 >
-                  <DropdownMenuItem>
-                    <Pencil className="text-muted-foreground" />
-                    <span>Rename</span>
-                  </DropdownMenuItem>
-                  <DropdownMenuItem>
-                    <Share className="text-muted-foreground" />
-                    <span>Share Chat</span>
-                  </DropdownMenuItem>
+                  {onRename && (
+                    <DropdownMenuItem onClick={() => handleStartRename(session.id, session.title)}>
+                      <Pencil className="text-muted-foreground" />
+                      <span>Rename</span>
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     variant="destructive"
@@ -100,6 +125,33 @@ export function NavChats({
           )
         })}
       </SidebarMenu>
+
+      <Dialog open={!!renameTarget} onOpenChange={(open) => { if (!open) { setRenameTarget(null); setRenameDraft(""); } }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Pencil className="size-5" />
+              Rename Chat
+            </DialogTitle>
+          </DialogHeader>
+          <div className="flex flex-col gap-4 pt-2">
+            <Input
+              autoFocus
+              value={renameDraft}
+              onChange={(e) => setRenameDraft(e.target.value)}
+              placeholder="Chat name"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleCommitRename()
+                if (e.key === "Escape") { setRenameTarget(null); setRenameDraft("") }
+              }}
+            />
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" size="sm" onClick={() => { setRenameTarget(null); setRenameDraft("") }}>Cancel</Button>
+              <Button size="sm" disabled={!renameDraft.trim()} onClick={handleCommitRename}>Rename</Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
     </SidebarGroup>
   )
 }

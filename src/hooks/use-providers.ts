@@ -5,6 +5,9 @@ import {
   createProvider as createProviderRPC,
   updateProvider as updateProviderRPC,
   deleteProvider as deleteProviderRPC,
+  addModelToProvider as addModelRPC,
+  removeModelFromProvider as removeModelRPC,
+  updateModelDisplayName as updateDisplayNameRPC,
 } from "@/lib/llm";
 
 export function useProviders() {
@@ -30,9 +33,10 @@ export function useProviders() {
       name: string,
       baseUrl: string,
       apiKey: string,
-      models: ProviderModel[]
+      models: ProviderModel[],
+      builtinKey?: string,
     ) => {
-      await createProviderRPC(name, baseUrl, apiKey, models);
+      await createProviderRPC(name, baseUrl, apiKey, models, builtinKey);
       await loadProviders();
     },
     [loadProviders]
@@ -44,9 +48,10 @@ export function useProviders() {
       name: string,
       baseUrl: string,
       apiKey: string,
-      models: ProviderModel[]
+      models: ProviderModel[],
+      builtinKey?: string,
     ) => {
-      await updateProviderRPC(providerId, name, baseUrl, apiKey, models);
+      await updateProviderRPC(providerId, name, baseUrl, apiKey, models, builtinKey);
       await loadProviders();
     },
     [loadProviders]
@@ -60,12 +65,39 @@ export function useProviders() {
     [loadProviders]
   );
 
+  const addModel = useCallback(
+    async (providerId: string, model: ProviderModel) => {
+      await addModelRPC(providerId, model);
+      await loadProviders();
+    },
+    [loadProviders]
+  );
+
+  const removeModel = useCallback(
+    async (providerId: string, modelId: string) => {
+      await removeModelRPC(providerId, modelId);
+      await loadProviders();
+    },
+    [loadProviders]
+  );
+
+  const updateModelDisplayName = useCallback(
+    async (providerId: string, modelId: string, displayName: string) => {
+      await updateDisplayNameRPC(providerId, modelId, displayName);
+      await loadProviders();
+    },
+    [loadProviders]
+  );
+
   return {
     providers,
     loading,
     createProvider,
     updateProvider,
     deleteProvider,
+    addModel,
+    removeModel,
+    updateModelDisplayName,
     refetch: loadProviders,
   };
 }

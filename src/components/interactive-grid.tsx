@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import {
   BookOpen,
   Brain,
@@ -10,8 +11,11 @@ import {
   Compass,
   Cpu,
   Database,
+  FileCode,
   FileText,
+  FolderGit2,
   GitBranch,
+  GitCommit,
   Globe,
   GraduationCap,
   Hash,
@@ -29,6 +33,7 @@ import {
   SquareTerminal,
   Star,
   Telescope,
+  Terminal,
   Webhook,
   Workflow,
   Wrench,
@@ -45,128 +50,220 @@ const AGENT_ICONS = [
   Code, Wrench, SquareTerminal, GitBranch, Bug, Cpu,
   Database, Cloud, Braces, Boxes, Server, Network,
   Webhook, Workflow, KeyRound, Hash, Sparkles, Zap,
+  Terminal, FileCode, FolderGit2, GitCommit,
 ];
 
 const SPACING = 36;
-const RADIUS = 140;
+const ICON_PX = 14;
+const WAVE_DURATION = 1800;
+const WAVE_WAVELENGTH = 220;
+
+const spriteCache = new Map<string, HTMLCanvasElement[]>();
+
+async function generateSprites(mode: string): Promise<HTMLCanvasElement[]> {
+  const cached = spriteCache.get(mode);
+  if (cached) return cached;
+
+  const icons = mode === "agent" ? AGENT_ICONS : CHAT_ICONS;
+  const dpr = window.devicePixelRatio || 1;
+  const px = Math.ceil(ICON_PX * dpr);
+
+  const sprites = await Promise.all(
+    icons.map(
+      (Icon) =>
+        new Promise<HTMLCanvasElement>((resolve, reject) => {
+          const svg = renderToStaticMarkup(
+            <Icon size={ICON_PX} strokeWidth={1.5} color="white" />,
+          );
+          const dataUrl = `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+          const img = document.createElement("img");
+          img.onload = () => {
+            const c = document.createElement("canvas");
+            c.width = px;
+            c.height = px;
+            const ictx = c.getContext("2d")!;
+            ictx.drawImage(img, 0, 0, px, px);
+            resolve(c);
+          };
+          img.onerror = reject;
+          img.src = dataUrl;
+        }),
+    ),
+  );
+
+  spriteCache.set(mode, sprites);
+  return sprites;
+}
 
 export function InteractiveGrid({
   className,
   mode = "chat",
+  origin,
 }: {
   className?: string;
   mode?: "chat" | "agent";
+  origin?: { x: number; y: number };
 }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const gridRef = useRef<HTMLDivElement>(null);
-  const [dims, setDims] = useState({ cols: 0, rows: 0 });
-
-  const icons = mode === "agent" ? AGENT_ICONS : CHAT_ICONS;
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
-    const container = containerRef.current;
-    if (!container) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
 
-    const measure = () => {
-      const rect = container.getBoundingClientRect();
-      setDims({
-        cols: Math.ceil(rect.width / SPACING),
-        rows: Math.ceil(rect.height / SPACING),
-      });
-    };
+    const dpr = window.devicePixelRatio || 1;
 
-    measure();
-    const ro = new ResizeObserver(measure);
-    ro.observe(container);
-    return () => ro.disconnect();
-  }, []);
-
-  const cells = [];
-  for (let row = 0; row < dims.rows; row++) {
-    for (let col = 0; col < dims.cols; col++) {
-      const Icon = icons[(row * dims.cols + col) % icons.length];
-      cells.push(
-        <div
-          key={`${row}-${col}`}
-          data-grid-cell
-          className="flex items-center justify-center text-white/60"
-          style={{ opacity: 0, transition: "opacity 0.2s ease, transform 0.2s ease" }}
-        >
-          <Icon className="size-3.5" strokeWidth={1.5} />
-        </div>,
-      );
-    }
-  }
-
-  const onMove = useCallback(() => {
-    const container = containerRef.current;
-    const grid = gridRef.current;
-    if (!container || !grid) return;
-
+    let sprites: HTMLCanvasElement[] = [];
+    let cellsX = new Float32Array(0);
+    let cellsY = new Float32Array(0);
+    let iconIdx = new Uint8Array(0);
+    let cols = 0;
+    let rows = 0;
+    let cw = 0;
+    let ch = 0;
     let raf = 0;
-    let mx = -9999;
-    let my = -9999;
+    let disposed = false;
+    let waveStart = 0;
 
-    const update = () => {
-      raf = 0;
-      const cellEls = grid.querySelectorAll<HTMLElement>("[data-grid-cell]");
-      cellEls.forEach((el) => {
-        const cx = el.offsetLeft + el.offsetWidth / 2;
-        const cy = el.offsetTop + el.offsetHeight / 2;
-        const dx = cx - mx;
-        const dy = cy - my;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < RADIUS) {
-          const t = 1 - dist / RADIUS;
-          el.style.opacity = String(t * 0.55);
-          el.style.transform = `scale(${0.7 + t * 0.5})`;
-        } else {
-          el.style.opacity = "0";
-          el.style.transform = "scale(0.7)";
+    const computeCells = () => {
+      const rect = canvas.getBoundingClientRect();
+      cw = rect.width;
+      ch = rect.height;
+      if (cw === 0 || ch === 0) return;
+
+      canvas.width = Math.round(cw * dpr);
+      canvas.height = Math.round(ch * dpr);
+
+      cols = Math.ceil(cw / SPACING);
+      rows = Math.ceil(ch / SPACING);
+      const total = cols * rows;
+      cellsX = new Float32Array(total);
+      cellsY = new Float32Array(total);
+      iconIdx = new Uint8Array(total);
+
+      for (let r = 0; r < rows; r++) {
+        for (let c = 0; c < cols; c++) {
+          const i = r * cols + c;
+          cellsX[i] = c * SPACING + SPACING / 2;
+          cellsY[i] = r * SPACING + SPACING / 2;
+          iconIdx[i] = i % sprites.length;
         }
-      });
+      }
     };
 
-    const handler = (e: MouseEvent) => {
-      const rect = container.getBoundingClientRect();
-      mx = e.clientX - rect.left;
-      my = e.clientY - rect.top;
-      if (!raf) raf = requestAnimationFrame(update);
+    const drawWave = () => {
+      if (disposed || !sprites.length || cw === 0) return;
+      const elapsed = performance.now() - waveStart;
+
+      if (elapsed >= WAVE_DURATION) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        raf = 0;
+        return;
+      }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      const progress = elapsed / WAVE_DURATION;
+      const iconPx = ICON_PX * dpr;
+      const total = cols * rows;
+
+      if (mode === "agent" && !origin) {
+        const eased = 1 - Math.pow(1 - progress, 2.5);
+        const wavePos = eased * (ch + 120);
+
+        for (let i = 0; i < total; i++) {
+          const cellY = cellsY[i];
+          const cellX = cellsX[i];
+          const diff = wavePos - cellY;
+
+          if (diff > 0 && diff < WAVE_WAVELENGTH) {
+            const t = 1 - diff / WAVE_WAVELENGTH;
+            const ts = t * t * (3 - 2 * t);
+            const sz = iconPx * (0.7 + ts * 0.6);
+            const sprite = sprites[iconIdx[i]];
+            if (sprite) {
+              ctx.globalAlpha = ts * 0.5 * (1 - progress * 0.3);
+              ctx.drawImage(
+                sprite,
+                cellX * dpr - sz / 2,
+                cellY * dpr - sz / 2,
+                sz,
+                sz,
+              );
+            }
+          }
+        }
+      } else {
+        const cx0 = origin ? origin.x * cw : cw / 2;
+        const cy0 = origin ? origin.y * ch : ch / 2;
+        const maxDist = Math.sqrt(
+          Math.max(cx0, cw - cx0) ** 2 + Math.max(cy0, ch - cy0) ** 2
+        );
+        const eased = 1 - Math.pow(1 - progress, 2.5);
+        const wavePos = eased * (maxDist + 120);
+
+        for (let i = 0; i < total; i++) {
+          const cellX = cellsX[i];
+          const cellY = cellsY[i];
+          const dx = cellX - cx0;
+          const dy = cellY - cy0;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const diff = wavePos - dist;
+
+          if (diff > 0 && diff < WAVE_WAVELENGTH) {
+            const t = 1 - diff / WAVE_WAVELENGTH;
+            const ts = t * t * (3 - 2 * t);
+            const sz = iconPx * (0.7 + ts * 0.6);
+            const sprite = sprites[iconIdx[i]];
+            if (sprite) {
+              ctx.globalAlpha = ts * 0.5 * (1 - progress * 0.3);
+              ctx.drawImage(
+                sprite,
+                cellX * dpr - sz / 2,
+                cellY * dpr - sz / 2,
+                sz,
+                sz,
+              );
+            }
+          }
+        }
+      }
+      ctx.globalAlpha = 1;
+
+      raf = requestAnimationFrame(drawWave);
     };
 
-    const leaveHandler = () => {
-      mx = -9999;
-      my = -9999;
-      if (!raf) raf = requestAnimationFrame(update);
-    };
+    const onResize = () => computeCells();
 
-    window.addEventListener("mousemove", handler);
-    window.addEventListener("blur", leaveHandler);
+    const ro = new ResizeObserver(onResize);
+    ro.observe(canvas);
+
+    (async () => {
+      try {
+        sprites = await generateSprites(mode);
+        if (disposed) return;
+        computeCells();
+        if (cw === 0 || ch === 0) return;
+        waveStart = performance.now();
+        raf = requestAnimationFrame(drawWave);
+      } catch {
+        // sprites failed — canvas stays empty
+      }
+    })();
+
     return () => {
-      window.removeEventListener("mousemove", handler);
-      window.removeEventListener("blur", leaveHandler);
+      disposed = true;
       if (raf) cancelAnimationFrame(raf);
+      ro.disconnect();
     };
-  }, []);
-
-  useEffect(() => {
-    const cleanup = onMove();
-    return cleanup;
-  }, [onMove, dims]);
+  }, [mode]);
 
   return (
-    <div ref={containerRef} className={className}>
-      <div
-        ref={gridRef}
-        className="absolute inset-0"
-        style={{
-          display: "grid",
-          gridTemplateColumns: `repeat(${dims.cols}, 1fr)`,
-          gridTemplateRows: `repeat(${dims.rows}, 1fr)`,
-        }}
-      >
-        {cells}
-      </div>
-    </div>
+    <canvas
+      ref={canvasRef}
+      className={className}
+      style={{ display: "block", pointerEvents: "none", width: "100%", height: "100%" }}
+    />
   );
 }

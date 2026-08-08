@@ -41,6 +41,7 @@ export interface Project {
   instructions: string;
   files: ProjectFile[];
   images: ProjectImage[];
+  directory?: string | null;
 }
 
 export interface ChatSession {
@@ -64,6 +65,7 @@ export interface Provider {
   baseUrl: string;
   models: ProviderModel[];
   hasKey: boolean;
+  builtinKey?: string;
 }
 
 export interface UserSettings {
@@ -72,4 +74,8 @@ export interface UserSettings {
   showTimestamps: boolean;
   soundEffects: boolean;
   temporaryByDefault: boolean;
+  autoMemory: boolean;
+  fullName: string;
+  nickname: string;
+  instructions: string;
 }

@@ -5,13 +5,16 @@ import {
   CircleFadingPlus,
   GalleryVerticalEnd,
   ChartColumnBig,
-  Wrench,
   BotMessageSquare,
-  Rocket,
+  Settings,
+  Puzzle,
 } from "lucide-react"
+import { useState } from "react"
+import { toast } from "sonner"
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import { NavChats } from "@/components/nav-chats"
-import { NavUser } from "@/components/nav-user"
+import { NavAgentProjects } from "@/components/nav-agent-projects"
+import { IntegrationsDialog } from "@/components/integrations-dialog"
 import {
   Sidebar,
   SidebarContent,
@@ -24,8 +27,7 @@ import {
 } from "@/components/ui/sidebar"
 import type { ChatSession, Project } from "@/types"
 import {Tabs, TabsList, TabsTrigger} from "@/components/ui/tabs.tsx";
-
-
+import { useOpencodeContext } from "@/lib/opencode-context"
 
 type Tab = "chat" | "agent";
 
@@ -38,6 +40,7 @@ export function AppSidebar({
   onSelectSession,
   onNewChat,
   onDeleteChat,
+  onRenameChat,
   onSettings,
   onProjects,
   onHistory,
@@ -53,6 +56,7 @@ export function AppSidebar({
   onSelectSession: (id: string) => void
   onNewChat: () => void
   onDeleteChat: (id: string) => void
+  onRenameChat?: (id: string, title: string) => void
   onSettings?: () => void
   onProjects?: () => void
   onHistory?: () => void
@@ -60,8 +64,20 @@ export function AppSidebar({
   projects?: Project[]
 }) {
 
+  const oc = useOpencodeContext();
+  const [integrationsOpen, setIntegrationsOpen] = useState(false);
+
   const startDrag = (e: React.MouseEvent) => {
     if (e.button === 0) getCurrentWindow().startDragging();
+  };
+
+  const handleNewAgent = () => {
+    if (!oc.serving) {
+      toast("OpenCode server is not running");
+      return;
+    }
+    oc.selectSession(null);
+    oc.clearPendingDir();
   };
 
   return (
@@ -89,7 +105,7 @@ export function AppSidebar({
             <SidebarMenuItem>
               <SidebarMenuButton onClick={onNewChat} tooltip="New Chat">
                 <CircleFadingPlus />
-                <span>New Chat</span>
+                <span className="hidden-xs">New Chat</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
             <SidebarMenuItem>
@@ -104,25 +120,31 @@ export function AppSidebar({
                 <span>History</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton onClick={() => setIntegrationsOpen(true)} tooltip="Integrations">
+                <Puzzle />
+                <span>Integrations</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
           </SidebarMenu>
         ) : (
           <SidebarMenu>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={onNewChat} tooltip="New Agent">
+              <SidebarMenuButton onClick={handleNewAgent} tooltip="New Session">
                 <BotMessageSquare />
-                <span>New Agent</span>
+                <span>New Session</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => onComingSoon?.("Tools")} tooltip="Tools">
-                <Wrench />
-                <span>Tools</span>
+              <SidebarMenuButton onClick={() => onProjects?.()} tooltip="Projects">
+                <ChartColumnBig />
+                <span>Projects</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => onComingSoon?.("Deployments")} tooltip="Deployments">
-                <Rocket />
-                <span>Deployments</span>
+              <SidebarMenuButton onClick={() => setIntegrationsOpen(true)} tooltip="Integrations">
+                <Puzzle />
+                <span>Integrations</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
@@ -136,25 +158,39 @@ export function AppSidebar({
             activeSessionId={activeSessionId}
             onSelect={onSelectSession}
             onDelete={onDeleteChat}
+            onRename={onRenameChat}
             projects={projects}
             label="Recent"
           />
         ) : (
-          <NavChats
-            sessions={agentSessions}
-            activeSessionId={activeSessionId}
-            onSelect={onSelectSession}
-            onDelete={onDeleteChat}
-            projects={projects}
-            label="Recent"
+          <NavAgentProjects
+            projects={projects ?? []}
+            sessions={oc.sessions}
+            activeSessionId={oc.activeSessionId}
+            onSelectSession={(id) => oc.selectSession(id)}
+            onDeleteSession={(id) => oc.deleteSession(id)}
+            onRenameSession={(id, title) => oc.renameSession(id, title)}
           />
         )}
       </SidebarContent>
 
       <SidebarFooter>
-        <NavUser onSettings={onSettings} />
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton onClick={onSettings} tooltip="Settings">
+              <Settings />
+              <span>Settings</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
       </SidebarFooter>
       <SidebarRail />
+      <IntegrationsDialog
+        open={integrationsOpen}
+        onOpenChange={setIntegrationsOpen}
+        serving={oc.serving}
+        activeDirectory={oc.activeDirectory}
+      />
     </Sidebar>
   )
 }

@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useRef } from "react";
+import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import {
   Plus,
@@ -7,6 +8,18 @@ import {
   KeyRound,
   Server,
   Cpu,
+  Download,
+  Upload,
+  Sun,
+  Moon,
+  Monitor,
+  Brain,
+  Bot,
+  MessageSquare,
+  User,
+  Settings as SettingsIcon,
+  Eye,
+  EyeOff,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +31,9 @@ import {
 } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
 import { Switch } from "@/components/ui/switch";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import {
   Dialog,
@@ -28,11 +44,17 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { ProviderForm } from "@/components/provider-form";
+import { ModelForm } from "@/components/model-form";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
+import { useProjects } from "@/hooks/use-projects";
+import { exportAllData, importAllData } from "@/lib/llm";
+import { getBuiltinProvider } from "@/lib/builtin-providers";
+import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync } from "@/lib/model-capabilities";
+import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
 import type { Provider, ProviderModel } from "@/types";
 
-type SettingsTab = "general" | "privacy" | "providers";
+type SettingsTab = "general" | "memory" | "models" | "chat" | "agents";
 
 export function SettingsDialog({
   open,
@@ -41,34 +63,46 @@ export function SettingsDialog({
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [activeTab, setActiveTab] = useState<SettingsTab>("providers");
-  const { providers, loading, createProvider, updateProvider, deleteProvider } =
+  const [activeTab, setActiveTab] = useState<SettingsTab>("general");
+  const { providers, loading, createProvider, updateProvider, deleteProvider, addModel, removeModel, updateModelDisplayName } =
     useProviders();
+  const { projects } = useProjects();
   const { settings, updateSettings } = useUserSettings();
+  const { theme, setTheme } = useTheme();
 
-  const [showForm, setShowForm] = useState(false);
+  const [showProviderForm, setShowProviderForm] = useState(false);
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Provider | null>(null);
 
+  const [showModelForm, setShowModelForm] = useState(false);
+  const [editingModel, setEditingModel] = useState<{ providerId: string; model: ProviderModel } | null>(null);
+  const [deleteModelTarget, setDeleteModelTarget] = useState<{ providerId: string; model: ProviderModel } | null>(null);
+  const [visionTick, setVisionTick] = useState(0);
+  const [memoryTick, setMemoryTick] = useState(0);
+  const [memoryProjectId, setMemoryProjectId] = useState<string | null>(null);
+  const [newMemoryText, setNewMemoryText] = useState("");
+
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   const allModels = providers.flatMap((p) =>
-    p.models.map((m) => ({ ...m, providerName: p.name }))
+    p.models.map((m) => ({ ...m, providerId: p.id, providerName: p.name, builtinKey: p.builtinKey }))
   );
 
   const handleSaveProvider = async (
     name: string,
     baseUrl: string,
     apiKey: string,
-    models: ProviderModel[]
+    builtinKey?: string,
   ) => {
     try {
       if (editingProvider) {
-        await updateProvider(editingProvider.id, name, baseUrl, apiKey, models);
+        await updateProvider(editingProvider.id, name, baseUrl, apiKey, [], builtinKey);
         toast.success("Provider updated");
       } else {
-        await createProvider(name, baseUrl, apiKey, models);
+        await createProvider(name, baseUrl, apiKey, [], builtinKey);
         toast.success("Provider added");
       }
-      setShowForm(false);
+      setShowProviderForm(false);
       setEditingProvider(null);
     } catch (err) {
       toast.error(
@@ -90,35 +124,114 @@ export function SettingsDialog({
     }
   };
 
-  const tabs: [SettingsTab, string][] = [
-    ["providers", "Providers"],
-    ["general", "General"],
-    ["privacy", "Privacy"],
+  const handleAddModel = async (providerId: string, model: ProviderModel) => {
+    try {
+      await addModel(providerId, model);
+      toast.success("Model added");
+      setShowModelForm(false);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to add model"
+      );
+    }
+  };
+
+  const handleDeleteModel = async () => {
+    if (!deleteModelTarget) return;
+    try {
+      await removeModel(deleteModelTarget.providerId, deleteModelTarget.model.id);
+      toast.success("Model removed");
+      setDeleteModelTarget(null);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to remove model"
+      );
+    }
+  };
+
+  const handleSaveModelDisplayName = async (displayName: string) => {
+    if (!editingModel) return;
+    try {
+      await updateModelDisplayName(editingModel.providerId, editingModel.model.id, displayName);
+      toast.success("Model name updated");
+      setEditingModel(null);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to update model name"
+      );
+    }
+  };
+
+  const handleExport = () => {
+    try {
+      const json = exportAllData();
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `chatui-export-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Data exported");
+    } catch (err) {
+      toast.error("Failed to export data");
+    }
+  };
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      importAllData(text);
+      toast.success("Data imported. Reloading...");
+      setTimeout(() => window.location.reload(), 1000);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to import data"
+      );
+    }
+    e.target.value = "";
+  };
+
+  const tabs: [SettingsTab, string, React.ReactNode][] = [
+    ["general", "General", <SettingsIcon className="size-4" />],
+    ["memory", "Memory", <Brain className="size-4" />],
+    ["models", "Models", <Cpu className="size-4" />],
+    ["chat", "Chat", <MessageSquare className="size-4" />],
+    ["agents", "Agents", <Bot className="size-4" />],
+  ];
+
+  const themeOptions: [string, string, React.ReactNode][] = [
+    ["system", "System", <Monitor className="size-4" />],
+    ["dark", "Dark", <Moon className="size-4" />],
+    ["light", "Light", <Sun className="size-4" />],
   ];
 
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent>
+        <DialogContent className="max-w-3xl">
           <DialogHeader className="shrink-0">
             <DialogTitle>Settings</DialogTitle>
             <DialogDescription>
-              Manage your providers, preferences, and privacy options.
+              Manage your preferences, memory, providers, and models.
             </DialogDescription>
           </DialogHeader>
 
-          <div className="flex flex-1 overflow-hidden gap-4">
+          <div className="flex flex-1 overflow-hidden gap-4 min-h-[400px]">
             <div className="flex w-40 flex-col gap-1">
-              {tabs.map(([key, label]) => (
+              {tabs.map(([key, label, icon]) => (
                 <button
                   key={key}
                   onClick={() => setActiveTab(key)}
-                  className={`rounded-md px-3 py-2 text-left text-sm transition-colors ${
+                  className={`flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors ${
                     activeTab === key
                       ? "bg-accent text-accent-foreground font-medium"
                       : "text-muted-foreground hover:bg-accent/50"
                   }`}
                 >
+                  {icon}
                   {label}
                 </button>
               ))}
@@ -126,156 +239,59 @@ export function SettingsDialog({
 
             <div className="flex-1 overflow-y-auto">
               <div className="mx-auto max-w-2xl">
-                {activeTab === "providers" && (
-                  <div className="flex flex-col gap-4">
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <h2 className="text-xl font-semibold">AI Providers</h2>
-                        <p className="text-sm text-muted-foreground">
-                          Manage your AI model providers and API keys
-                        </p>
-                      </div>
-                      {!showForm && (
-                        <Button
-                          onClick={() => {
-                            setEditingProvider(null);
-                            setShowForm(true);
-                          }}
-                        >
-                          <Plus className="size-4" />
-                          Add Provider
-                        </Button>
-                      )}
-                    </div>
-
-                    {showForm && (
-                      <ProviderForm
-                        provider={editingProvider}
-                        onSave={handleSaveProvider}
-                        onCancel={() => {
-                          setShowForm(false);
-                          setEditingProvider(null);
-                        }}
-                      />
-                    )}
-
-                    {loading ? (
-                      <p className="text-sm text-muted-foreground">Loading providers...</p>
-                    ) : providers.length === 0 && !showForm ? (
-                      <Card className="border-dashed">
-                        <CardContent className="flex flex-col items-center gap-2 py-10">
-                          <Server className="size-8 text-muted-foreground" />
-                          <p className="text-sm text-muted-foreground">
-                            No providers configured yet
-                          </p>
-                          <Button
-                            variant="outline"
-                            onClick={() => setShowForm(true)}
-                          >
-                            <Plus className="size-4" />
-                            Add your first provider
-                          </Button>
-                        </CardContent>
-                      </Card>
-                    ) : (
-                      <div className="flex flex-col gap-3">
-                        {providers.map((provider) => (
-                          <Card key={provider.id}>
-                            <CardHeader>
-                              <div className="flex items-start justify-between">
-                                <div className="flex flex-col gap-1">
-                                  <CardTitle className="flex items-center gap-2">
-                                    <Cpu className="size-4" />
-                                    {provider.name}
-                                  </CardTitle>
-                                  <CardDescription className="flex items-center gap-2">
-                                    <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
-                                      {provider.baseUrl}
-                                    </code>
-                                  </CardDescription>
-                                </div>
-                                <div className="flex gap-1">
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    onClick={() => {
-                                      setEditingProvider(provider);
-                                      setShowForm(true);
-                                    }}
-                                  >
-                                    <Pencil className="size-4" />
-                                  </Button>
-                                  <Button
-                                    variant="ghost"
-                                    size="icon"
-                                    onClick={() => setDeleteTarget(provider)}
-                                  >
-                                    <Trash2 className="size-4 text-destructive" />
-                                  </Button>
-                                </div>
-                              </div>
-                            </CardHeader>
-                            <CardContent>
-                              <div className="flex flex-wrap gap-2">
-                                {provider.models.map((model) => (
-                                  <span
-                                    key={model.id}
-                                    className="rounded-md bg-muted px-2 py-1 text-xs font-medium"
-                                  >
-                                    {model.displayName || model.name}
-                                  </span>
-                                ))}
-                              </div>
-                              <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
-                                <KeyRound className="size-3" />
-                                {provider.hasKey ? "API key set" : "No API key"}
-                              </div>
-                            </CardContent>
-                          </Card>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-
+                {/* ─── General Tab ─── */}
                 {activeTab === "general" && (
                   <div className="flex flex-col gap-6">
                     <div className="flex flex-col gap-4">
                       <h2 className="text-xl font-semibold">General</h2>
                       <Separator />
+
+                      <div className="flex flex-col gap-2">
+                        <Label className="flex items-center gap-2">
+                          <User className="size-4" />
+                          Full Name
+                        </Label>
+                        <Input
+                          placeholder="Your full name"
+                          value={settings.fullName}
+                          onChange={(e) => updateSettings({ fullName: e.target.value })}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          Used for your identity in the app
+                        </p>
+                      </div>
+
+                      <Separator />
+
+                      <div className="flex flex-col gap-2">
+                        <Label>Theme</Label>
+                        <div className="flex gap-2">
+                          {themeOptions.map(([value, label, icon]) => (
+                            <button
+                              key={value}
+                              onClick={() => setTheme(value)}
+                              className={`flex items-center gap-2 rounded-lg border px-4 py-2 text-sm transition-colors ${
+                                theme === value
+                                  ? "border-primary bg-primary text-primary-foreground"
+                                  : "border-border hover:bg-accent"
+                              }`}
+                            >
+                              {icon}
+                              {label}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
+
+                      <Separator />
+
                       <div className="flex items-center justify-between">
                         <div className="flex flex-col gap-0.5">
-                          <span className="text-sm">Default model</span>
+                          <span className="text-sm">Send on Enter</span>
                           <span className="text-xs text-muted-foreground">
-                            Model used for new conversations
+                            Press Enter to send, Shift+Enter for newline
                           </span>
                         </div>
-                        <Select
-                          value={settings.defaultModel ?? ""}
-                          onValueChange={(v) =>
-                            updateSettings({ defaultModel: v || null })
-                          }
-                        >
-                          <SelectTrigger size="sm" className="w-48">
-                            <SelectValue placeholder="Select model" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {allModels.length === 0 ? (
-                              <SelectItem value="__none__" disabled>
-                                No models available
-                              </SelectItem>
-                            ) : (
-                              allModels.map((m) => (
-                                <SelectItem key={m.id} value={m.name}>
-                                  {m.displayName || m.name} ({m.providerName})
-                                </SelectItem>
-                              ))
-                            )}
-                          </SelectContent>
-                        </Select>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm">Send on Enter</span>
                         <Switch
                           checked={settings.sendOnEnter}
                           onCheckedChange={(v) =>
@@ -305,33 +321,489 @@ export function SettingsDialog({
                   </div>
                 )}
 
-                {activeTab === "privacy" && (
+                {/* ─── Memory Tab ─── */}
+                {activeTab === "memory" && (
                   <div className="flex flex-col gap-6">
                     <div className="flex flex-col gap-4">
-                      <h2 className="text-xl font-semibold">Privacy</h2>
+                      <h2 className="text-xl font-semibold">Memory</h2>
+                      <p className="text-sm text-muted-foreground">
+                        These settings are applied to all models throughout the app.
+                      </p>
                       <Separator />
+
+                      <div className="flex flex-col gap-2">
+                        <Label htmlFor="nickname">Nickname</Label>
+                        <Input
+                          id="nickname"
+                          placeholder="e.g. Tom, buddy, chief"
+                          value={settings.nickname}
+                          onChange={(e) => updateSettings({ nickname: e.target.value })}
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          How the AI should address you
+                        </p>
+                      </div>
+
+                      <div className="flex flex-col gap-2">
+                        <Label htmlFor="instructions">Global Instructions</Label>
+                        <Textarea
+                          id="instructions"
+                          placeholder="e.g. Always respond concisely. Use TypeScript code examples. Be direct and honest."
+                          value={settings.instructions}
+                          onChange={(e) => updateSettings({ instructions: e.target.value })}
+                          className="min-h-32"
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          These instructions are prepended to every conversation as a system message
+                        </p>
+                      </div>
+
+                      <Separator />
+
                       <div className="flex items-center justify-between">
                         <div className="flex flex-col gap-0.5">
-                          <span className="text-sm">Temporary chat by default</span>
+                          <span className="text-sm font-medium">Auto-save memory</span>
                           <span className="text-xs text-muted-foreground">
-                            New chats won&apos;t be saved
+            Automatically extract and remember durable facts from your conversations
                           </span>
                         </div>
                         <Switch
-                          checked={settings.temporaryByDefault}
-                          onCheckedChange={(v) =>
-                            updateSettings({ temporaryByDefault: v })
-                          }
+                          checked={settings.autoMemory}
+                          onCheckedChange={(v) => updateSettings({ autoMemory: v })}
                         />
                       </div>
-                      <Button
-                        variant="outline"
-                        className="justify-start text-destructive hover:text-destructive w-fit"
-                        onClick={() => toast.info("Use the sidebar delete buttons to clear individual chats")}
-                      >
-                        <Trash2 />
-                        Clear all chat history
-                      </Button>
+
+                      {/* Universal memory list */}
+                      <div className="flex flex-col gap-2">
+                        <Label>Universal Memory</Label>
+                        <div className="flex gap-2">
+                          <Input
+                            placeholder="Add a memory manually…"
+                            value={newMemoryText}
+                            onChange={(e) => setNewMemoryText(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter" && newMemoryText.trim()) {
+                                addMemory("global", newMemoryText.trim());
+                                setNewMemoryText("");
+                                setMemoryTick((t) => t + 1);
+                              }
+                            }}
+                          />
+                          <Button
+                            size="sm"
+                            disabled={!newMemoryText.trim()}
+                            onClick={() => {
+                              addMemory("global", newMemoryText.trim());
+                              setNewMemoryText("");
+                              setMemoryTick((t) => t + 1);
+                            }}
+                          >
+                            <Plus className="size-4" /> Add
+                          </Button>
+                        </div>
+                        {(() => {
+                          void memoryTick;
+                          const entries = loadMemory("global");
+                          if (entries.length === 0) {
+                            return <p className="text-xs text-muted-foreground">No memories saved yet.</p>;
+                          }
+                          return (
+                            <div className="flex flex-col gap-1.5">
+                              {entries.map((entry) => (
+                                <div key={entry.id} className="flex items-start justify-between gap-2 rounded-lg border p-2.5 text-xs">
+                                  <span>{entry.text}</span>
+                                  <Button
+                                    variant="ghost"
+                                    size="icon-xs"
+                                    className="shrink-0 text-muted-foreground hover:text-destructive"
+                                    onClick={() => { deleteMemory("global", entry.id); setMemoryTick((t) => t + 1); }}
+                                  >
+                                    <Trash2 className="size-3" />
+                                  </Button>
+                                </div>
+                              ))}
+                            </div>
+                          );
+                        })()}
+                      </div>
+
+                      {/* Project memory */}
+                      {projects.length > 0 && (
+                        <div className="flex flex-col gap-2">
+                          <Label>Project Memory</Label>
+                          <Select
+                            value={memoryProjectId ?? ""}
+                            onValueChange={(v) => setMemoryProjectId(v || null)}
+                          >
+                            <SelectTrigger size="sm" className="w-full">
+                              <SelectValue placeholder="Select a project" />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {projects.map((p) => (
+                                <SelectItem key={p.id} value={p.id}>{p.name}</SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          {memoryProjectId && (() => {
+                            void memoryTick;
+                            const entries = loadMemory(memoryProjectId);
+                            if (entries.length === 0) {
+                              return <p className="text-xs text-muted-foreground">No project memories yet.</p>;
+                            }
+                            return (
+                              <div className="flex flex-col gap-1.5">
+                                {entries.map((entry) => (
+                                  <div key={entry.id} className="flex items-start justify-between gap-2 rounded-lg border p-2.5 text-xs">
+                                    <span>{entry.text}</span>
+                                    <Button
+                                      variant="ghost"
+                                      size="icon-xs"
+                                      className="shrink-0 text-muted-foreground hover:text-destructive"
+                                      onClick={() => { deleteMemory(memoryProjectId, entry.id); setMemoryTick((t) => t + 1); }}
+                                    >
+                                      <Trash2 className="size-3" />
+                                    </Button>
+                                  </div>
+                                ))}
+                              </div>
+                            );
+                          })()}
+                        </div>
+                      )}
+
+                      <Separator />
+
+                      <div className="flex items-center gap-2">
+                        <Button variant="outline" onClick={handleExport}>
+                          <Download className="size-4" />
+                          Export Data
+                        </Button>
+                        <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
+                          <Upload className="size-4" />
+                          Import Data
+                        </Button>
+                        <input
+                          ref={fileInputRef}
+                          type="file"
+                          accept="application/json"
+                          className="hidden"
+                          onChange={handleImport}
+                        />
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        Export includes all providers, settings, projects, and conversation history
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* ─── Models Tab ─── */}
+                {activeTab === "models" && (
+                  <div className="flex flex-col gap-6">
+                    {/* Providers Section */}
+                    <div className="flex flex-col gap-4">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h2 className="text-xl font-semibold">Providers</h2>
+                          <p className="text-sm text-muted-foreground">
+                            Configure your AI provider endpoints and API keys
+                          </p>
+                        </div>
+                        {!showProviderForm && (
+                          <Button
+                            onClick={() => {
+                              setEditingProvider(null);
+                              setShowProviderForm(true);
+                            }}
+                          >
+                            <Plus className="size-4" />
+                            Add Provider
+                          </Button>
+                        )}
+                      </div>
+
+                      {showProviderForm && (
+                        <ProviderForm
+                          provider={editingProvider}
+                          onSave={handleSaveProvider}
+                          onCancel={() => {
+                            setShowProviderForm(false);
+                            setEditingProvider(null);
+                          }}
+                        />
+                      )}
+
+                      {loading ? (
+                        <p className="text-sm text-muted-foreground">Loading providers...</p>
+                      ) : providers.length === 0 && !showProviderForm ? (
+                        <Card className="border-dashed">
+                          <CardContent className="flex flex-col items-center gap-2 py-10">
+                            <Server className="size-8 text-muted-foreground" />
+                            <p className="text-sm text-muted-foreground">
+                              No providers configured yet
+                            </p>
+                            <Button
+                              variant="outline"
+                              onClick={() => setShowProviderForm(true)}
+                            >
+                              <Plus className="size-4" />
+                              Add your first provider
+                            </Button>
+                          </CardContent>
+                        </Card>
+                      ) : (
+                        <div className="flex flex-col gap-3">
+                          {providers.map((provider) => {
+                            const builtin = provider.builtinKey ? getBuiltinProvider(provider.builtinKey) : null;
+                            return (
+                              <Card key={provider.id}>
+                                <CardHeader>
+                                  <div className="flex items-start justify-between">
+                                    <div className="flex flex-col gap-1">
+                                      <CardTitle className="flex items-center gap-2">
+                                        <Cpu className="size-4" />
+                                        {provider.name}
+                                        {builtin && (
+                                          <span className="rounded-full bg-secondary px-2 py-0.5 text-[10px] text-secondary-foreground">
+                                            built-in
+                                          </span>
+                                        )}
+                                      </CardTitle>
+                                      <CardDescription className="flex items-center gap-2">
+                                        <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
+                                          {provider.baseUrl || "(local)"}
+                                        </code>
+                                      </CardDescription>
+                                    </div>
+                                    <div className="flex gap-1">
+                                      <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        onClick={() => {
+                                          setEditingProvider(provider);
+                                          setShowProviderForm(true);
+                                        }}
+                                      >
+                                        <Pencil className="size-4" />
+                                      </Button>
+                                      <Button
+                                        variant="ghost"
+                                        size="icon"
+                                        onClick={() => setDeleteTarget(provider)}
+                                      >
+                                        <Trash2 className="size-4 text-destructive" />
+                                      </Button>
+                                    </div>
+                                  </div>
+                                </CardHeader>
+                                <CardContent>
+                                  <div className="flex flex-wrap gap-2">
+                                    {provider.models.map((model) => (
+                                      <span
+                                        key={model.id}
+                                        className="rounded-md bg-muted px-2 py-1 text-xs font-medium"
+                                      >
+                                        {model.displayName || model.name}
+                                      </span>
+                                    ))}
+                                    {provider.models.length === 0 && (
+                                      <span className="text-xs text-muted-foreground">
+                                        No models added yet
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+                                    <KeyRound className="size-3" />
+                                    {provider.hasKey ? "API key set" : "No API key"}
+                                    <span className="mx-1">·</span>
+                                    {provider.models.length} model{provider.models.length !== 1 ? "s" : ""}
+                                  </div>
+                                </CardContent>
+                              </Card>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+
+                    <Separator />
+
+                    {/* Models Section */}
+                    <div className="flex flex-col gap-4">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <h2 className="text-xl font-semibold">Models</h2>
+                          <p className="text-sm text-muted-foreground">
+                            Add models to your providers and select a default
+                          </p>
+                        </div>
+                        {!showModelForm && (
+                          <Button
+                            onClick={() => setShowModelForm(true)}
+                            disabled={providers.length === 0}
+                          >
+                            <Plus className="size-4" />
+                            Add Model
+                          </Button>
+                        )}
+                      </div>
+
+                      {showModelForm && (
+                        <ModelForm
+                          providers={providers}
+                          onSave={handleAddModel}
+                          onCancel={() => setShowModelForm(false)}
+                        />
+                      )}
+
+                      <div className="flex items-center justify-between">
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-sm font-medium">Default Model</span>
+                          <span className="text-xs text-muted-foreground">
+                            Model used for new conversations
+                          </span>
+                        </div>
+                        <Select
+                          value={settings.defaultModel ?? ""}
+                          onValueChange={(v) =>
+                            updateSettings({ defaultModel: v || null })
+                          }
+                        >
+                          <SelectTrigger size="sm" className="w-56">
+                            <SelectValue placeholder="Select model" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {allModels.length === 0 ? (
+                              <SelectItem value="__none__" disabled>
+                                No models available
+                              </SelectItem>
+                            ) : (
+                              allModels.map((m) => (
+                                <SelectItem key={m.id} value={m.name}>
+                                  {m.displayName || m.name} ({m.providerName})
+                                </SelectItem>
+                              ))
+                            )}
+                          </SelectContent>
+                        </Select>
+                      </div>
+
+                      {allModels.length > 0 && (
+                        <div className="flex flex-col gap-2">
+                          {allModels.map((m) => {
+                            void visionTick;
+                            const provider = providers.find((p) => p.id === m.providerId);
+                            const override = getVisionOverride(m.providerId, m.name);
+                            const caps = provider ? getModelCapabilitiesSync(provider, m.name) : null;
+                            const visionOn = override ?? caps?.vision ?? false;
+                            const cycleVision = () => {
+                              if (override === undefined) setVisionOverride(m.providerId, m.name, true);
+                              else if (override === true) setVisionOverride(m.providerId, m.name, false);
+                              else setVisionOverride(m.providerId, m.name, undefined);
+                              setVisionTick((t) => t + 1);
+                            };
+                            return (
+                            <div
+                              key={m.id}
+                              className="flex items-center justify-between rounded-lg border p-3"
+                            >
+                              <div className="flex flex-col gap-0.5">
+                                <span className="text-sm font-medium">
+                                  {m.displayName || m.name}
+                                </span>
+                                <span className="text-xs text-muted-foreground">
+                                  {m.name} · {m.providerName}
+                                  {settings.defaultModel === m.name && (
+                                    <span className="ml-2 rounded-full bg-primary/10 text-primary px-2 py-0.5 text-[10px]">
+                                      default
+                                    </span>
+                                  )}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <Button
+                                  variant="ghost"
+                                  size="xs"
+                                  onClick={cycleVision}
+                                  title={`Vision: ${override === undefined ? "auto" : override ? "on" : "off"}${caps ? ` (detected: ${caps.vision ? "yes" : "no"})` : ""}`}
+                                  className={visionOn ? "text-primary" : "text-muted-foreground"}
+                                >
+                                  {visionOn ? <Eye className="size-3.5" /> : <EyeOff className="size-3.5" />}
+                                  <span className="text-[10px]">{override === undefined ? "auto" : override ? "vision" : "no vision"}</span>
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  onClick={() => {
+                                    setEditingModel({ providerId: m.providerId, model: { id: m.id, name: m.name, displayName: m.displayName } });
+                                  }}
+                                >
+                                  <Pencil className="size-3.5" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  onClick={() => setDeleteModelTarget({ providerId: m.providerId, model: { id: m.id, name: m.name, displayName: m.displayName } })}
+                                >
+                                  <Trash2 className="size-3.5 text-destructive" />
+                                </Button>
+                              </div>
+                            </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {allModels.length === 0 && !showModelForm && (
+                        <Card className="border-dashed">
+                          <CardContent className="flex flex-col items-center gap-2 py-10">
+                            <Cpu className="size-8 text-muted-foreground" />
+                            <p className="text-sm text-muted-foreground">
+                              No models added yet
+                            </p>
+                            <Button
+                              variant="outline"
+                              onClick={() => setShowModelForm(true)}
+                              disabled={providers.length === 0}
+                            >
+                              <Plus className="size-4" />
+                              Add your first model
+                            </Button>
+                          </CardContent>
+                        </Card>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* ─── Chat Tab ─── */}
+                {activeTab === "chat" && (
+                  <div className="flex flex-col gap-6">
+                    <div className="flex flex-col gap-4">
+                      <h2 className="text-xl font-semibold">Chat</h2>
+                      <Separator />
+                      <div className="flex flex-col items-center justify-center py-16 text-center">
+                        <MessageSquare className="size-10 text-muted-foreground/40" />
+                        <p className="mt-3 text-sm text-muted-foreground">
+                          Chat settings coming soon
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                {/* ─── Agents Tab ─── */}
+                {activeTab === "agents" && (
+                  <div className="flex flex-col gap-6">
+                    <div className="flex flex-col gap-4">
+                      <h2 className="text-xl font-semibold">Agents</h2>
+                      <Separator />
+                      <div className="flex flex-col items-center justify-center py-16 text-center">
+                        <Bot className="size-10 text-muted-foreground/40" />
+                        <p className="mt-3 text-sm text-muted-foreground">
+                          Agent settings coming soon
+                        </p>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -341,6 +813,7 @@ export function SettingsDialog({
         </DialogContent>
       </Dialog>
 
+      {/* Delete Provider Dialog */}
       <Dialog
         open={!!deleteTarget}
         onOpenChange={(o) => !o && setDeleteTarget(null)}
@@ -350,7 +823,7 @@ export function SettingsDialog({
             <DialogTitle>Delete Provider</DialogTitle>
             <DialogDescription>
               Are you sure you want to delete "{deleteTarget?.name}"? This will
-              remove the provider and its API key from Vault. This action cannot
+              remove the provider, its API key, and all its models. This action cannot
               be undone.
             </DialogDescription>
           </DialogHeader>
@@ -364,6 +837,83 @@ export function SettingsDialog({
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Delete Model Dialog */}
+      <Dialog
+        open={!!deleteModelTarget}
+        onOpenChange={(o) => !o && setDeleteModelTarget(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Remove Model</DialogTitle>
+            <DialogDescription>
+              Remove "{deleteModelTarget?.model.displayName || deleteModelTarget?.model.name}" from this provider?
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteModelTarget(null)}>
+              Cancel
+            </Button>
+            <Button variant="destructive" onClick={handleDeleteModel}>
+              Remove
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Model Display Name Dialog */}
+      <Dialog
+        open={!!editingModel}
+        onOpenChange={(o) => !o && setEditingModel(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit Model Name</DialogTitle>
+            <DialogDescription>
+              Change the display name for "{editingModel?.model.name}"
+            </DialogDescription>
+          </DialogHeader>
+          <EditModelNameForm
+            initialName={editingModel?.model.displayName ?? ""}
+            onSave={handleSaveModelDisplayName}
+            onCancel={() => setEditingModel(null)}
+          />
+        </DialogContent>
+      </Dialog>
     </>
+  );
+}
+
+function EditModelNameForm({
+  initialName,
+  onSave,
+  onCancel,
+}: {
+  initialName: string;
+  onSave: (name: string) => void;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(initialName);
+  return (
+    <div className="flex flex-col gap-4 pt-2">
+      <Input
+        autoFocus
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="Display name"
+        onKeyDown={(e) => {
+          if (e.key === "Enter") onSave(name);
+          if (e.key === "Escape") onCancel();
+        }}
+      />
+      <div className="flex justify-end gap-2">
+        <Button variant="outline" size="sm" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button size="sm" onClick={() => onSave(name)}>
+          Save
+        </Button>
+      </div>
+    </div>
   );
 }

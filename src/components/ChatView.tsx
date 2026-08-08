@@ -12,7 +12,6 @@ import {
   ChevronRight,
   Image as ImageIcon,
   Microscope,
-  MessageSquare,
   MoreHorizontal,
   Pencil,
   Plus,
@@ -20,9 +19,9 @@ import {
   ScrollText,
   GalleryVerticalEnd,
   Search,
-  Share,
   FolderPlus,
   FileText,
+  FileCode,
   Trash2,
   X,
   RotateCcw,
@@ -30,9 +29,6 @@ import {
   SquareTerminal,
   Brain,
   Globe,
-  CloudSun,
-  Clock,
-  Calendar,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/app-sidebar";
@@ -40,6 +36,9 @@ import { AgentView } from "@/components/AgentView";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SettingsDialog } from "@/pages/settings";
 import { InteractiveGrid } from "@/components/interactive-grid";
+import { ArtifactPanel } from "@/components/artifact-panel";
+import { extractArtifacts, type Artifact } from "@/lib/artifacts";
+import { OpenCodeProvider } from "@/lib/opencode-context";
 import {
   Attachment,
   AttachmentAction,
@@ -124,13 +123,16 @@ import { useMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
-import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage } from "@/lib/llm";
+import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
 import { getAllTools } from "@/lib/tools";
 import {
   buildMessageTree,
   getActivePath,
   getSiblings,
 } from "@/lib/message-tree";
+import { prepareAttachmentContext } from "@/lib/attachment-context";
+import { getModelCapabilities } from "@/lib/model-capabilities";
+import { buildMemoryContext, extractAndSaveMemory, loadMemory } from "@/lib/memory";
 
 function generateId() {
   if (typeof crypto !== "undefined" && crypto.randomUUID) {
@@ -149,6 +151,8 @@ function formatBytes(bytes: number) {
   const value = bytes / 1024 ** i;
   return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
+
+type PendingFile = MessageAttachment & { file?: File };
 
 const WELCOME_PROMPTS = [
   "What do you want to know?",
@@ -171,17 +175,13 @@ const WELCOME_PROMPTS = [
   "Ask away, the floor is yours.",
 ];
 
+const RESEARCH_PROMPT =
+  "You are in research mode. Be thorough: use the web_fetch tool to look up information when needed, cite sources by URL, and provide well-organized, factual answers. Prefer accuracy over brevity.";
+
 const SKILLS = [
-  { id: "web-search", name: "Web Search", Icon: Search },
   { id: "code-interpreter", name: "Code Interpreter", Icon: FileText },
   { id: "image-gen", name: "Image Generation", Icon: ImageIcon },
   { id: "data-analysis", name: "Data Analysis", Icon: ChartColumnBig },
-];
-
-const ALWAYS_ON_TOOLS_INFO = [
-  { name: "Time", Icon: Clock },
-  { name: "Date", Icon: Calendar },
-  { name: "Weather", Icon: CloudSun },
 ];
 
 export function ChatView() {
@@ -205,7 +205,7 @@ export function ChatView() {
   );
   const { messages, addMessage, deleteTemporaryMessages } = useMessages(activeSessionId);
   const [inputText, setInputText] = useState("");
-  const [files, setFiles] = useState<MessageAttachment[]>([]);
+  const [files, setFiles] = useState<PendingFile[]>([]);
   const [isThinking, setIsThinking] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
   const [streamingReasoning, setStreamingReasoning] = useState("");
@@ -225,6 +225,8 @@ export function ChatView() {
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [projectSearch, setProjectSearch] = useState("");
   const [historySearch, setHistorySearch] = useState("");
+  const [renamingHistory, setRenamingHistory] = useState<{ id: string; title: string } | null>(null);
+  const [historyRenameDraft, setHistoryRenameDraft] = useState("");
   const [projectInputText, setProjectInputText] = useState("");
   const [selectedModel, setSelectedModel] = useState<string>("");
   const [abortController, setAbortController] =
@@ -243,6 +245,10 @@ export function ChatView() {
   const [editingProjectField, setEditingProjectField] = useState<string | null>(null);
   const [projectNameDraft, setProjectNameDraft] = useState("");
   const [projectInstructionsDraft, setProjectInstructionsDraft] = useState("");
+  const [showNewProjectCard, setShowNewProjectCard] = useState(false);
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectInstructions, setNewProjectInstructions] = useState("");
+  const [artifactPanel, setArtifactPanel] = useState<{ artifacts: Artifact[]; activeIndex: number } | null>(null);
 
   useEffect(() => {
     if (settings.temporaryByDefault) setIsTemporary(true);
@@ -274,6 +280,9 @@ export function ChatView() {
   const currentProjectName = projects.find(
     (p) => p.id === currentProjectId,
   )?.name;
+  const currentProjectInstructions = projects.find(
+    (p) => p.id === currentProjectId,
+  )?.instructions;
 
   const displayMessages: ChatMessage[] = activeSessionId
     ? messages
@@ -334,6 +343,7 @@ export function ChatView() {
           previewUrl: file.type.startsWith("image/")
             ? URL.createObjectURL(file)
             : undefined,
+          file,
         })),
       ]);
     }
@@ -363,6 +373,18 @@ export function ChatView() {
       toast.error("No provider configured. Add one in Settings.");
       setSettingsOpen(true);
       return;
+    }
+
+    // Vision check: block image attachments for non-vision models
+    const hasImages = files.some((f) => f.type.startsWith("image/"));
+    if (hasImages) {
+      const caps = await getModelCapabilities(provider, selectedModel);
+      if (!caps.vision) {
+        toast.error(
+          `${selectedModelLabel?.displayName || selectedModelLabel?.name || selectedModel} doesn't support image input. Remove the image or switch to a vision-capable model.`,
+        );
+        return;
+      }
     }
 
     const attachments = files.length > 0 ? files : undefined;
@@ -413,12 +435,26 @@ export function ChatView() {
         isTemporary,
       );
 
+      updateSession(sessionId, {});
+
+      const modelLabel = selectedModelLabel?.displayName || selectedModelLabel?.name || selectedModel;
+      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, selectedModel, modelLabel);
+      if (prep.blocked) {
+        toast.error(prep.warning ?? "This model doesn't support images.");
+        return;
+      }
+      const userContent: string | ContentPart[] = prep.content;
+
+      const memoryContext = settings.autoMemory ? await buildMemoryContext(currentProjectId ?? null, text) : "";
+      const effectiveInstructions = [currentProjectInstructions, memoryContext, isResearch ? RESEARCH_PROMPT : null]
+        .filter(Boolean).join("\n\n") || undefined;
+
       const completionMessages: ChatCompletionMessage[] = [
         ...activePath.map((n) => ({
           role: n.message.role as "user" | "assistant" | "system",
           content: n.message.content,
         })),
-        { role: "user" as const, content: text },
+        { role: "user" as const, content: userContent },
       ];
 
       const controller = new AbortController();
@@ -435,6 +471,7 @@ export function ChatView() {
           completionMessages,
           controller.signal,
           tools,
+          effectiveInstructions,
         )) {
           if (chunk.content) {
             fullResponse += chunk.content;
@@ -467,6 +504,14 @@ export function ChatView() {
             }
           })
           .catch(() => {});
+      }
+
+      // Auto-extract durable memories (background, best-effort)
+      if (settings.autoMemory && !isTemporary && fullResponse) {
+        void extractAndSaveMemory(provider, selectedModel, text, fullResponse, "global", loadMemory("global"), sessionId).catch(() => {});
+        if (currentProjectId) {
+          void extractAndSaveMemory(provider, selectedModel, text, fullResponse, currentProjectId, loadMemory(currentProjectId), sessionId).catch(() => {});
+        }
       }
     } catch (err) {
       toast.error(
@@ -534,6 +579,8 @@ export function ChatView() {
         isTemporary,
       );
 
+      updateSession(activeSessionId, {});
+
       const completionMessages: ChatCompletionMessage[] = [];
       const pathToParent = activePath.slice(
         0,
@@ -561,6 +608,7 @@ export function ChatView() {
           completionMessages,
           controller.signal,
           tools,
+          currentProjectInstructions,
         )) {
           if (chunk.content) {
             fullResponse += chunk.content;
@@ -642,6 +690,7 @@ export function ChatView() {
           completionMessages,
           controller.signal,
           tools,
+          currentProjectInstructions,
         )) {
           if (chunk.content) {
             fullResponse += chunk.content;
@@ -665,6 +714,7 @@ export function ChatView() {
       if (fullResponse) {
         await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, parentId, msgIsTemporary, fullReasoning || undefined);
       }
+      updateSession(activeSessionId, {});
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to regenerate response",
@@ -966,6 +1016,25 @@ export function ChatView() {
                   )}
                 </BubbleContent>
               </Bubble>
+              {(() => {
+                const arts = extractArtifacts(msg.content);
+                if (arts.length === 0) return null;
+                return (
+                  <div className="mb-1 flex flex-wrap gap-1.5">
+                    {arts.map((a) => (
+                      <button
+                        key={a.id}
+                        onClick={() => setArtifactPanel({ artifacts: arts, activeIndex: a.index })}
+                        className="flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs transition-colors hover:bg-accent"
+                      >
+                        <FileCode className="size-3.5 text-muted-foreground" />
+                        <span className="font-medium">{a.title}</span>
+                        <span className="text-muted-foreground">{a.language}</span>
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
               <MessageFooter className="gap-1.5 [&_button]:size-5 [&_button]:p-0 opacity-0 transition-opacity group-hover/message:opacity-100">
                 {hasBranches && (
                   <div className="flex items-center gap-0.5 text-xs text-muted-foreground">
@@ -1032,6 +1101,7 @@ export function ChatView() {
   };
 
   return (
+    <OpenCodeProvider>
     <SidebarProvider
       className="relative h-dvh min-h-0 overflow-hidden"
       style={{ "--sidebar-width-icon": "3rem" } as React.CSSProperties}
@@ -1045,6 +1115,7 @@ export function ChatView() {
         onSelectSession={selectSession}
         onNewChat={handleNewChat}
         onDeleteChat={handleDeleteSession}
+        onRenameChat={(id, title) => updateSession(id, { title })}
         onSettings={() => setSettingsOpen(true)}
         onProjects={() => setProjectsOpen(true)}
         onHistory={() => setHistoryOpen(true)}
@@ -1060,12 +1131,54 @@ export function ChatView() {
           onMouseDown={startDrag}
           className="relative flex h-10 shrink-0 select-none items-center px-4"
         >
+          {activeProject && (
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              onClick={() => setActiveProjectId(null)}
+              onMouseDown={(e) => e.stopPropagation()}
+              aria-label="Back to chat"
+              className="shrink-0"
+            >
+              <ArrowLeft />
+            </Button>
+          )}
           {(activeSession || activeProject) && (
             <div className="absolute left-1/2 -translate-x-1/2">
               {activeProject ? (
-                <span className="max-w-xs truncate px-3 py-1 text-sm font-medium">
-                  {activeProject.name}
-                </span>
+                editingProjectField === "name" ? (
+                  <input
+                    autoFocus
+                    value={projectNameDraft}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onChange={(e) => setProjectNameDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        const trimmed = projectNameDraft.trim();
+                        if (trimmed) updateProject(activeProject.id, { name: trimmed });
+                        setEditingProjectField(null);
+                      }
+                      if (e.key === "Escape") setEditingProjectField(null);
+                    }}
+                    onBlur={() => {
+                      const trimmed = projectNameDraft.trim();
+                      if (trimmed) updateProject(activeProject.id, { name: trimmed });
+                      setEditingProjectField(null);
+                    }}
+                    className="max-w-xs rounded-md border px-3 py-1 text-sm font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  />
+                ) : (
+                  <button
+                    onClick={() => {
+                      setProjectNameDraft(activeProject.name);
+                      setEditingProjectField("name");
+                    }}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    className="max-w-xs truncate rounded-md px-3 py-1 text-sm font-medium transition-colors hover:bg-accent"
+                  >
+                    {activeProject.name}
+                  </button>
+                )
               ) : isEditingTitle ? (
                 <input
                   autoFocus
@@ -1095,7 +1208,15 @@ export function ChatView() {
 
         <div className={activeTab === "agent" ? "hidden" : "flex min-h-0 flex-1 flex-col"}>
         {activeSession ? (
-          <div className="flex min-h-0 flex-1 flex-col">
+          <div className="relative flex min-h-0 flex-1 flex-col">
+            {artifactPanel && (
+              <ArtifactPanel
+                artifacts={artifactPanel.artifacts}
+                activeIndex={artifactPanel.activeIndex}
+                onSelectIndex={(i) => setArtifactPanel((prev) => prev ? { ...prev, activeIndex: i } : null)}
+                onClose={() => setArtifactPanel(null)}
+              />
+            )}
             <MessageScrollerProvider
               autoScroll
               defaultScrollPosition="last-anchor"
@@ -1231,15 +1352,6 @@ export function ChatView() {
                             Skills
                           </DropdownMenuSubTrigger>
                           <DropdownMenuSubContent>
-                            <DropdownMenuSeparator className="mb-1" />
-                            {ALWAYS_ON_TOOLS_INFO.map((tool) => (
-                              <DropdownMenuItem key={tool.name} className="opacity-60" disabled>
-                                <tool.Icon />
-                                {tool.name}
-                                <DropdownMenuShortcut>Always on</DropdownMenuShortcut>
-                              </DropdownMenuItem>
-                            ))}
-                            <DropdownMenuSeparator className="my-1" />
                             <DropdownMenuItem onClick={() => setWebFetchEnabled((prev) => !prev)}>
                               <Globe />
                               Web Fetch
@@ -1348,47 +1460,6 @@ export function ChatView() {
           </div>
         ) : activeProject ? (
           <div className="flex min-h-0 flex-1 flex-col">
-            <div className="flex items-center gap-2 px-4 py-2.5 border-b shrink-0">
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                onClick={() => setActiveProjectId(null)}
-                aria-label="Back to chat"
-              >
-                <ArrowLeft />
-              </Button>
-              {editingProjectField === "name" ? (
-                <input
-                  autoFocus
-                  value={projectNameDraft}
-                  onChange={(e) => setProjectNameDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      const trimmed = projectNameDraft.trim();
-                      if (trimmed) updateProject(activeProject.id, { name: trimmed });
-                      setEditingProjectField(null);
-                    }
-                    if (e.key === "Escape") setEditingProjectField(null);
-                  }}
-                  onBlur={() => {
-                    const trimmed = projectNameDraft.trim();
-                    if (trimmed) updateProject(activeProject.id, { name: trimmed });
-                    setEditingProjectField(null);
-                  }}
-                  className="text-sm font-medium rounded-md border px-2 py-1 outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                />
-              ) : (
-                <button
-                  onClick={() => {
-                    setProjectNameDraft(activeProject.name);
-                    setEditingProjectField("name");
-                  }}
-                  className="text-sm font-medium rounded-md px-2 py-1 transition-colors hover:bg-accent"
-                >
-                  {activeProject.name}
-                </button>
-              )}
-            </div>
             <div className="flex min-h-0 flex-1">
               <div className="flex flex-col w-2/3 min-h-0 border-r">
                 <div className="shrink-0 p-4">
@@ -1443,8 +1514,7 @@ export function ChatView() {
                 <ScrollArea className="flex-1">
                   <div className="px-4 pb-4">
                     <div className="mb-3 flex items-center gap-2">
-                      <MessageSquare className="size-4 text-muted-foreground" />
-                      <span className="text-sm font-medium">Chats in this project</span>
+                      <span className="text-sm font-medium">Chats</span>
                     </div>
                     <div className="flex flex-col gap-2">
                       {sessions
@@ -1459,7 +1529,7 @@ export function ChatView() {
                               setActiveProjectId(null);
                             }}
                           >
-                            <CardHeader className="flex-row items-center justify-between py-3.5">
+                            <CardHeader className="flex items-center justify-between py-3.5">
                               <span className="truncate text-sm font-medium">
                                 {session.title}
                               </span>
@@ -1494,6 +1564,7 @@ export function ChatView() {
                         <Button
                           variant="ghost"
                           size="icon-xs"
+                          onMouseDown={(e) => e.preventDefault()}
                           onClick={() => {
                             if (editingProjectField === "instructions") {
                               updateProject(activeProject.id, { instructions: projectInstructionsDraft });
@@ -1555,7 +1626,13 @@ export function ChatView() {
                               variant="ghost"
                               size="icon-xs"
                               className="shrink-0 text-muted-foreground hover:text-destructive"
-                              onClick={() => deleteProjectFile(activeProject.id, file.id)}
+                              onClick={async () => {
+                                try {
+                                  await deleteProjectFile(activeProject.id, file.id);
+                                } catch {
+                                  toast.error("Failed to delete file");
+                                }
+                              }}
                               aria-label="Delete file"
                             >
                               <X />
@@ -1598,7 +1675,13 @@ export function ChatView() {
                               variant="ghost"
                               size="icon-xs"
                               className="absolute top-1 right-1 bg-background/80 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive"
-                              onClick={() => deleteProjectImage(activeProject.id, img.id)}
+                              onClick={async () => {
+                                try {
+                                  await deleteProjectImage(activeProject.id, img.id);
+                                } catch {
+                                  toast.error("Failed to delete image");
+                                }
+                              }}
                               aria-label="Delete image"
                             >
                               <X />
@@ -1653,7 +1736,7 @@ export function ChatView() {
         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden bg-black px-4 pb-8">
             <InteractiveGrid className="absolute inset-0" mode={activeTab} />
-            <h2 className="select-none cursor-default relative font-serif z-10 mb-12 text-center text-4xl text-white/70">
+            <h2 className="select-none cursor-default relative font-serif z-10 mb-12 text-center text-4xl text-white/70 welcome-fade-in">
               {welcomePrompt}
             </h2>
             <div className="relative z-10 w-full max-w-3xl">
@@ -1735,15 +1818,6 @@ export function ChatView() {
                           Skills
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent>
-                          <DropdownMenuSeparator className="mb-1" />
-                          {ALWAYS_ON_TOOLS_INFO.map((tool) => (
-                            <DropdownMenuItem key={tool.name} className="opacity-60" disabled>
-                              <tool.Icon />
-                              {tool.name}
-                              <DropdownMenuShortcut>Always on</DropdownMenuShortcut>
-                            </DropdownMenuItem>
-                          ))}
-                          <DropdownMenuSeparator className="my-1" />
                           <DropdownMenuItem onClick={() => setWebFetchEnabled((prev) => !prev)}>
                             <Globe />
                             Web Fetch
@@ -1852,7 +1926,7 @@ export function ChatView() {
         )}
         </div>
         <div className={activeTab === "agent" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
-          <AgentView />
+          <AgentView projects={projects} updateProject={updateProject} />
         </div>
       </SidebarInset>
 
@@ -1882,16 +1956,10 @@ export function ChatView() {
                 <Button
                   variant="outline"
                   size="sm"
-                  onClick={async () => {
-                    try {
-                      await createProject(
-                        `New Project ${projects.length + 1}`,
-                        "A brand new project",
-                        "",
-                      );
-                    } catch {
-                      toast.error("Failed to create project");
-                    }
+                  onClick={() => {
+                    setShowNewProjectCard(true);
+                    setNewProjectName("");
+                    setNewProjectInstructions("");
                   }}
                 >
                   <Plus />
@@ -1902,6 +1970,64 @@ export function ChatView() {
           </DialogHeader>
           <div className="flex-1 overflow-y-auto">
             <div className="grid grid-cols-2 gap-3 pb-1">
+              {showNewProjectCard && (
+                <Card className="col-span-2 gap-0 py-0">
+                  <CardHeader className="py-4">
+                    <div className="flex flex-col gap-3">
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-medium">New Project</span>
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
+                          onClick={() => setShowNewProjectCard(false)}
+                          aria-label="Cancel"
+                        >
+                          <X />
+                        </Button>
+                      </div>
+                      <Input
+                        autoFocus
+                        value={newProjectName}
+                        onChange={(e) => setNewProjectName(e.target.value)}
+                        placeholder="Project name (required)"
+                      />
+                      <Textarea
+                        value={newProjectInstructions}
+                        onChange={(e) => setNewProjectInstructions(e.currentTarget.value)}
+                        placeholder="Instructions for the AI..."
+                        className="min-h-24 text-xs"
+                      />
+                      <div className="flex justify-end gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setShowNewProjectCard(false)}
+                        >
+                          Cancel
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={!newProjectName.trim()}
+                          onClick={async () => {
+                            try {
+                              await createProject(
+                                newProjectName.trim(),
+                                "",
+                                newProjectInstructions.trim(),
+                              );
+                              setShowNewProjectCard(false);
+                            } catch {
+                              toast.error("Failed to create project");
+                            }
+                          }}
+                        >
+                          Create
+                        </Button>
+                      </div>
+                    </div>
+                  </CardHeader>
+                </Card>
+              )}
               {projects
                 .filter((p) =>
                   p.name.toLowerCase().includes(projectSearch.toLowerCase()) ||
@@ -1909,6 +2035,7 @@ export function ChatView() {
                 )
                 .map((project) => (
                   <Card key={project.id} className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent/50" onClick={() => {
+                    setActiveTab("chat");
                     setActiveSessionId(null);
                     setActiveProjectId(project.id);
                     setProjectsOpen(false);
@@ -1932,15 +2059,6 @@ export function ChatView() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); comingSoon("Rename Project"); }}>
-                              <Pencil />
-                              Rename
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); comingSoon("Share Project"); }}>
-                              <Share />
-                              Share
-                            </DropdownMenuItem>
-                            <DropdownMenuSeparator />
                             <DropdownMenuItem
                               variant="destructive"
                               onClick={async (e) => {
@@ -2051,13 +2169,9 @@ export function ChatView() {
                             </Button>
                           </DropdownMenuTrigger>
                           <DropdownMenuContent align="end">
-                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); comingSoon("Rename Chat"); }}>
+                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); setHistoryRenameDraft(session.title); setRenamingHistory({ id: session.id, title: session.title }); }}>
                               <Pencil />
                               Rename
-                            </DropdownMenuItem>
-                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); comingSoon("Share Chat"); }}>
-                              <Share />
-                              Share
                             </DropdownMenuItem>
                             <DropdownMenuSeparator />
                             <DropdownMenuItem
@@ -2089,8 +2203,54 @@ export function ChatView() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={!!renamingHistory} onOpenChange={(open) => { if (!open) { setRenamingHistory(null); setHistoryRenameDraft(""); } }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Pencil className="size-5" />
+              Rename Chat
+            </DialogTitle>
+          </DialogHeader>
+          <div className="flex flex-col gap-4 pt-2">
+            <Input
+              autoFocus
+              value={historyRenameDraft}
+              onChange={(e) => setHistoryRenameDraft(e.target.value)}
+              placeholder="Chat name"
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  if (renamingHistory && historyRenameDraft.trim()) {
+                    updateSession(renamingHistory.id, { title: historyRenameDraft.trim() });
+                  }
+                  setRenamingHistory(null);
+                  setHistoryRenameDraft("");
+                }
+                if (e.key === "Escape") { setRenamingHistory(null); setHistoryRenameDraft(""); }
+              }}
+            />
+            <div className="flex justify-end gap-2">
+              <Button variant="outline" size="sm" onClick={() => { setRenamingHistory(null); setHistoryRenameDraft(""); }}>Cancel</Button>
+              <Button
+                size="sm"
+                disabled={!historyRenameDraft.trim()}
+                onClick={() => {
+                  if (renamingHistory && historyRenameDraft.trim()) {
+                    updateSession(renamingHistory.id, { title: historyRenameDraft.trim() });
+                  }
+                  setRenamingHistory(null);
+                  setHistoryRenameDraft("");
+                }}
+              >
+                Rename
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
     </SidebarProvider>
+    </OpenCodeProvider>
   );
 
   async function handleProjectSend(text: string) {
@@ -2132,6 +2292,7 @@ export function ChatView() {
           completionMessages,
           controller.signal,
           tools,
+          activeProject?.instructions,
         )) {
           if (chunk.content) {
             fullResponse += chunk.content;
