@@ -52,6 +52,7 @@ import { exportAllData, importAllData } from "@/lib/llm";
 import { getBuiltinProvider } from "@/lib/builtin-providers";
 import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync } from "@/lib/model-capabilities";
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
+import { EMBEDDING_MODELS, setEmbeddingModel } from "@/lib/embeddings";
 import type { Provider, ProviderModel } from "@/types";
 
 type SettingsTab = "general" | "memory" | "models" | "chat" | "agents";
@@ -371,6 +372,33 @@ export function SettingsDialog({
                           checked={settings.autoMemory}
                           onCheckedChange={(v) => updateSettings({ autoMemory: v })}
                         />
+                      </div>
+
+                      <div className="flex items-center justify-between">
+                        <div className="flex flex-col gap-0.5">
+                          <span className="text-sm font-medium">Embedding Model</span>
+                          <span className="text-xs text-muted-foreground">
+                            Local model used for semantic memory &amp; attachment search
+                          </span>
+                        </div>
+                        <Select
+                          value={settings.embeddingModel}
+                          onValueChange={(v) => {
+                            updateSettings({ embeddingModel: v });
+                            setEmbeddingModel(v);
+                          }}
+                        >
+                          <SelectTrigger size="sm" className="w-64">
+                            <SelectValue />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {EMBEDDING_MODELS.map((m) => (
+                              <SelectItem key={m.id} value={m.id}>
+                                {m.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                       </div>
 
                       {/* Universal memory list */}

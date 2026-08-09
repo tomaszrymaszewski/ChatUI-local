@@ -78,4 +78,5 @@ export interface UserSettings {
   fullName: string;
   nickname: string;
   instructions: string;
+  embeddingModel: string;
 }

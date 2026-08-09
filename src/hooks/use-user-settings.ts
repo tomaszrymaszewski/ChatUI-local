@@ -13,6 +13,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   fullName: "",
   nickname: "",
   instructions: "",
+  embeddingModel: "Xenova/all-MiniLM-L6-v2",
 };
 
 function loadSettings(): UserSettings {
