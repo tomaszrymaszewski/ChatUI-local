@@ -228,7 +228,7 @@ function loadUserSettings(): UserSettings | null {
   }
 }
 
-function buildSystemPrompt(projectInstructions?: string): string | null {
+function buildSystemPrompt(projectInstructions?: string, skillsContext?: string): string | null {
   const settings = loadUserSettings();
   const parts: string[] = [];
   if (settings?.nickname?.trim()) {
@@ -239,6 +239,9 @@ function buildSystemPrompt(projectInstructions?: string): string | null {
   }
   if (projectInstructions?.trim()) {
     parts.push(`Project instructions: ${projectInstructions.trim()}`);
+  }
+  if (skillsContext?.trim()) {
+    parts.push(skillsContext.trim());
   }
   if (parts.length === 0) return null;
   return parts.join("\n\n");
@@ -279,6 +282,7 @@ export async function* streamChatCompletion(
   signal?: AbortSignal,
   tools?: ToolDefinition[],
   projectInstructions?: string,
+  skillsContext?: string,
 ): AsyncGenerator<StreamChunk> {
   const apiKey = await getProviderApiKey(provider.id);
   const baseUrl = provider.baseUrl.replace(/\/$/, "");
@@ -286,7 +290,7 @@ export async function* streamChatCompletion(
 
   let currentMessages = [...messages];
 
-  const systemPrompt = buildSystemPrompt(projectInstructions);
+  const systemPrompt = buildSystemPrompt(projectInstructions, skillsContext);
 
   // Anthropic uses a different API shape — delegate to the dedicated adapter.
   if (isAnthropicProvider(provider.baseUrl)) {

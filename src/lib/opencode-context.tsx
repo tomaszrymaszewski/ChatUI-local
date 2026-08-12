@@ -44,6 +44,7 @@ import {
   deleteLocalSession,
   updateLocalSessionTitle,
 } from "@/lib/opencode";
+import { ensureLspEnabled } from "@/lib/opencode-config";
 
 interface ProjectDirectory {
   name: string;
@@ -56,6 +57,7 @@ interface OpenCodeContextValue {
   serving: boolean;
   installing: boolean;
   starting: boolean;
+  startError: string | null;
   activeDirectory: string | null;
   install: () => Promise<void>;
   startServe: () => Promise<void>;
@@ -109,6 +111,7 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
   const [serving, setServing] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionMetadata[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<MessageEntry[]>([]);
@@ -153,20 +156,6 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const install = useCallback(async () => {
-    setInstalling(true);
-    try {
-      await opencodeInstall();
-      setInstalled(true);
-      toast.success("OpenCode installed successfully");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to install OpenCode");
-      throw err;
-    } finally {
-      setInstalling(false);
-    }
-  }, []);
-
   const refreshProviders = useCallback(async () => {
     try {
       const info = await getConfigProviders(config);
@@ -189,19 +178,43 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
 
   const startServe = useCallback(async () => {
     setStarting(true);
+    setStartError(null);
     try {
       await opencodeServeStart();
       setServing(true);
+      // Auto-enable OpenCode's built-in LSP servers (off by default) so language
+      // diagnostics work without any user setup.
+      await ensureLspEnabled(null).catch(() => {});
       await loadAgents();
       await refreshProviders();
       await refreshSessions();
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to start OpenCode server");
+      const msg = err instanceof Error ? err.message : "Failed to start OpenCode server";
+      setStartError(msg);
+      toast.error(msg);
       throw err;
     } finally {
       setStarting(false);
     }
   }, [loadAgents, refreshSessions, refreshProviders]);
+
+  const install = useCallback(async () => {
+    setInstalling(true);
+    setStartError(null);
+    try {
+      await opencodeInstall();
+      setInstalled(true);
+      toast.success("OpenCode installed successfully");
+      // Start the server immediately — otherwise the first-run path dead-ends
+      // on the StartingScreen forever (the init effect already ran).
+      await startServe();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to install OpenCode");
+      throw err;
+    } finally {
+      setInstalling(false);
+    }
+  }, [startServe]);
 
   // One-time init
   useEffect(() => {
@@ -213,6 +226,7 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
         setInstalled(status.installed);
         setServing(status.serving);
         if (status.serving) {
+          await ensureLspEnabled(null).catch(() => {});
           await loadAgents();
           await refreshProviders();
           await refreshSessions();
@@ -653,6 +667,7 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
         serving,
         installing,
         starting,
+        startError,
         activeDirectory,
         install,
         startServe,

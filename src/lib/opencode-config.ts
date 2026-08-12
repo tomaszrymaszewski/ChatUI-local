@@ -90,3 +90,22 @@ export async function removeLspEntry(directory: string | null | undefined, name:
     await writeOpencodeConfig(config, directory);
   }
 }
+
+/**
+ * Enable OpenCode's built-in LSP servers (for ~30 languages) by setting
+ * `lsp: {}` in the config. OpenCode ships these built-ins but leaves LSP
+ * disabled by default. We turn it on automatically so language diagnostics
+ * work with zero setup. No-op if the user has explicitly set `lsp: false`.
+ */
+export async function ensureLspEnabled(directory: string | null | undefined): Promise<void> {
+  try {
+    const config = await readOpencodeConfig(directory);
+    if (config.lsp === false) return; // respect an explicit opt-out
+    if (config.lsp === undefined || config.lsp === null) {
+      config.lsp = {};
+      await writeOpencodeConfig(config, directory);
+    }
+  } catch {
+    // ignore — LSP is a nice-to-have, not a hard requirement
+  }
+}

@@ -7,14 +7,16 @@ import {
   ChartColumnBig,
   BotMessageSquare,
   Settings,
-  Puzzle,
+  Sparkles,
+  Plug,
 } from "lucide-react"
 import { useState } from "react"
 import { toast } from "sonner"
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import { NavChats } from "@/components/nav-chats"
 import { NavAgentProjects } from "@/components/nav-agent-projects"
-import { IntegrationsDialog } from "@/components/integrations-dialog"
+import { SkillsDialog } from "@/components/skills-dialog"
+import { McpDialog } from "@/components/mcp-dialog"
 import {
   Sidebar,
   SidebarContent,
@@ -65,7 +67,8 @@ export function AppSidebar({
 }) {
 
   const oc = useOpencodeContext();
-  const [integrationsOpen, setIntegrationsOpen] = useState(false);
+  const [skillsOpen, setSkillsOpen] = useState(false);
+  const [mcpOpen, setMcpOpen] = useState(false);
 
   const startDrag = (e: React.MouseEvent) => {
     if (e.button === 0) getCurrentWindow().startDragging();
@@ -121,9 +124,9 @@ export function AppSidebar({
               </SidebarMenuButton>
             </SidebarMenuItem>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => setIntegrationsOpen(true)} tooltip="Integrations">
-                <Puzzle />
-                <span>Integrations</span>
+              <SidebarMenuButton onClick={() => setSkillsOpen(true)} tooltip="Skills">
+                <Sparkles />
+                <span>Skills</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
@@ -142,9 +145,15 @@ export function AppSidebar({
               </SidebarMenuButton>
             </SidebarMenuItem>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={() => setIntegrationsOpen(true)} tooltip="Integrations">
-                <Puzzle />
-                <span>Integrations</span>
+              <SidebarMenuButton onClick={() => setMcpOpen(true)} tooltip="App Connections">
+                <Plug />
+                <span>Connections</span>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+            <SidebarMenuItem>
+              <SidebarMenuButton onClick={() => setSkillsOpen(true)} tooltip="Skills">
+                <Sparkles />
+                <span>Skills</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
@@ -185,9 +194,14 @@ export function AppSidebar({
         </SidebarMenu>
       </SidebarFooter>
       <SidebarRail />
-      <IntegrationsDialog
-        open={integrationsOpen}
-        onOpenChange={setIntegrationsOpen}
+      <SkillsDialog
+        open={skillsOpen}
+        onOpenChange={setSkillsOpen}
+        activeDirectory={oc.activeDirectory}
+      />
+      <McpDialog
+        open={mcpOpen}
+        onOpenChange={setMcpOpen}
         serving={oc.serving}
         activeDirectory={oc.activeDirectory}
       />

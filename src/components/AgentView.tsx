@@ -21,6 +21,7 @@ import {
   ShieldX,
   CircleCheck,
   CircleAlert,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -272,7 +273,30 @@ function InstallForm({ onInstall, installing }: { onInstall: () => void; install
   );
 }
 
-function StartingScreen() {
+function StartingScreen({
+  error,
+  onRetry,
+  retrying,
+}: {
+  error: string | null;
+  onRetry: () => void;
+  retrying: boolean;
+}) {
+  if (error) {
+    return (
+      <div className="flex h-[calc(100dvh-2.5rem)] items-center justify-center p-6">
+        <div className="flex max-w-md flex-col items-center gap-3 text-center">
+          <CircleAlert className="size-8 text-destructive" />
+          <p className="text-sm font-medium">Couldn't start the agent engine</p>
+          <p className="text-xs text-muted-foreground">{error}</p>
+          <Button size="sm" onClick={onRetry} disabled={retrying}>
+            {retrying ? <Spinner className="size-3.5" /> : <RefreshCw className="size-3.5" />}
+            Try again
+          </Button>
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="flex h-[calc(100dvh-2.5rem)] items-center justify-center p-6">
       <div className="flex flex-col items-center gap-3 text-center">
@@ -562,7 +586,13 @@ export function AgentView({
     return <InstallForm onInstall={handleInstall} installing />;
   }
   if ((!oc.serving && oc.installed && !oc.starting) || oc.starting) {
-    return <StartingScreen />;
+    return (
+      <StartingScreen
+        error={!oc.starting ? oc.startError : null}
+        onRetry={() => { void oc.startServe(); }}
+        retrying={oc.starting}
+      />
+    );
   }
 
   const hasActiveSession = Boolean(oc.activeSessionId);

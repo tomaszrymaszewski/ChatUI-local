@@ -1,4 +1,5 @@
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -7,6 +8,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
+const OPENCODE_PORT: &str = "4096";
 const OPENCODE_URL: &str = "http://localhost:4096";
 
 static SERVER_PID: Mutex<Option<u32>> = Mutex::new(None);
@@ -335,15 +337,51 @@ fn kill_tracked_server() {
     }
 }
 
+fn server_log_path() -> Option<PathBuf> {
+    chat_ui_base_dir().ok().map(|b| b.join("logs").join("opencode-server.log"))
+}
+
 fn spawn_opencode_server(dir: Option<&str>) -> Result<(), String> {
     kill_tracked_server();
     std::thread::sleep(Duration::from_millis(300));
 
     let bin = opencode_bin();
     let mut cmd = Command::new(&bin);
-    cmd.args(["serve", "--cors", "http://localhost:1420", "--cors", "http://tauri.localhost"]);
+    // Pin the port so the frontend (http://localhost:4096) and health check match.
+    // Include CORS for dev (localhost:1420), Windows/Linux prod (tauri.localhost),
+    // and macOS prod (tauri://localhost).
+    cmd.args([
+        "serve",
+        "--port",
+        OPENCODE_PORT,
+        "--hostname",
+        "127.0.0.1",
+        "--cors",
+        "http://localhost:1420",
+        "--cors",
+        "http://tauri.localhost",
+        "--cors",
+        "tauri://localhost",
+    ]);
+
+    // Capture stderr to a log file so failures are diagnosable (was Stdio::null()).
+    let log_path = server_log_path();
+    let stderr: Stdio = if let Some(ref log) = log_path {
+        if let Some(parent) = log.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map(|f| Stdio::from(f))
+            .unwrap_or_else(|_| Stdio::null())
+    } else {
+        Stdio::null()
+    };
     cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
+    cmd.stderr(stderr);
+
     if let Some(d) = dir {
         let path = PathBuf::from(d);
         if !path.exists() {
@@ -419,6 +457,14 @@ async fn opencode_serve_start() -> Result<(), String> {
 async fn opencode_serve_stop() -> Result<(), String> {
     kill_tracked_server();
     Ok(())
+}
+
+#[tauri::command]
+fn opencode_server_log() -> Result<String, String> {
+    match server_log_path() {
+        Some(p) if p.exists() => fs::read_to_string(&p).map_err(|e| e.to_string()),
+        _ => Ok(String::new()),
+    }
 }
 
 #[tauri::command]
@@ -663,6 +709,7 @@ pub fn run() {
             opencode_install,
             opencode_serve_start,
             opencode_serve_stop,
+            opencode_server_log,
             opencode_serve_in_dir,
             opencode_mcp_auth,
             run_scaffold,

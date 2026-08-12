@@ -42,6 +42,7 @@ async function apiFetch<T>(
   const res = await fetch(url, {
     ...options,
     headers: { ...buildHeaders(config), ...(options?.headers ?? {}) },
+    signal: options?.signal ?? AbortSignal.timeout(15000),
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
@@ -603,11 +604,19 @@ function subscribeInternal(
   const controller = new AbortController();
 
   (async () => {
+    // Connection timeout: if the server doesn't respond within 10s, abort
+    // so the caller's onError fires and can reconnect (instead of hanging forever).
+    let connected = false;
+    const connectTimer = setTimeout(() => {
+      if (!connected) controller.abort();
+    }, 10000);
     try {
       const res = await fetch(url, {
         headers: buildHeaders(config),
         signal: controller.signal,
       });
+      connected = true;
+      clearTimeout(connectTimer);
       if (!res.ok || !res.body) {
         throw new Error(`SSE connection failed: ${res.status}`);
       }
@@ -634,6 +643,7 @@ function subscribeInternal(
         }
       }
     } catch (err) {
+      clearTimeout(connectTimer);
       if (!controller.signal.aborted) onError?.(err as Error);
     }
   })();
@@ -663,6 +673,10 @@ export function opencodeServeStart(): Promise<void> {
 
 export function opencodeServeStop(): Promise<void> {
   return invoke<void>("opencode_serve_stop");
+}
+
+export function opencodeServerLog(): Promise<string> {
+  return invoke<string>("opencode_server_log");
 }
 
 export function opencodeServeInDir(dir: string | null): Promise<void> {

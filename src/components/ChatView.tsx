@@ -124,6 +124,7 @@ import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
+import { loadInstalledSkillsPrompt } from "@/lib/skills-library";
 import { getAllTools } from "@/lib/tools";
 import {
   buildMessageTree,
@@ -177,12 +178,6 @@ const WELCOME_PROMPTS = [
 
 const RESEARCH_PROMPT =
   "You are in research mode. Be thorough: use the web_fetch tool to look up information when needed, cite sources by URL, and provide well-organized, factual answers. Prefer accuracy over brevity.";
-
-const SKILLS = [
-  { id: "code-interpreter", name: "Code Interpreter", Icon: FileText },
-  { id: "image-gen", name: "Image Generation", Icon: ImageIcon },
-  { id: "data-analysis", name: "Data Analysis", Icon: ChartColumnBig },
-];
 
 export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
@@ -461,6 +456,7 @@ export function ChatView() {
       setAbortController(controller);
 
       const tools = getAllTools(webFetchEnabled);
+      const skillsContext = await loadInstalledSkillsPrompt();
 
       let fullResponse = "";
       let fullReasoning = "";
@@ -472,6 +468,7 @@ export function ChatView() {
           controller.signal,
           tools,
           effectiveInstructions,
+          skillsContext,
         )) {
           if (chunk.content) {
             fullResponse += chunk.content;
@@ -598,6 +595,7 @@ export function ChatView() {
       setAbortController(controller);
 
       const tools = getAllTools(webFetchEnabled);
+      const skillsContext = await loadInstalledSkillsPrompt();
 
       let fullResponse = "";
       let fullReasoning = "";
@@ -609,6 +607,7 @@ export function ChatView() {
           controller.signal,
           tools,
           currentProjectInstructions,
+          skillsContext,
         )) {
           if (chunk.content) {
             fullResponse += chunk.content;
@@ -680,6 +679,7 @@ export function ChatView() {
       setAbortController(controller);
 
       const tools = getAllTools(webFetchEnabled);
+      const skillsContext = await loadInstalledSkillsPrompt();
 
       let fullResponse = "";
       let fullReasoning = "";
@@ -691,6 +691,7 @@ export function ChatView() {
           controller.signal,
           tools,
           currentProjectInstructions,
+          skillsContext,
         )) {
           if (chunk.content) {
             fullResponse += chunk.content;
@@ -1357,13 +1358,6 @@ export function ChatView() {
                               Web Fetch
                               {webFetchEnabled ? <Check className="ml-auto" /> : <span className="ml-auto size-4" />}
                             </DropdownMenuItem>
-                            <DropdownMenuSeparator className="my-1" />
-                            {SKILLS.map((skill) => (
-                              <DropdownMenuItem key={skill.id} onClick={() => comingSoon(`Skill: ${skill.name}`)}>
-                                <skill.Icon />
-                                {skill.name}
-                              </DropdownMenuItem>
-                            ))}
                           </DropdownMenuSubContent>
                         </DropdownMenuSub>
                         <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
@@ -1823,13 +1817,6 @@ export function ChatView() {
                             Web Fetch
                             {webFetchEnabled ? <Check className="ml-auto" /> : <span className="ml-auto size-4" />}
                           </DropdownMenuItem>
-                          <DropdownMenuSeparator className="my-1" />
-                          {SKILLS.map((skill) => (
-                            <DropdownMenuItem key={skill.id} onClick={() => comingSoon(`Skill: ${skill.name}`)}>
-                              <skill.Icon />
-                              {skill.name}
-                            </DropdownMenuItem>
-                          ))}
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
                       <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
@@ -2282,6 +2269,7 @@ export function ChatView() {
       setAbortController(controller);
 
       const tools = getAllTools(webFetchEnabled);
+      const skillsContext = await loadInstalledSkillsPrompt();
 
       let fullResponse = "";
       let fullReasoning = "";
@@ -2292,7 +2280,8 @@ export function ChatView() {
           completionMessages,
           controller.signal,
           tools,
-          activeProject?.instructions,
+          currentProjectInstructions,
+          skillsContext,
         )) {
           if (chunk.content) {
             fullResponse += chunk.content;
