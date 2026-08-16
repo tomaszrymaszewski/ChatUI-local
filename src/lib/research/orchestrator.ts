@@ -7,9 +7,11 @@
 import { QueryDedup } from "./dedup";
 import {
   DEFAULT_RESEARCH_CONFIG,
+  DEFAULT_RESEARCH_CONTEXT,
   type PlannerFn,
   type ProgressEvent,
   type ResearchConfig,
+  type ResearchContext,
   type ResearchRoundFn,
   type ResearchSession,
   type SynthesizeFn,
@@ -82,6 +84,8 @@ export interface RunResearchSessionArgs {
   topic: string;
   ourOrgContext?: string;
   config?: Partial<ResearchConfig>;
+  /** Defaults to { mode: "search" } — omit entirely for the existing search-based paths. */
+  context?: ResearchContext;
   planner: PlannerFn;
   researchRound: ResearchRoundFn;
   synthesize: SynthesizeFn;
@@ -100,6 +104,7 @@ export async function runResearchSession(
 ): Promise<RunResearchSessionResult> {
   const { topic, ourOrgContext, planner, researchRound, synthesize, onProgress, signal } = args;
   const config: ResearchConfig = { ...DEFAULT_RESEARCH_CONFIG, ...args.config };
+  const context: ResearchContext = args.context ?? DEFAULT_RESEARCH_CONTEXT;
   const emit = (event: ProgressEvent) => onProgress?.(event);
 
   const session: ResearchSession = {
@@ -186,7 +191,7 @@ export async function runResearchSession(
     try {
       result = await withDeadline(
         (boundedSignal) =>
-          researchRound(topic, session.gaps, pendingQueries, roundIndex, boundedSignal),
+          researchRound(topic, session.gaps, pendingQueries, roundIndex, context, boundedSignal),
         signal,
         deadline - Date.now(),
       );

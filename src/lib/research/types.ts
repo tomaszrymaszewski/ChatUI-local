@@ -98,11 +98,26 @@ export type PlannerFn = (
   signal: AbortSignal,
 ) => Promise<PlannerResult>;
 
+/**
+ * How a round should gather material. "search" (the default) is the existing,
+ * unchanged behavior — Claude web_search or Tavily-injected search, depending
+ * on engine. "fetch-only" (Phase 2-C) expands only by fetching links already
+ * present in an uploaded seed, no search tool involved at all.
+ */
+export interface ResearchContext {
+  mode: "search" | "fetch-only";
+  /** fetch-only mode's expansion frontier — candidate URLs to fetch, sourced from the seed. Ignored in search mode. */
+  seedUrls?: string[];
+}
+
+export const DEFAULT_RESEARCH_CONTEXT: ResearchContext = { mode: "search" };
+
 export type ResearchRoundFn = (
   topic: string,
   gaps: Gap[],
   queries: string[],
   roundIndex: number,
+  context: ResearchContext,
   signal: AbortSignal,
 ) => Promise<ResearchRoundResult>;
 

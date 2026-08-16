@@ -125,6 +125,7 @@ import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { useDeepResearch } from "@/hooks/use-deep-research";
+import { buildResearchSeed, computeExpansionFrontier, extractUrlsFromText } from "@/lib/research/seed";
 import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
 import { loadInstalledSkillsPrompt } from "@/lib/skills-library";
 import { getAllTools } from "@/lib/tools";
@@ -541,7 +542,14 @@ export function ChatView() {
 
   const handleDeepResearch = async () => {
     const topic = inputText.trim();
-    if (!topic || isThinking || deepResearch.isRunning) return;
+    if ((!topic && files.length === 0) || isThinking || deepResearch.isRunning) return;
+
+    const urlsInText = extractUrlsFromText(topic);
+    const hasFetchableMaterial = files.length > 0 || urlsInText.length > 0;
+    if (!hasFetchableMaterial) {
+      toast.error("Attach a document or paste URLs to research.");
+      return;
+    }
 
     const provider = selectedModel ? findProviderForModel(selectedModel) : null;
     if (!provider) {
@@ -550,6 +558,13 @@ export function ChatView() {
       return;
     }
 
+    const seedFiles = files.filter((f) => f.file).map((f) => ({ name: f.name, file: f.file! }));
+    const attachedFiles = files;
+    const displayText = topic || `Uploaded: ${attachedFiles.map((f) => f.name).join(", ")}`;
+    const userAttachments = attachedFiles.length > 0
+      ? attachedFiles.map((f) => ({ id: f.id, name: f.name, size: f.size, type: f.type }))
+      : undefined;
+
     setInputText("");
     setFiles([]);
 
@@ -557,7 +572,7 @@ export function ChatView() {
     let sessionPersisted = Promise.resolve();
 
     if (!sessionId) {
-      const newSession = createSession(topic.slice(0, 30), pendingProjectId ?? undefined);
+      const newSession = createSession(displayText.slice(0, 30), pendingProjectId ?? undefined);
       sessionId = newSession.id;
       setActiveSessionId(newSession.id);
       setPendingProjectId(null);
@@ -568,11 +583,14 @@ export function ChatView() {
     try {
       await sessionPersisted;
       const parentId = activePath.length > 0 ? activePath[activePath.length - 1].message.id : null;
-      const userMsg = await addMessage(sessionId, "user", topic, undefined, undefined, parentId, isTemporary);
+      const userMsg = await addMessage(sessionId, "user", displayText, undefined, userAttachments, parentId, isTemporary);
       updateSession(sessionId, {});
 
+      const seed = await buildResearchSeed(seedFiles, urlsInText);
+      const seedUrls = computeExpansionFrontier(seed);
+
       pendingResearchSessionRef.current = { sessionId, userMsgId: userMsg.id };
-      await deepResearch.start(topic, provider, selectedModel, currentProjectInstructions || undefined);
+      await deepResearch.start(topic, provider, selectedModel, seed.text, seedUrls, currentProjectInstructions || undefined);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to start Deep Research");
     } finally {
@@ -1476,9 +1494,9 @@ export function ChatView() {
                       size="icon-xs"
                       variant="ghost"
                       aria-label="Deep Research"
-                      title="Deep Research: run a multi-round web research report on this topic"
+                      title="Deep Research: paste URLs or attach a document to research"
                       onClick={handleDeepResearch}
-                      disabled={!inputText.trim() || isThinking || deepResearch.isRunning}
+                      disabled={(!inputText.trim() && files.length === 0) || isThinking || deepResearch.isRunning}
                     >
                       <Microscope />
                     </InputGroupButton>
@@ -1944,9 +1962,9 @@ export function ChatView() {
                     size="icon-xs"
                     variant="ghost"
                     aria-label="Deep Research"
-                    title="Deep Research: run a multi-round web research report on this topic"
+                    title="Deep Research: paste URLs or attach a document to research"
                     onClick={handleDeepResearch}
-                    disabled={!inputText.trim() || isThinking || deepResearch.isRunning}
+                    disabled={(!inputText.trim() && files.length === 0) || isThinking || deepResearch.isRunning}
                   >
                     <Microscope />
                   </InputGroupButton>

@@ -2,12 +2,11 @@ import { useCallback, useRef, useState } from "react";
 import { toast } from "sonner";
 import type { Provider } from "@/types";
 import { runResearchSession } from "@/lib/research/orchestrator";
-import { selectResearchFunctions } from "@/lib/research/router";
-import { MissingResearchKeyError, MissingTavilyKeyError } from "@/lib/research/api-key";
+import { createFetchOnlyResearchFunctions } from "@/lib/research/fetch-only-research";
 import type { ProgressEvent } from "@/lib/research/types";
 
 export interface UseDeepResearchOptions {
-  /** Persists the finished report as an assistant message, tagged with whichever model actually generated it. Awaited before streaming state clears, so the chat never flashes empty between the streamed report and the persisted message (mirrors handleSend's ordering). */
+  /** Persists the finished report as an assistant message. Awaited before streaming state clears, so the chat never flashes empty between the streamed report and the persisted message (mirrors handleSend's ordering). */
   onReport: (report: string, modelUsed: string) => Promise<void>;
 }
 
@@ -15,7 +14,14 @@ export interface UseDeepResearchResult {
   isRunning: boolean;
   statusLabel: string | null;
   streamingReport: string;
-  start: (topic: string, provider: Provider, model: string, ourOrgContext?: string) => Promise<void>;
+  start: (
+    topic: string,
+    provider: Provider,
+    model: string,
+    seedText: string | undefined,
+    seedUrls: string[],
+    ourOrgContext?: string,
+  ) => Promise<void>;
   cancel: () => void;
 }
 
@@ -43,7 +49,14 @@ export function useDeepResearch({ onReport }: UseDeepResearchOptions): UseDeepRe
   }, []);
 
   const start = useCallback(
-    async (topic: string, provider: Provider, model: string, ourOrgContext?: string) => {
+    async (
+      topic: string,
+      provider: Provider,
+      model: string,
+      seedText: string | undefined,
+      seedUrls: string[],
+      ourOrgContext?: string,
+    ) => {
       setIsRunning(true);
       setStatusLabel("Planning research…");
       setStreamingReport("");
@@ -52,8 +65,7 @@ export function useDeepResearch({ onReport }: UseDeepResearchOptions): UseDeepRe
       controllerRef.current = controller;
 
       try {
-        const { model: modelUsed, functions } = await selectResearchFunctions(provider, model);
-        const { planner, researchRound, synthesize } = functions;
+        const { planner, researchRound, synthesize } = createFetchOnlyResearchFunctions(provider, model, seedText);
 
         const onProgress = (event: ProgressEvent) => {
           const label = describeProgress(event);
@@ -64,6 +76,7 @@ export function useDeepResearch({ onReport }: UseDeepResearchOptions): UseDeepRe
         const { session, report } = await runResearchSession({
           topic,
           ourOrgContext,
+          context: { mode: "fetch-only", seedUrls },
           planner,
           researchRound,
           synthesize,
@@ -72,7 +85,7 @@ export function useDeepResearch({ onReport }: UseDeepResearchOptions): UseDeepRe
         });
 
         if (report) {
-          await onReport(report, modelUsed);
+          await onReport(report, model);
         } else if (session.phase === "error") {
           toast.error(
             session.notes.length > 0
@@ -82,9 +95,7 @@ export function useDeepResearch({ onReport }: UseDeepResearchOptions): UseDeepRe
         }
         // cancelled with no report: user-initiated, no toast needed
       } catch (error) {
-        if (error instanceof MissingResearchKeyError || error instanceof MissingTavilyKeyError) {
-          toast.error(error.message);
-        } else if (!controller.signal.aborted) {
+        if (!controller.signal.aborted) {
           toast.error(error instanceof Error ? error.message : "Deep Research failed");
         }
       } finally {
