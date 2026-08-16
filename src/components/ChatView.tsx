@@ -29,6 +29,7 @@ import {
   SquareTerminal,
   Brain,
   Globe,
+  Telescope,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/app-sidebar";
@@ -123,6 +124,8 @@ import { useMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
+import { useDeepResearch } from "@/hooks/use-deep-research";
+import { RESEARCH_MODEL } from "@/lib/research/config";
 import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
 import { loadInstalledSkillsPrompt } from "@/lib/skills-library";
 import { getAllTools } from "@/lib/tools";
@@ -176,9 +179,6 @@ const WELCOME_PROMPTS = [
   "Ask away, the floor is yours.",
 ];
 
-const RESEARCH_PROMPT =
-  "You are in research mode. Be thorough: use the web_fetch tool to look up information when needed, cite sources by URL, and provide well-organized, factual answers. Prefer accuracy over brevity.";
-
 export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
   const { sessions, createSession, deleteSession, updateSession } =
@@ -212,7 +212,6 @@ export function ChatView() {
     () => WELCOME_PROMPTS[Math.floor(Math.random() * WELCOME_PROMPTS.length)],
   );
   const [isTemporary, setIsTemporary] = useState(false);
-  const [isResearch, setIsResearch] = useState(false);
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
   const [projectsOpen, setProjectsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -361,7 +360,7 @@ export function ChatView() {
 
   const handleSend = async () => {
     const text = inputText.trim();
-    if ((!text && files.length === 0) || isThinking) return;
+    if ((!text && files.length === 0) || isThinking || deepResearch.isRunning) return;
 
     const provider = selectedModel ? findProviderForModel(selectedModel) : null;
     if (!provider) {
@@ -441,7 +440,7 @@ export function ChatView() {
       const userContent: string | ContentPart[] = prep.content;
 
       const memoryContext = settings.autoMemory ? await buildMemoryContext(currentProjectId ?? null, text) : "";
-      const effectiveInstructions = [currentProjectInstructions, memoryContext, isResearch ? RESEARCH_PROMPT : null]
+      const effectiveInstructions = [currentProjectInstructions, memoryContext]
         .filter(Boolean).join("\n\n") || undefined;
 
       const completionMessages: ChatCompletionMessage[] = [
@@ -525,6 +524,54 @@ export function ChatView() {
 
   const handleStop = () => {
     abortController?.abort();
+  };
+
+  // Deep Research targets whatever session/user-message it was started under,
+  // resolved locally in handleDeepResearch (not via the activeSessionId state,
+  // which may not have re-rendered yet if a new session was just created —
+  // same reason handleSend keeps its own local `sessionId` variable).
+  const pendingResearchSessionRef = useRef<{ sessionId: string; userMsgId: string } | null>(null);
+
+  const deepResearch = useDeepResearch({
+    onReport: async (report) => {
+      const pending = pendingResearchSessionRef.current;
+      if (!pending) return;
+      await addMessage(pending.sessionId, "assistant", report, RESEARCH_MODEL, undefined, pending.userMsgId, isTemporary);
+    },
+  });
+
+  const handleDeepResearch = async () => {
+    const topic = inputText.trim();
+    if (!topic || isThinking || deepResearch.isRunning) return;
+
+    setInputText("");
+    setFiles([]);
+
+    let sessionId = activeSessionId;
+    let sessionPersisted = Promise.resolve();
+
+    if (!sessionId) {
+      const newSession = createSession(topic.slice(0, 30), pendingProjectId ?? undefined);
+      sessionId = newSession.id;
+      setActiveSessionId(newSession.id);
+      setPendingProjectId(null);
+      sessionPersisted = newSession.persisted;
+    }
+    if (!sessionId) throw new Error("Failed to create session");
+
+    try {
+      await sessionPersisted;
+      const parentId = activePath.length > 0 ? activePath[activePath.length - 1].message.id : null;
+      const userMsg = await addMessage(sessionId, "user", topic, undefined, undefined, parentId, isTemporary);
+      updateSession(sessionId, {});
+
+      pendingResearchSessionRef.current = { sessionId, userMsgId: userMsg.id };
+      await deepResearch.start(topic, currentProjectInstructions || undefined);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to start Deep Research");
+    } finally {
+      pendingResearchSessionRef.current = null;
+    }
   };
 
   const handleCopyMessage = async (content: string) => {
@@ -1267,6 +1314,37 @@ export function ChatView() {
                         </Message>
                       </MessageScrollerItem>
                     )}
+
+                    {deepResearch.isRunning && (
+                      <MessageScrollerItem messageId="deep-research">
+                        <Message>
+                          <MessageContent>
+                            {deepResearch.streamingReport ? (
+                              <>
+                                <div className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+                                  <Telescope className="size-3.5" />
+                                  <span className="shimmer">{deepResearch.statusLabel ?? "Writing report…"}</span>
+                                </div>
+                                <Bubble variant="ghost">
+                                  <BubbleContent>
+                                    <MarkdownRenderer content={deepResearch.streamingReport} />
+                                  </BubbleContent>
+                                </Bubble>
+                              </>
+                            ) : (
+                              <Marker role="status">
+                                <MarkerIcon>
+                                  <Spinner />
+                                </MarkerIcon>
+                                <MarkerContent className="shimmer">
+                                  {deepResearch.statusLabel ?? "Researching…"}
+                                </MarkerContent>
+                              </Marker>
+                            )}
+                          </MessageContent>
+                        </Message>
+                      </MessageScrollerItem>
+                    )}
                   </MessageScrollerContent>
                 </MessageScrollerViewport>
                 <MessageScrollerButton />
@@ -1389,15 +1467,14 @@ export function ChatView() {
                       {isTemporary && <span className="group-hover:line-through">Temporary</span>}
                     </InputGroupButton>
                     <InputGroupButton
-                      size={isResearch ? "xs" : "icon-xs"}
+                      size="icon-xs"
                       variant="ghost"
-                      aria-label="Toggle research mode"
-                      title="Research"
-                      onClick={() => setIsResearch((prev) => !prev)}
-                      className={`group ${isResearch ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
+                      aria-label="Deep Research"
+                      title="Deep Research: run a multi-round web research report on this topic"
+                      onClick={handleDeepResearch}
+                      disabled={!inputText.trim() || isThinking || deepResearch.isRunning}
                     >
-                      <Microscope className={isResearch ? "fill-blue-500/30" : ""} />
-                      {isResearch && <span className="group-hover:line-through">Research</span>}
+                      <Microscope />
                     </InputGroupButton>
                     <input
                       ref={fileInputRef}
@@ -1426,6 +1503,16 @@ export function ChatView() {
                         className="rounded-lg"
                         onClick={handleStop}
                         aria-label="Stop generation"
+                      >
+                        <span className="size-3 rounded-sm bg-current" />
+                      </InputGroupButton>
+                    ) : deepResearch.isRunning ? (
+                      <InputGroupButton
+                        variant="outline"
+                        size="icon-xs"
+                        className="rounded-lg"
+                        onClick={deepResearch.cancel}
+                        aria-label="Cancel Deep Research"
                       >
                         <span className="size-3 rounded-sm bg-current" />
                       </InputGroupButton>
@@ -1848,15 +1935,14 @@ export function ChatView() {
                     {isTemporary && <span className="group-hover:line-through">Temporary</span>}
                   </InputGroupButton>
                   <InputGroupButton
-                    size={isResearch ? "xs" : "icon-xs"}
+                    size="icon-xs"
                     variant="ghost"
-                    aria-label="Toggle research mode"
-                    title="Research"
-                    onClick={() => setIsResearch((prev) => !prev)}
-                    className={`group ${isResearch ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
+                    aria-label="Deep Research"
+                    title="Deep Research: run a multi-round web research report on this topic"
+                    onClick={handleDeepResearch}
+                    disabled={!inputText.trim() || isThinking || deepResearch.isRunning}
                   >
-                    <Microscope className={isResearch ? "fill-blue-500/30" : ""} />
-                    {isResearch && <span className="group-hover:line-through">Research</span>}
+                    <Microscope />
                   </InputGroupButton>
                   <input
                     ref={fileInputRef}
@@ -1885,6 +1971,16 @@ export function ChatView() {
                       className="rounded-lg"
                       onClick={handleStop}
                       aria-label="Stop generation"
+                    >
+                      <span className="size-3 rounded-sm bg-current" />
+                    </InputGroupButton>
+                  ) : deepResearch.isRunning ? (
+                    <InputGroupButton
+                      variant="outline"
+                      size="icon-xs"
+                      className="rounded-lg"
+                      onClick={deepResearch.cancel}
+                      aria-label="Cancel Deep Research"
                     >
                       <span className="size-3 rounded-sm bg-current" />
                     </InputGroupButton>
