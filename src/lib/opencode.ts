@@ -8,7 +8,7 @@ export interface OpenCodeServerConfig {
 }
 
 const DEFAULT_CONFIG: OpenCodeServerConfig = {
-  url: "http://localhost:4096",
+  url: "http://localhost:2138",
 };
 
 export function getDefaultConfig(): OpenCodeServerConfig {

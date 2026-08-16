@@ -8,8 +8,8 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
-const OPENCODE_PORT: &str = "4096";
-const OPENCODE_URL: &str = "http://localhost:4096";
+const OPENCODE_PORT: &str = "2138";
+const OPENCODE_URL: &str = "http://localhost:2138";
 
 static SERVER_PID: Mutex<Option<u32>> = Mutex::new(None);
 
@@ -337,17 +337,64 @@ fn kill_tracked_server() {
     }
 }
 
+/// Find the PID of the process listening on `port` (if any).
+fn pid_listening_on(port: &str) -> Option<u32> {
+    let out = Command::new("lsof")
+        .args(["-t", "-nP", &format!("-iTCP:{}", port), "-sTCP:LISTEN"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u32>().ok())
+        .next()
+}
+
+/// Adopt an already-running server on our port so quitting the app stops it.
+/// Idempotent: never overwrites a PID we already track.
+fn adopt_server_if_needed() {
+    if SERVER_PID.lock().unwrap().is_none() {
+        if let Some(pid) = pid_listening_on(OPENCODE_PORT) {
+            *SERVER_PID.lock().unwrap() = Some(pid);
+        }
+    }
+}
+
 fn server_log_path() -> Option<PathBuf> {
     chat_ui_base_dir().ok().map(|b| b.join("logs").join("opencode-server.log"))
 }
 
 fn spawn_opencode_server(dir: Option<&str>) -> Result<(), String> {
     kill_tracked_server();
+    // Evict any untracked, non-responsive squatter on our port (e.g. a stale
+    // password-protected server from before env sanitization) so the fresh
+    // spawn can bind. kill -9 on an already-dead PID is a harmless no-op.
+    if let Some(pid) = pid_listening_on(OPENCODE_PORT) {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+    }
     std::thread::sleep(Duration::from_millis(300));
 
     let bin = opencode_bin();
     let mut cmd = Command::new(&bin);
-    // Pin the port so the frontend (http://localhost:4096) and health check match.
+    // Never inherit an opencode/OpenChamber session environment. A leaked
+    // OPENCODE_SERVER_PASSWORD makes the spawned server demand Basic auth on
+    // every endpoint — including /global/health — so the health check fails
+    // with 401 and the app reports "OpenCode server is not running".
+    // OPENCODE_CONFIG_CONTENT would also pull OpenChamber's plugin into our
+    // server. env_remove is a no-op when the variable is not set.
+    for key in [
+        "OPENCODE",
+        "OPENCODE_PID",
+        "OPENCODE_BINARY",
+        "OPENCODE_SERVER_PASSWORD",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCHAMBER_OPENCODE_CWD",
+    ] {
+        cmd.env_remove(key);
+    }
+    // Pin the port so the frontend (http://localhost:2138) and health check match.
     // Include CORS for dev (localhost:1420), Windows/Linux prod (tauri.localhost),
     // and macOS prod (tauri://localhost).
     cmd.args([
@@ -406,6 +453,12 @@ async fn opencode_status() -> Result<OpenCodeStatus, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let installed = opencode_exists();
         let serving = installed && opencode_health();
+        // If a server is already running on our port, adopt it so quitting
+        // the app stops it cleanly. Runs on every status check but is
+        // idempotent (never overwrites a tracked PID).
+        if serving {
+            adopt_server_if_needed();
+        }
         Ok(OpenCodeStatus {
             installed,
             serving,
@@ -436,16 +489,23 @@ async fn opencode_install() -> Result<(), String> {
 
 #[tauri::command]
 async fn opencode_serve_start() -> Result<(), String> {
-    if !opencode_exists() {
-        return Err("OpenCode is not installed".to_string());
-    }
-    if opencode_health() {
-        return Ok(());
-    }
-    ensure_chat_ui_directory()?;
-    let base = chat_ui_base_dir()?;
-    let dir = base.to_string_lossy().to_string();
-    tauri::async_runtime::spawn_blocking(move || {
+    // Everything runs inside spawn_blocking: opencode_health() uses reqwest's
+    // blocking client, which must NOT be called on an async runtime thread
+    // (it panics/stalls there, the IPC response is never sent, and the
+    // frontend hangs on "Starting OpenCode server…" forever).
+    tauri::async_runtime::spawn_blocking(|| {
+        if !opencode_exists() {
+            return Err("OpenCode is not installed".to_string());
+        }
+        if opencode_health() {
+            // Adopt an already-running server on our port (e.g. left over from
+            // a previous app instance) so quitting the app stops it cleanly.
+            adopt_server_if_needed();
+            return Ok(());
+        }
+        ensure_chat_ui_directory()?;
+        let base = chat_ui_base_dir()?;
+        let dir = base.to_string_lossy().to_string();
         spawn_opencode_server(Some(&dir))?;
         wait_for_health_blocking()
     })
