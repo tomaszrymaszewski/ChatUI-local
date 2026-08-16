@@ -25,40 +25,47 @@ export function buildPlannerUserMessage(topic: string, ourOrgContext: string | u
   return `Organization to research: ${topic}${orgContextLine(ourOrgContext)}`;
 }
 
-export const RESEARCH_ROUND_SYSTEM_PROMPT = `You are a research analyst with a web_search tool. Use it thoroughly — search multiple times, from multiple angles — to find concrete, sourced information about the assigned questions. Prefer primary sources (the organization's own site, filings, annual reports) and reputable secondary sources (established news outlets, nonprofit watchdog/rating sites like Charity Navigator or ProPublica Nonprofit Explorer where relevant).
+// --- Seed-adaptive planning (Phase 2-C, upload input mode) ---
+// A run can be started from a typed topic, an uploaded seed (doc/URL list),
+// or both. Topic-only delegates straight to buildPlannerUserMessage above —
+// byte-for-byte the same as before this existed — so the existing typed-topic
+// path is untouched.
 
-Once you've finished searching, respond with ONLY a single JSON object as your entire final message — no markdown code fences, no other text before or after it — matching exactly this schema:
-{
-  "findings": [ { "text": string, "sourceUrls": [string, ...] } ],
-  "resolvedGaps": [string, ...],
-  "newGaps": [ { "question": string, "section": string } ]
-}
-
-Rules:
-- Every finding must be concrete and attributable — no vague filler. If you found nothing solid for a question, leave it unresolved; never invent an answer.
-- "sourceUrls" must only contain URLs that actually appeared in your search results this round.
-- "resolvedGaps" must contain the exact question text — copied verbatim, character-for-character — of every open question below that you found solid evidence for. Do not resolve a question without real, specific evidence.
-- "newGaps" are new, more specific follow-up questions this round's research surfaced. Only include genuinely useful ones; an empty array is fine.`;
-
-export function buildResearchRoundUserMessage(
-  topic: string,
-  gaps: Gap[],
-  queries: string[],
-  roundIndex: number,
+export function buildPlannerUserMessageAdaptive(
+  topic: string | undefined,
+  seed: string | undefined,
+  ourOrgContext: string | undefined,
 ): string {
-  const openQuestions = gaps.map((gap, i) => `${i + 1}. [${gap.section}] ${gap.question}`).join("\n");
-  return `Organization: ${topic}
+  const trimmedTopic = topic?.trim();
+  const trimmedSeed = seed?.trim();
 
-Research round ${roundIndex + 1}. Suggested starting search queries: ${queries.join("; ")}
+  if (!trimmedTopic && !trimmedSeed) {
+    throw new Error("buildPlannerUserMessageAdaptive requires a topic, a seed, or both");
+  }
 
-Open questions (answer as many as you credibly can — you are not limited to only these):
-${openQuestions}`;
+  if (trimmedSeed && !trimmedTopic) {
+    return `You have been given seed material about an organization (below) instead of a typed topic. Derive research questions that DEEPEN and VERIFY what's already stated in it — don't just restate it; dig into what's under-supported, ambiguous, or worth independently confirming.${orgContextLine(ourOrgContext)}
+
+Seed material:
+${trimmedSeed}`;
+  }
+
+  if (trimmedSeed && trimmedTopic) {
+    return `Organization to research: ${trimmedTopic}${orgContextLine(ourOrgContext)}
+
+You have also been given seed material (below) — use it as grounding context. Focus your research questions on "${trimmedTopic}" specifically, using the seed to inform what's already known versus what still needs independent verification.
+
+Seed material:
+${trimmedSeed}`;
+  }
+
+  return buildPlannerUserMessage(trimmedTopic!, ourOrgContext);
 }
 
-// --- Extraction (universal/Tavily path — Phase 2-B) ---
-// Same job as RESEARCH_ROUND_SYSTEM_PROMPT above, but the model has no tool to
-// call: search results are injected directly into the message as text, since
-// not every provider/model supports (or reliably supports) tool-calling.
+// --- Extraction (the only research-round path) ---
+// The model has no tool to call: fetched page content is injected directly
+// into the message as text, since not every provider/model supports (or
+// reliably supports) tool-calling, and there's no search tool to call anyway.
 
 export const EXTRACTION_SYSTEM_PROMPT = `You are a research analyst extracting information from web search results about an NGO or nonprofit organization. You will be given raw search results (title, URL, and page content) gathered for a set of open research questions — read them carefully and extract concrete, sourced findings.
 

@@ -1,18 +1,19 @@
-// Universal (any-model) research path — Phase 2-B. Planner, extraction, and
-// synthesis all run through the app's EXISTING multi-provider completion layer
-// (streamChatCompletion in src/lib/llm.ts) on whatever provider/model the
-// caller supplies, instead of the Claude-only anthropic-research.ts path.
-// Search itself comes from Tavily, injected into the extraction prompt as text
-// — no per-provider tool-calling, so this works uniformly even on models with
-// weak or no tool support.
+// The Deep Research engine — the only one. No search tool, no search API key,
+// no per-provider special-casing: expansion happens only by fetching URLs
+// already present in an uploaded/pasted seed (computeExpansionFrontier in
+// seed.ts), one hop out, via the app's existing web_fetch. Planner, extraction,
+// and synthesis all run through the app's multi-provider completion layer, so
+// this works on whatever model is currently selected — Claude, OpenAI, Gemini,
+// a local Ollama model, anything.
 
 import type { Provider } from "@/types";
 import { streamChatCompletion, type ChatCompletionMessage } from "@/lib/llm";
 import { extractJson } from "./json";
-import { searchTavily, type TavilyCredentials, type TavilySearchResult } from "./tavily";
+import { fetchUrlContent } from "./seed";
+import { FETCH_ONLY_FETCH_CONCURRENCY, FETCH_ONLY_MAX_CONTENT_CHARS, FETCH_ONLY_MAX_FETCHES_PER_ROUND } from "./config";
 import {
   PLANNER_SYSTEM_PROMPT,
-  buildPlannerUserMessage,
+  buildPlannerUserMessageAdaptive,
   EXTRACTION_SYSTEM_PROMPT,
   buildExtractionUserMessage,
   SYNTHESIS_SYSTEM_PROMPT,
@@ -42,9 +43,6 @@ async function withRetryOnce<T>(fn: () => Promise<T>, signal: AbortSignal): Prom
   }
 }
 
-/** streamChatCompletion doesn't surface token usage across providers — a rough
- * chars/4 estimate is enough to keep the orchestrator's token ceiling meaningful
- * rather than dead code for this path (injected search content is heavy). */
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
@@ -68,8 +66,6 @@ function normalizeQuestion(text: string): string {
   return text.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-/** Same verbatim-with-fallback matching as the Claude path (anthropic-research.ts) — kept
- * as a local copy rather than a shared import so the two paths stay independently editable. */
 function matchResolvedGaps(gaps: Gap[], claimed: string[]): string[] {
   const byNormalized = new Map(gaps.map((gap) => [normalizeQuestion(gap.question), gap.question]));
   const resolved = new Set<string>();
@@ -84,17 +80,11 @@ function matchResolvedGaps(gaps: Gap[], claimed: string[]): string[] {
   return Array.from(resolved);
 }
 
-function makeUniversalPlannerFn(provider: Provider, model: string): PlannerFn {
+function makeFetchOnlyPlannerFn(provider: Provider, model: string, seed: string | undefined): PlannerFn {
   return async (topic, ourOrgContext, signal) => {
+    const userMessage = buildPlannerUserMessageAdaptive(topic || undefined, seed, ourOrgContext);
     const text = await withRetryOnce(
-      () =>
-        collectCompletion(
-          provider,
-          model,
-          PLANNER_SYSTEM_PROMPT,
-          buildPlannerUserMessage(topic, ourOrgContext),
-          signal,
-        ),
+      () => collectCompletion(provider, model, PLANNER_SYSTEM_PROMPT, userMessage, signal),
       signal,
     );
 
@@ -111,48 +101,74 @@ function makeUniversalPlannerFn(provider: Provider, model: string): PlannerFn {
   };
 }
 
-function makeUniversalResearchRoundFn(
-  provider: Provider,
-  model: string,
-  tavily: TavilyCredentials,
-): ResearchRoundFn {
-  // URL-dedup across rounds: once a page's content has been injected into an
-  // extraction prompt, never inject it again even if a later round's search
-  // resurfaces it — the model has already had a chance to extract from it.
-  const injectedUrls = new Set<string>();
+function makeFetchOnlyResearchRoundFn(provider: Provider, model: string): ResearchRoundFn {
+  // The expansion frontier (context.seedUrls) is consumed across rounds, a
+  // capped batch at a time — never re-fetched, never expanded beyond (no hop 2).
+  const fetchedUrls = new Set<string>();
+  let frontierQueue: string[] | null = null;
 
-  return async (topic, gaps, queries, roundIndex, signal) => {
-    const perQuery: QuerySearchResults[] = [];
-    const newSources: Source[] = [];
-
-    for (const query of queries) {
-      let results: TavilySearchResult[];
-      try {
-        results = await withRetryOnce(() => searchTavily(query, tavily, signal), signal);
-      } catch {
-        results = []; // one failed query degrades to no results for that query, not a crash
-      }
-
-      const freshResults = results.filter((result) => !injectedUrls.has(result.url));
-      freshResults.forEach((result) => injectedUrls.add(result.url));
-      perQuery.push({ query, results: freshResults });
-      newSources.push(
-        ...freshResults.map((result) => ({ url: result.url, title: result.title, foundInRound: roundIndex })),
-      );
+  return async (topic, gaps, _queries, roundIndex, context, signal) => {
+    if (context.mode !== "fetch-only") {
+      throw new Error("makeFetchOnlyResearchRoundFn requires context.mode === 'fetch-only'");
     }
 
-    const emptyResult = (tokensUsed: number): ResearchRoundResult => ({
+    if (frontierQueue === null) {
+      frontierQueue = Array.from(new Set(context.seedUrls ?? []));
+    }
+
+    const batch: string[] = [];
+    while (frontierQueue.length > 0 && batch.length < FETCH_ONLY_MAX_FETCHES_PER_ROUND) {
+      const next = frontierQueue.shift()!;
+      if (!fetchedUrls.has(next)) batch.push(next);
+    }
+
+    const emptyResult = (tokensUsed = 0): ResearchRoundResult => ({
       findings: [],
-      newSources,
+      newSources: [],
       resolvedGaps: [],
       newGaps: [],
       tokensUsed,
     });
 
-    // Nothing new to extract from this round (every result was already injected earlier).
-    if (newSources.length === 0) return emptyResult(0);
+    // Frontier exhausted — nothing left to fetch. Orchestrator's diminishing-
+    // returns termination will end the loop after this.
+    if (batch.length === 0) return emptyResult();
 
-    const userMessage = buildExtractionUserMessage(topic, gaps, perQuery);
+    // Bounded-concurrency fetch, checking cancellation between mini-batches —
+    // executeWebFetch has no external AbortSignal (see DISCOVERY-2C.md), so an
+    // in-flight fetch can't be aborted mid-request, only not-started.
+    const fetchedPages: Array<{ url: string; content: string }> = [];
+    for (let i = 0; i < batch.length; i += FETCH_ONLY_FETCH_CONCURRENCY) {
+      if (signal.aborted) break;
+      const slice = batch.slice(i, i + FETCH_ONLY_FETCH_CONCURRENCY);
+      const results = await Promise.all(
+        slice.map(async (url) => {
+          fetchedUrls.add(url);
+          const content = await fetchUrlContent(url);
+          return { url, content };
+        }),
+      );
+      for (const r of results) {
+        if (r.content) fetchedPages.push({ url: r.url, content: r.content.slice(0, FETCH_ONLY_MAX_CONTENT_CHARS) });
+      }
+    }
+
+    const newSources: Source[] = fetchedPages.map((page) => ({
+      url: page.url,
+      title: page.url,
+      foundInRound: roundIndex,
+    }));
+
+    if (fetchedPages.length === 0) return emptyResult();
+
+    const searchResults: QuerySearchResults[] = [
+      {
+        query: "links referenced in the uploaded material",
+        results: fetchedPages.map((page) => ({ url: page.url, title: page.url, content: page.content })),
+      },
+    ];
+    const userMessage = buildExtractionUserMessage(topic || "the organization described in the uploaded material", gaps, searchResults);
+
     let text: string;
     try {
       text = await withRetryOnce(
@@ -160,7 +176,7 @@ function makeUniversalResearchRoundFn(
         signal,
       );
     } catch {
-      return emptyResult(estimateTokens(userMessage));
+      return { ...emptyResult(estimateTokens(userMessage)), newSources };
     }
 
     let parsed: {
@@ -171,7 +187,7 @@ function makeUniversalResearchRoundFn(
     try {
       parsed = extractJson(text);
     } catch {
-      return emptyResult(estimateTokens(userMessage) + estimateTokens(text));
+      return { ...emptyResult(estimateTokens(userMessage) + estimateTokens(text)), newSources };
     }
 
     const actualUrls = new Set(newSources.map((source) => source.url));
@@ -192,7 +208,7 @@ function makeUniversalResearchRoundFn(
   };
 }
 
-function makeUniversalSynthesizeFn(provider: Provider, model: string): SynthesizeFn {
+function makeFetchOnlySynthesizeFn(provider: Provider, model: string): SynthesizeFn {
   return async function* (session: ResearchSession, signal: AbortSignal) {
     const messages: ChatCompletionMessage[] = [{ role: "user", content: buildSynthesisUserMessage(session) }];
     for await (const chunk of streamChatCompletion(
@@ -209,20 +225,20 @@ function makeUniversalSynthesizeFn(provider: Provider, model: string): Synthesiz
   };
 }
 
-export interface UniversalResearchFunctions {
+export interface FetchOnlyResearchFunctions {
   planner: PlannerFn;
   researchRound: ResearchRoundFn;
   synthesize: SynthesizeFn;
 }
 
-export function createUniversalResearchFunctions(
+export function createFetchOnlyResearchFunctions(
   provider: Provider,
   model: string,
-  tavily: TavilyCredentials,
-): UniversalResearchFunctions {
+  seed: string | undefined,
+): FetchOnlyResearchFunctions {
   return {
-    planner: makeUniversalPlannerFn(provider, model),
-    researchRound: makeUniversalResearchRoundFn(provider, model, tavily),
-    synthesize: makeUniversalSynthesizeFn(provider, model),
+    planner: makeFetchOnlyPlannerFn(provider, model, seed),
+    researchRound: makeFetchOnlyResearchRoundFn(provider, model),
+    synthesize: makeFetchOnlySynthesizeFn(provider, model),
   };
 }
