@@ -126,6 +126,8 @@ import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { useDeepResearch } from "@/hooks/use-deep-research";
 import { buildResearchSeed, computeExpansionFrontier, extractUrlsFromText } from "@/lib/research/seed";
+import { keylessWebSearch } from "@/lib/research/keyless-search";
+import { KEYLESS_SEARCH_MAX_RESULTS } from "@/lib/research/config";
 import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
 import { loadInstalledSkillsPrompt } from "@/lib/skills-library";
 import { getAllTools } from "@/lib/tools";
@@ -546,8 +548,8 @@ export function ChatView() {
 
     const urlsInText = extractUrlsFromText(topic);
     const hasFetchableMaterial = files.length > 0 || urlsInText.length > 0;
-    if (!hasFetchableMaterial) {
-      toast.error("Attach a document or paste URLs to research.");
+    if (!hasFetchableMaterial && !topic) {
+      toast.error("Type a topic, attach a document, or paste URLs to research.");
       return;
     }
 
@@ -586,7 +588,19 @@ export function ChatView() {
       const userMsg = await addMessage(sessionId, "user", displayText, undefined, userAttachments, parentId, isTemporary);
       updateSession(sessionId, {});
 
-      const seed = await buildResearchSeed(seedFiles, urlsInText);
+      let directUrls = urlsInText;
+      if (!hasFetchableMaterial) {
+        // Bare topic, nothing attached — bootstrap starting URLs via a keyless
+        // search (no API key; scrapes DuckDuckGo's HTML endpoint) so typing
+        // just a name still works, same as before search was removed.
+        directUrls = await keylessWebSearch(topic, KEYLESS_SEARCH_MAX_RESULTS);
+        if (directUrls.length === 0) {
+          toast.error("Couldn't find anything to research for that topic — try attaching a document or pasting URLs instead.");
+          return;
+        }
+      }
+
+      const seed = await buildResearchSeed(seedFiles, directUrls);
       const seedUrls = computeExpansionFrontier(seed);
 
       pendingResearchSessionRef.current = { sessionId, userMsgId: userMsg.id };
@@ -1494,7 +1508,7 @@ export function ChatView() {
                       size="icon-xs"
                       variant="ghost"
                       aria-label="Deep Research"
-                      title="Deep Research: paste URLs or attach a document to research"
+                      title="Deep Research: type a topic, paste URLs, or attach a document"
                       onClick={handleDeepResearch}
                       disabled={(!inputText.trim() && files.length === 0) || isThinking || deepResearch.isRunning}
                     >
@@ -1962,7 +1976,7 @@ export function ChatView() {
                     size="icon-xs"
                     variant="ghost"
                     aria-label="Deep Research"
-                    title="Deep Research: paste URLs or attach a document to research"
+                    title="Deep Research: type a topic, paste URLs, or attach a document"
                     onClick={handleDeepResearch}
                     disabled={(!inputText.trim() && files.length === 0) || isThinking || deepResearch.isRunning}
                   >

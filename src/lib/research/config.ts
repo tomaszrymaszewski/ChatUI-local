@@ -13,6 +13,9 @@ export const FETCH_ONLY_FETCH_CONCURRENCY = 2;
 /** Per-page content cap before injecting into the extraction prompt. */
 export const FETCH_ONLY_MAX_CONTENT_CHARS = 4000;
 
+/** Bare-topic runs (no doc/URLs attached) bootstrap starting URLs via keylessWebSearch — this many. */
+export const KEYLESS_SEARCH_MAX_RESULTS = 5;
+
 export const REPORT_SECTIONS = [
   "Snapshot",
   "Programs & Activities",
