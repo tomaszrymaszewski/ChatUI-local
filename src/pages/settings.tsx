@@ -53,6 +53,7 @@ import { getBuiltinProvider } from "@/lib/builtin-providers";
 import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync } from "@/lib/model-capabilities";
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
 import { EMBEDDING_MODELS, setEmbeddingModel } from "@/lib/embeddings";
+import { getTavilyApiKeyOrEmpty, setTavilyApiKey } from "@/lib/research/api-key";
 import type { Provider, ProviderModel } from "@/types";
 
 type SettingsTab = "general" | "memory" | "models" | "chat" | "agents";
@@ -73,6 +74,7 @@ export function SettingsDialog({
 
   const [showProviderForm, setShowProviderForm] = useState(false);
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
+  const [tavilyKeyDraft, setTavilyKeyDraft] = useState(() => getTavilyApiKeyOrEmpty());
   const [deleteTarget, setDeleteTarget] = useState<Provider | null>(null);
 
   const [showModelForm, setShowModelForm] = useState(false);
@@ -652,6 +654,55 @@ export function SettingsDialog({
                           })}
                         </div>
                       )}
+                    </div>
+
+                    <Separator />
+
+                    {/* Deep Research Search Section */}
+                    <div className="flex flex-col gap-4">
+                      <div>
+                        <h2 className="text-xl font-semibold">Deep Research Search</h2>
+                        <p className="text-sm text-muted-foreground">
+                          Used by Deep Research when a non-Claude model is selected. Claude models use Anthropic's built-in search instead and don't need this.
+                        </p>
+                      </div>
+                      <Card>
+                        <CardContent className="flex flex-col gap-3 pt-6">
+                          <div className="flex flex-col gap-1.5">
+                            <Label htmlFor="tavily-key">Tavily API key</Label>
+                            <Input
+                              id="tavily-key"
+                              type="password"
+                              placeholder="tvly-..."
+                              value={tavilyKeyDraft}
+                              onChange={(e) => setTavilyKeyDraft(e.target.value)}
+                            />
+                            <p className="text-xs text-muted-foreground">
+                              Free key at{" "}
+                              <a
+                                href="https://tavily.com"
+                                target="_blank"
+                                rel="noreferrer"
+                                className="underline"
+                              >
+                                tavily.com
+                              </a>
+                            </p>
+                          </div>
+                          <div>
+                            <Button
+                              size="sm"
+                              disabled={!tavilyKeyDraft.trim()}
+                              onClick={() => {
+                                setTavilyApiKey(tavilyKeyDraft);
+                                toast.success("Tavily key saved");
+                              }}
+                            >
+                              Save
+                            </Button>
+                          </div>
+                        </CardContent>
+                      </Card>
                     </div>
 
                     <Separator />

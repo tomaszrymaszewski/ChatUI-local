@@ -55,6 +55,11 @@ export function getTavilyApiKey(): string {
   return key;
 }
 
+/** Non-throwing variant for UI display (e.g. pre-filling a Settings field). */
+export function getTavilyApiKeyOrEmpty(): string {
+  return localStorage.getItem(TAVILY_KEY_STORAGE_KEY)?.trim() ?? "";
+}
+
 export function setTavilyApiKey(key: string): void {
   localStorage.setItem(TAVILY_KEY_STORAGE_KEY, key.trim());
 }

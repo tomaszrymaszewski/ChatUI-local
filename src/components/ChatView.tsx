@@ -125,7 +125,6 @@ import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { useDeepResearch } from "@/hooks/use-deep-research";
-import { RESEARCH_MODEL } from "@/lib/research/config";
 import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
 import { loadInstalledSkillsPrompt } from "@/lib/skills-library";
 import { getAllTools } from "@/lib/tools";
@@ -533,16 +532,23 @@ export function ChatView() {
   const pendingResearchSessionRef = useRef<{ sessionId: string; userMsgId: string } | null>(null);
 
   const deepResearch = useDeepResearch({
-    onReport: async (report) => {
+    onReport: async (report, modelUsed) => {
       const pending = pendingResearchSessionRef.current;
       if (!pending) return;
-      await addMessage(pending.sessionId, "assistant", report, RESEARCH_MODEL, undefined, pending.userMsgId, isTemporary);
+      await addMessage(pending.sessionId, "assistant", report, modelUsed, undefined, pending.userMsgId, isTemporary);
     },
   });
 
   const handleDeepResearch = async () => {
     const topic = inputText.trim();
     if (!topic || isThinking || deepResearch.isRunning) return;
+
+    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    if (!provider) {
+      toast.error("No provider configured. Add one in Settings.");
+      setSettingsOpen(true);
+      return;
+    }
 
     setInputText("");
     setFiles([]);
@@ -566,7 +572,7 @@ export function ChatView() {
       updateSession(sessionId, {});
 
       pendingResearchSessionRef.current = { sessionId, userMsgId: userMsg.id };
-      await deepResearch.start(topic, currentProjectInstructions || undefined);
+      await deepResearch.start(topic, provider, selectedModel, currentProjectInstructions || undefined);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to start Deep Research");
     } finally {
