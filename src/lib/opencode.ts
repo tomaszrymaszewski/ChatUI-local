@@ -15,6 +15,26 @@ export function getDefaultConfig(): OpenCodeServerConfig {
   return { ...DEFAULT_CONFIG };
 }
 
+const CONFIG_STORAGE_KEY = "opencode-server-config";
+
+export function getStoredConfig(): OpenCodeServerConfig | null {
+  try {
+    const raw = localStorage.getItem(CONFIG_STORAGE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as OpenCodeServerConfig;
+  } catch {
+    return null;
+  }
+}
+
+export function saveConfig(config: OpenCodeServerConfig): void {
+  localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(config));
+}
+
+export function clearConfig(): void {
+  localStorage.removeItem(CONFIG_STORAGE_KEY);
+}
+
 function buildHeaders(config: OpenCodeServerConfig): Record<string, string> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -464,18 +484,6 @@ export async function sendMessageAsync(
     method: "POST",
     body: JSON.stringify(body),
     query: { directory },
-  });
-}
-
-export async function summarizeSession(
-  config: OpenCodeServerConfig,
-  sessionId: string,
-  providerID: string,
-  modelID: string
-): Promise<boolean> {
-  return apiFetch(config, `/session/${sessionId}/summarize`, {
-    method: "POST",
-    body: JSON.stringify({ providerID, modelID }),
   });
 }
 
