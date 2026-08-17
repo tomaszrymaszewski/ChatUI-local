@@ -8,6 +8,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
+mod research_tools;
+use research_tools::{research_open_url, research_read_pdf};
+
 const OPENCODE_PORT: &str = "4096";
 const OPENCODE_URL: &str = "http://localhost:4096";
 
@@ -77,7 +80,7 @@ fn ensure_chat_ui_directory() -> Result<String, String> {
     if !base.exists() {
         fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     }
-    for sub in &["sessions", "agents", "projects", "skills", "mcp", "logs"] {
+    for sub in &["sessions", "agents", "projects", "skills", "mcp", "logs", "research"] {
         let dir = base.join(sub);
         if !dir.exists() {
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -704,6 +707,8 @@ pub fn run() {
             path_exists,
             remove_path,
             get_home_dir,
+            research_open_url,
+            research_read_pdf,
             get_opencode_config_path,
             opencode_status,
             opencode_install,
