@@ -15,6 +15,8 @@ import {
   checkTermination,
   checkReflectionTrigger,
   foldState,
+  normalizeUrl,
+  normalizeQuery,
   DEFAULT_LOOP_CONFIG,
   type LoopConfig,
   type ModelPort,
@@ -34,6 +36,20 @@ function ctx(overrides: Partial<ValidationContext> = {}): ValidationContext {
     ...overrides,
   };
 }
+
+describe("researchLoop: normalizeUrl / normalizeQuery (now exported for reuse by tool implementations)", () => {
+  it("normalizeUrl trims, lowercases, and strips a trailing slash", () => {
+    expect(normalizeUrl("  HTTPS://Example.com/Path/ ")).toBe("https://example.com/path");
+  });
+
+  it("normalizeUrl treats a URL with and without a trailing slash as the same key", () => {
+    expect(normalizeUrl("https://example.com/page/")).toBe(normalizeUrl("https://example.com/page"));
+  });
+
+  it("normalizeQuery trims, lowercases, and collapses internal whitespace", () => {
+    expect(normalizeQuery("  Example   Query  ")).toBe("example query");
+  });
+});
 
 describe("actions: extractFirstJsonObject", () => {
   it("extracts a bare JSON object with no fence", () => {
