@@ -7,6 +7,7 @@ import {
   toSubQuestionId,
   type ValidationContext,
 } from "./actions";
+import { evaluateExpression } from "./calculate";
 
 function ctx(overrides: Partial<ValidationContext> = {}): ValidationContext {
   return {
@@ -251,5 +252,97 @@ describe("actions: describeActionError", () => {
   it("mentions the offending id for unknown_source/unknown_subq", () => {
     expect(describeActionError({ kind: "unknown_source", sourceId: "S99" })).toContain("S99");
     expect(describeActionError({ kind: "unknown_subq", subQuestionId: "SQ99" })).toContain("SQ99");
+  });
+});
+
+describe("calculate: evaluateExpression", () => {
+  it("evaluates basic addition and subtraction", () => {
+    const result = evaluateExpression("2 + 3 - 1");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toBe(4);
+  });
+
+  it("respects multiplication/division precedence over addition", () => {
+    const result = evaluateExpression("2 + 3 * 4");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toBe(14);
+  });
+
+  it("respects parentheses", () => {
+    const result = evaluateExpression("(2 + 3) * 4");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toBe(20);
+  });
+
+  it("supports right-associative exponentiation", () => {
+    const result = evaluateExpression("2 ^ 3 ^ 2"); // 2^(3^2) = 2^9 = 512
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toBe(512);
+  });
+
+  it("supports unary minus", () => {
+    const result = evaluateExpression("-5 + 3");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toBe(-2);
+  });
+
+  it("supports modulo", () => {
+    const result = evaluateExpression("10 % 3");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toBe(1);
+  });
+
+  it("rejects division by zero", () => {
+    const result = evaluateExpression("1 / 0");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("division_by_zero");
+  });
+
+  it("rejects modulo by zero", () => {
+    const result = evaluateExpression("1 % 0");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("division_by_zero");
+  });
+
+  it("rejects malformed expressions", () => {
+    const result = evaluateExpression("2 + * 3");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("parse_error");
+  });
+
+  it("rejects unbalanced parentheses", () => {
+    const result = evaluateExpression("(2 + 3");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("parse_error");
+  });
+
+  it("rejects trailing garbage after a valid expression", () => {
+    const result = evaluateExpression("2 + 3 foo");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("parse_error");
+  });
+
+  it("rejects empty input", () => {
+    const result = evaluateExpression("");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("parse_error");
+  });
+
+  it("rejects unknown characters (no identifiers, no ambient scope)", () => {
+    const result = evaluateExpression("globalThis");
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("parse_error");
+  });
+
+  it("rejects pathologically long input", () => {
+    const result = evaluateExpression("1" + "+1".repeat(500));
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.error.kind).toBe("parse_error");
+  });
+
+  it("handles decimal numbers", () => {
+    const result = evaluateExpression("1.5 + 2.5");
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.value).toBe(4);
   });
 });
