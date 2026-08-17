@@ -234,11 +234,11 @@ function openSubQCount(state: ResearchSession): number {
   return state.subQuestions.filter((sq) => sq.status !== "done").length;
 }
 
-function normalizeQuery(query: string): string {
+export function normalizeQuery(query: string): string {
   return query.trim().toLowerCase().replace(/\s+/g, " ");
 }
 
-function normalizeUrl(url: string): string {
+export function normalizeUrl(url: string): string {
   return url.trim().replace(/\/$/, "").toLowerCase();
 }
 
