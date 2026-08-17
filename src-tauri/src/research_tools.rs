@@ -231,6 +231,33 @@ mod tests {
         assert!(result.body.contains("nested oddly"));
     }
 
+    // Live network checks — not part of `cargo test`'s normal run (no network in CI/npm run
+    // test). Run explicitly with `cargo test -- --ignored` to exercise the real fetch path this
+    // stage's Verification section calls for.
+    #[test]
+    #[ignore]
+    fn live_fetch_and_extract_a_real_page() {
+        let bytes = fetch_capped_bytes("https://example.com", 15_000).expect("live fetch should succeed");
+        let html = String::from_utf8_lossy(&bytes).to_string();
+        let result = extract_html(&html);
+        assert!(result.title.to_lowercase().contains("example"));
+        assert!(!result.body.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn live_fetch_rejects_a_404() {
+        let result = fetch_capped_bytes("https://example.com/this-path-does-not-exist-404", 15_000);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn live_fetch_rejects_an_unreachable_host() {
+        let result = fetch_capped_bytes("https://this-host-does-not-exist-at-all.invalid", 5_000);
+        assert!(result.is_err());
+    }
+
     #[test]
     fn read_capped_allows_data_under_the_cap() {
         let data = vec![7u8; 100];
