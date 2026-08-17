@@ -2,11 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import {
   type OpenCodeServerConfig,
-  type OCSession,
-  type OCMessageEntry,
-  type OCPart,
-  type OCAgent,
-  type OCEvent,
+  type Session,
+  type MessageEntry,
+  type AssistantMessageInfo,
+  type Part,
+  type Agent,
+  type Event,
   getStoredConfig,
   saveConfig,
   clearConfig,
@@ -30,11 +31,11 @@ export function useOpencode() {
   );
   const [connected, setConnected] = useState(false);
   const [connecting, setConnecting] = useState(false);
-  const [sessions, setSessions] = useState<OCSession[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<OCMessageEntry[]>([]);
+  const [messages, setMessages] = useState<MessageEntry[]>([]);
   const [isBusy, setIsBusy] = useState(false);
-  const [agents, setAgents] = useState<OCAgent[]>([]);
+  const [agents, setAgents] = useState<Agent[]>([]);
   const [selectedAgent, setSelectedAgent] = useState<string>("");
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
@@ -169,12 +170,14 @@ export function useOpencode() {
     async (text: string, sessionIdOverride?: string) => {
       const sessionId = sessionIdOverride ?? activeSessionId;
       if (!config || !sessionId || !text.trim()) return;
-      const userEntry: OCMessageEntry = {
+      const userEntry: MessageEntry = {
         info: {
           id: `local-${Date.now()}`,
           sessionID: sessionId,
           role: "user",
           time: { created: Date.now() },
+          agent: selectedAgent || "",
+          model: { providerID: "", modelID: "" },
         },
         parts: [
           {
@@ -193,8 +196,10 @@ export function useOpencode() {
         await sendMessageAsync(
           config,
           sessionId,
-          text.trim(),
-          selectedAgent || undefined
+          {
+            parts: [{ type: "text", text: text.trim() }],
+            agent: selectedAgent || undefined,
+          },
         );
       } catch (err) {
         setIsBusy(false);
@@ -222,7 +227,8 @@ export function useOpencode() {
       .find(
         (e) => e.info.role === "assistant" && e.info.providerID && e.info.modelID
       );
-    if (!lastAssistant?.info.providerID || !lastAssistant.info.modelID) {
+    const ai = lastAssistant?.info as AssistantMessageInfo | undefined;
+    if (!ai?.providerID || !ai.modelID) {
       toast.error("Send a message first so a model is known for this session");
       return;
     }
@@ -231,8 +237,7 @@ export function useOpencode() {
       await summarizeSession(
         config,
         activeSessionId,
-        lastAssistant.info.providerID,
-        lastAssistant.info.modelID
+        { providerID: ai.providerID, modelID: ai.modelID },
       );
       toast.success("Session compacted");
     } catch (err) {
@@ -259,12 +264,12 @@ export function useOpencode() {
 
       eventUnsubscribeRef.current = subscribeToEvents(
         config,
-        (event: OCEvent) => {
+        (event: Event) => {
           const props = event.properties as Record<string, unknown>;
 
           switch (event.type) {
             case "session.created": {
-              const info = props.info as OCSession;
+              const info = props.info as Session;
               setSessions((prev) => {
                 if (prev.some((s) => s.id === info.id)) return prev;
                 return [info, ...prev];
@@ -273,7 +278,7 @@ export function useOpencode() {
             }
 
             case "session.updated": {
-              const info = props.info as OCSession;
+              const info = props.info as Session;
               setSessions((prev) =>
                 prev.map((s) => (s.id === info.id ? info : s))
               );
@@ -281,7 +286,7 @@ export function useOpencode() {
             }
 
             case "session.deleted": {
-              const info = props.info as OCSession;
+              const info = props.info as Session;
               setSessions((prev) => prev.filter((s) => s.id !== info.id));
               if (activeSessionIdRef.current === info.id) {
                 setActiveSessionId(null);
@@ -291,7 +296,7 @@ export function useOpencode() {
             }
 
             case "message.updated": {
-              const info = props.info as OCMessageEntry["info"];
+              const info = props.info as MessageEntry["info"];
               if (info.sessionID !== activeSessionIdRef.current) break;
               setMessages((prev) => {
                 const idx = prev.findIndex((e) => e.info.id === info.id);
@@ -322,7 +327,7 @@ export function useOpencode() {
             }
 
             case "message.part.updated": {
-              const part = props.part as OCPart;
+              const part = props.part as Part;
               if (part.sessionID !== activeSessionIdRef.current) break;
               setMessages((prev) => {
                 const msgIdx = prev.findIndex(
@@ -337,6 +342,17 @@ export function useOpencode() {
                         sessionID: part.sessionID,
                         role: "assistant",
                         time: { created: Date.now() },
+                        parentID: "",
+                        modelID: "",
+                        providerID: "",
+                        mode: "",
+                        cost: 0,
+                        tokens: {
+                          input: 0,
+                          output: 0,
+                          reasoning: 0,
+                          cache: { read: 0, write: 0 },
+                        },
                       },
                       parts: [part],
                     },

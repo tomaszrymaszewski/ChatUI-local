@@ -52,7 +52,7 @@ import {
   InputGroupTextarea,
 } from "@/components/ui/input-group";
 import { useOpencode } from "@/hooks/use-opencode";
-import type { OCMessageEntry, OCPart } from "@/lib/opencode";
+import type { MessageEntry, Part } from "@/lib/opencode";
 
 function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], {
@@ -61,7 +61,7 @@ function formatTime(ts: number): string {
   });
 }
 
-function renderPart(part: OCPart, key: string) {
+function renderPart(part: Part, key: string) {
   switch (part.type) {
     case "text":
       return (
@@ -113,7 +113,7 @@ function renderPart(part: OCPart, key: string) {
   }
 }
 
-function renderMessage(entry: OCMessageEntry) {
+function renderMessage(entry: MessageEntry) {
   const { info, parts } = entry;
   const visibleParts = parts.filter(
     (p) => p.type !== "step-start" && p.type !== "step-finish"
@@ -133,7 +133,7 @@ function renderMessage(entry: OCMessageEntry) {
           ) : (
             visibleParts.map((part) => renderPart(part, part.id))
           )}
-          {info.time.completed && (
+          {"completed" in info.time && info.time.completed && (
             <span className="mt-1 block text-[10px] text-muted-foreground">
               {formatTime(info.time.completed)}
             </span>

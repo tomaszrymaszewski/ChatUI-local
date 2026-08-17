@@ -2047,7 +2047,7 @@ export function ChatView() {
         )}
         </div>
         <div className={activeTab === "agent" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
-          <AgentView projects={projects} updateProject={updateProject} />
+          <AgentView />
         </div>
       </SidebarInset>
 
