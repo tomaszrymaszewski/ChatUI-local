@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import type { Provider } from "@/types";
 import { runResearchSession } from "@/lib/research/orchestrator";
 import { createFetchOnlyResearchFunctions } from "@/lib/research/fetch-only-research";
+import { DEFAULT_RESEARCH_BREADTH, DEFAULT_RESEARCH_DEPTH } from "@/lib/research/config";
 import type { ProgressEvent } from "@/lib/research/types";
 
 export interface UseDeepResearchOptions {
@@ -28,11 +29,13 @@ export interface UseDeepResearchResult {
 function describeProgress(event: ProgressEvent): string | null {
   switch (event.type) {
     case "planning":
-      return "Planning research…";
+      return "Mapping perspectives & planning sub-questions…";
     case "round_start":
-      return `Round ${event.round}/${event.maxRounds}: ${event.label}`;
+      return `Round ${event.round}/${event.maxRounds} — researching: ${event.label}`;
+    case "round_end":
+      return `Round ${event.round} done — ${event.newSourceCount} new source${event.newSourceCount === 1 ? "" : "s"}, ${event.remainingGaps} open question${event.remainingGaps === 1 ? "" : "s"}`;
     case "synthesizing":
-      return "Writing report…";
+      return "Synthesizing cited report…";
     default:
       return null;
   }
@@ -58,7 +61,7 @@ export function useDeepResearch({ onReport }: UseDeepResearchOptions): UseDeepRe
       ourOrgContext?: string,
     ) => {
       setIsRunning(true);
-      setStatusLabel("Planning research…");
+      setStatusLabel("Mapping perspectives & planning sub-questions…");
       setStreamingReport("");
 
       const controller = new AbortController();
@@ -76,6 +79,10 @@ export function useDeepResearch({ onReport }: UseDeepResearchOptions): UseDeepRe
         const { session, report } = await runResearchSession({
           topic,
           ourOrgContext,
+          config: {
+            maxRounds: DEFAULT_RESEARCH_DEPTH,
+            maxQueriesPerRound: DEFAULT_RESEARCH_BREADTH,
+          },
           context: { mode: "fetch-only", seedUrls },
           planner,
           researchRound,

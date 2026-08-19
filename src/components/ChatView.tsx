@@ -30,6 +30,8 @@ import {
   Brain,
   Globe,
   Telescope,
+  GraduationCap,
+  UsersRound,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/app-sidebar";
@@ -69,6 +71,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
@@ -125,9 +128,17 @@ import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { useDeepResearch } from "@/hooks/use-deep-research";
+import { useModelCouncil } from "@/hooks/use-model-council";
 import { buildResearchSeed, computeExpansionFrontier, extractUrlsFromText } from "@/lib/research/seed";
-import { keylessWebSearch } from "@/lib/research/keyless-search";
-import { KEYLESS_SEARCH_MAX_RESULTS } from "@/lib/research/config";
+import {
+  buildLearnSystemPrompt,
+  loadLearnPreferences,
+  saveLearnPreferences,
+  LEARN_LEVELS,
+  LEARN_SUBJECTS,
+  type LearnLevel,
+  type LearnSubject,
+} from "@/lib/learn-mode";
 import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
 import { loadInstalledSkillsPrompt } from "@/lib/skills-library";
 import { getAllTools } from "@/lib/tools";
@@ -159,6 +170,13 @@ function formatBytes(bytes: number) {
 }
 
 type PendingFile = MessageAttachment & { file?: File };
+
+/**
+ * Single chat mode — at most one active at a time. "temporary" is derived
+ * from it (isTemporary below), so all existing temporary-message logic keeps
+ * working untouched.
+ */
+type ChatMode = "none" | "temporary" | "learn" | "research" | "council";
 
 const WELCOME_PROMPTS = [
   "What do you want to know?",
@@ -213,7 +231,10 @@ export function ChatView() {
   const [welcomePrompt, setWelcomePrompt] = useState(
     () => WELCOME_PROMPTS[Math.floor(Math.random() * WELCOME_PROMPTS.length)],
   );
-  const [isTemporary, setIsTemporary] = useState(false);
+  const [chatMode, setChatMode] = useState<ChatMode>("none");
+  const isTemporary = chatMode === "temporary";
+  const [learnLevel, setLearnLevel] = useState<LearnLevel>(() => loadLearnPreferences().level);
+  const [learnSubject, setLearnSubject] = useState<LearnSubject>(() => loadLearnPreferences().subject);
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
   const [projectsOpen, setProjectsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -247,8 +268,16 @@ export function ChatView() {
   const [artifactPanel, setArtifactPanel] = useState<{ artifacts: Artifact[]; activeIndex: number } | null>(null);
 
   useEffect(() => {
-    if (settings.temporaryByDefault) setIsTemporary(true);
+    if (settings.temporaryByDefault) {
+      setChatMode((prev) => (prev === "none" ? "temporary" : prev));
+    }
   }, [settings.temporaryByDefault]);
+
+  const updateLearnPreferences = (level: LearnLevel, subject: LearnSubject) => {
+    setLearnLevel(level);
+    setLearnSubject(subject);
+    saveLearnPreferences({ level, subject });
+  };
 
   useEffect(() => {
     if (!selectedModel && settings.defaultModel) {
@@ -362,7 +391,7 @@ export function ChatView() {
 
   const handleSend = async () => {
     const text = inputText.trim();
-    if ((!text && files.length === 0) || isThinking || deepResearch.isRunning) return;
+    if ((!text && files.length === 0) || isThinking || deepResearch.isRunning || council.isRunning) return;
 
     const provider = selectedModel ? findProviderForModel(selectedModel) : null;
     if (!provider) {
@@ -442,7 +471,8 @@ export function ChatView() {
       const userContent: string | ContentPart[] = prep.content;
 
       const memoryContext = settings.autoMemory ? await buildMemoryContext(currentProjectId ?? null, text) : "";
-      const effectiveInstructions = [currentProjectInstructions, memoryContext]
+      const learnContext = chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
+      const effectiveInstructions = [currentProjectInstructions, learnContext, memoryContext]
         .filter(Boolean).join("\n\n") || undefined;
 
       const completionMessages: ChatCompletionMessage[] = [
@@ -525,6 +555,10 @@ export function ChatView() {
   };
 
   const handleStop = () => {
+    if (council.isRunning) {
+      council.cancel();
+      return;
+    }
     abortController?.abort();
   };
 
@@ -542,16 +576,26 @@ export function ChatView() {
     },
   });
 
-  const handleDeepResearch = async () => {
-    const topic = inputText.trim();
-    if ((!topic && files.length === 0) || isThinking || deepResearch.isRunning) return;
+  // Model Council targets whatever session/user-message it was started under,
+  // resolved locally in handleCouncilSend (same pattern as Deep Research above).
+  const pendingCouncilSessionRef = useRef<{ sessionId: string; userMsgId: string } | null>(null);
+
+  const council = useModelCouncil({
+    providers,
+    selectedModel,
+    onVerdict: async (verdict, memberLabels) => {
+      const pending = pendingCouncilSessionRef.current;
+      if (!pending) return;
+      const content = `${verdict}\n\n---\n*Council of ${memberLabels.length}: ${memberLabels.join(" · ")}*`;
+      await addMessage(pending.sessionId, "assistant", content, selectedModel, undefined, pending.userMsgId, isTemporary);
+    },
+  });
+
+  const handleDeepResearch = async (topicOverride?: string) => {
+    const topic = (topicOverride ?? inputText).trim();
+    if ((!topic && files.length === 0) || isThinking || deepResearch.isRunning || council.isRunning) return;
 
     const urlsInText = extractUrlsFromText(topic);
-    const hasFetchableMaterial = files.length > 0 || urlsInText.length > 0;
-    if (!hasFetchableMaterial && !topic) {
-      toast.error("Type a topic, attach a document, or paste URLs to research.");
-      return;
-    }
 
     const provider = selectedModel ? findProviderForModel(selectedModel) : null;
     if (!provider) {
@@ -567,7 +611,8 @@ export function ChatView() {
       ? attachedFiles.map((f) => ({ id: f.id, name: f.name, size: f.size, type: f.type }))
       : undefined;
 
-    setInputText("");
+    if (topicOverride === undefined) setInputText("");
+    else setProjectInputText("");
     setFiles([]);
 
     let sessionId = activeSessionId;
@@ -588,28 +633,153 @@ export function ChatView() {
       const userMsg = await addMessage(sessionId, "user", displayText, undefined, userAttachments, parentId, isTemporary);
       updateSession(sessionId, {});
 
-      let directUrls = urlsInText;
-      if (!hasFetchableMaterial) {
-        // Bare topic, nothing attached — bootstrap starting URLs via a keyless
-        // search (no API key; scrapes DuckDuckGo's HTML endpoint) so typing
-        // just a name still works, same as before search was removed.
-        directUrls = await keylessWebSearch(topic, KEYLESS_SEARCH_MAX_RESULTS);
-        if (directUrls.length === 0) {
-          toast.error("Couldn't find anything to research for that topic — try attaching a document or pasting URLs instead.");
-          return;
-        }
-      }
-
-      const seed = await buildResearchSeed(seedFiles, directUrls);
-      const seedUrls = computeExpansionFrontier(seed);
+      // Pasted URLs and attached files seed round 0; a bare topic needs no
+      // seed — the search-driven rounds look everything up themselves (and
+      // degrade to flagged model-knowledge findings if search is unavailable).
+      const hasSeedMaterial = seedFiles.length > 0 || urlsInText.length > 0;
+      const seed = hasSeedMaterial ? await buildResearchSeed(seedFiles, urlsInText) : undefined;
+      const seedUrls = seed ? computeExpansionFrontier(seed) : [];
 
       pendingResearchSessionRef.current = { sessionId, userMsgId: userMsg.id };
-      await deepResearch.start(topic, provider, selectedModel, seed.text, seedUrls, currentProjectInstructions || undefined);
+      await deepResearch.start(topic, provider, selectedModel, seed?.text, seedUrls, currentProjectInstructions || undefined);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to start Deep Research");
     } finally {
       pendingResearchSessionRef.current = null;
     }
+  };
+
+  const handleCouncilSend = async () => {
+    const text = inputText.trim();
+    if ((!text && files.length === 0) || isThinking || council.isRunning || deepResearch.isRunning) return;
+
+    // Roster guard before anything is persisted, so a too-small council never
+    // leaves behind an orphaned user message (the hook re-checks after
+    // resolving providers, as a backstop).
+    if (council.councilModels.length < 2) {
+      toast.error("Council needs at least 2 models — pick more in the Council picker.");
+      return;
+    }
+
+    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    if (!provider) {
+      toast.error("No provider configured. Add one in Settings.");
+      setSettingsOpen(true);
+      return;
+    }
+
+    // Vision check: block image attachments for non-vision models
+    const hasImages = files.some((f) => f.type.startsWith("image/"));
+    if (hasImages) {
+      const caps = await getModelCapabilities(provider, selectedModel);
+      if (!caps.vision) {
+        toast.error(
+          `${selectedModelLabel?.displayName || selectedModelLabel?.name || selectedModel} doesn't support image input. Remove the image or switch to a vision-capable model.`,
+        );
+        return;
+      }
+    }
+
+    const attachments = files.length > 0 ? files : undefined;
+    setInputText("");
+    setFiles([]);
+    setIsThinking(true);
+
+    let sessionId = activeSessionId;
+    let sessionPersisted = Promise.resolve();
+
+    if (!sessionId) {
+      const newSession = createSession(
+        (text || "Attachments").slice(0, 30),
+        pendingProjectId ?? undefined,
+      );
+      sessionId = newSession.id;
+      setActiveSessionId(newSession.id);
+      setPendingProjectId(null);
+      sessionPersisted = newSession.persisted;
+    }
+
+    if (!sessionId) throw new Error("Failed to create session");
+
+    const userAttachments = attachments?.map((a) => ({
+      id: a.id,
+      name: a.name,
+      size: a.size,
+      type: a.type,
+    }));
+
+    try {
+      await sessionPersisted;
+      const parentId = activePath.length > 0
+        ? activePath[activePath.length - 1].message.id
+        : null;
+      const userMsg = await addMessage(
+        sessionId,
+        "user",
+        text,
+        undefined,
+        userAttachments,
+        parentId,
+        isTemporary,
+      );
+
+      updateSession(sessionId, {});
+
+      const modelLabel = selectedModelLabel?.displayName || selectedModelLabel?.name || selectedModel;
+      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, selectedModel, modelLabel);
+      if (prep.blocked) {
+        toast.error(prep.warning ?? "This model doesn't support images.");
+        return;
+      }
+      const userContent: string | ContentPart[] = prep.content;
+
+      const memoryContext = settings.autoMemory ? await buildMemoryContext(currentProjectId ?? null, text) : "";
+      const effectiveInstructions = [currentProjectInstructions, memoryContext]
+        .filter(Boolean).join("\n\n") || undefined;
+
+      const completionMessages: ChatCompletionMessage[] = [
+        ...activePath.map((n) => ({
+          role: n.message.role as "user" | "assistant" | "system",
+          content: n.message.content,
+        })),
+        { role: "user" as const, content: userContent },
+      ];
+
+      const skillsContext = await loadInstalledSkillsPrompt();
+
+      pendingCouncilSessionRef.current = { sessionId, userMsgId: userMsg.id };
+      await council.start(completionMessages, effectiveInstructions, skillsContext);
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : "Failed to start Model Council",
+      );
+    } finally {
+      pendingCouncilSessionRef.current = null;
+      setIsThinking(false);
+    }
+  };
+
+  // Send dispatches per active mode: research and council have their own
+  // flows; none/temporary/learn all go through handleSend (learn injects its
+  // tutor prompt via the instructions path, temporary is derived from mode).
+  const handleModeSend = () => {
+    if (chatMode === "research") {
+      handleDeepResearch();
+      return;
+    }
+    if (chatMode === "council") {
+      handleCouncilSend();
+      return;
+    }
+    handleSend();
+  };
+
+  const handleProjectModeSend = (text: string) => {
+    if (chatMode === "research") {
+      handleDeepResearch(text);
+      return;
+    }
+    handleProjectSend(text);
   };
 
   const handleCopyMessage = async (content: string) => {
@@ -941,6 +1111,123 @@ export function ChatView() {
       {modelSelectContent}
     </Select>
   );
+
+  const modeToggle = (
+    mode: ChatMode,
+    label: string,
+    title: string,
+    icon: React.ReactNode,
+    activeClass: string,
+  ) => {
+    const active = chatMode === mode;
+    return (
+      <InputGroupButton
+        size={active ? "xs" : "icon-xs"}
+        variant="ghost"
+        aria-label={`Toggle ${label} mode`}
+        title={title}
+        onClick={() => setChatMode((prev) => (prev === mode ? "none" : mode))}
+        className={`group ${active ? activeClass : ""}`}
+      >
+        {icon}
+        {active && <span className="group-hover:line-through">{label}</span>}
+      </InputGroupButton>
+    );
+  };
+
+  const modeToggles = (
+    <>
+      {modeToggle(
+        "temporary",
+        "Temporary",
+        "Temporary message - will be deleted when you close the chat",
+        <ClockFading className={chatMode === "temporary" ? "fill-blue-500/30" : ""} />,
+        "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
+      )}
+      {modeToggle(
+        "learn",
+        "Learn",
+        "Learn mode - structured tutoring with a comprehension check",
+        <GraduationCap />,
+        "bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25 hover:text-emerald-500",
+      )}
+      {modeToggle(
+        "research",
+        "Research",
+        "Deep Research - multi-round, search-driven cited report",
+        <Microscope />,
+        "bg-violet-500/15 text-violet-500 hover:bg-violet-500/25 hover:text-violet-500",
+      )}
+      {modeToggle(
+        "council",
+        "Council",
+        "Model Council - several models answer, the selected model writes the verdict",
+        <UsersRound />,
+        "bg-amber-500/15 text-amber-500 hover:bg-amber-500/25 hover:text-amber-500",
+      )}
+    </>
+  );
+
+  const learnSelectors = chatMode === "learn" ? (
+    <div className="mb-2 flex items-center gap-2">
+      <Select value={learnLevel} onValueChange={(value) => updateLearnPreferences(value as LearnLevel, learnSubject)}>
+        <SelectTrigger size="sm" className="w-36">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {LEARN_LEVELS.map((level) => (
+            <SelectItem key={level.value} value={level.value}>
+              {level.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      <Select value={learnSubject} onValueChange={(value) => updateLearnPreferences(learnLevel, value as LearnSubject)}>
+        <SelectTrigger size="sm" className="w-44">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {LEARN_SUBJECTS.map((subject) => (
+            <SelectItem key={subject.value} value={subject.value}>
+              {subject.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  ) : null;
+
+  const councilPicker = chatMode === "council" ? (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <InputGroupButton
+          size="xs"
+          variant="ghost"
+          aria-label="Choose council models"
+          title="Choose which models sit on the council"
+          className="bg-amber-500/15 text-amber-500 hover:bg-amber-500/25 hover:text-amber-500"
+        >
+          <UsersRound />
+          Council ({council.councilModels.length})
+        </InputGroupButton>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent side="top" align="start" className="max-h-72 min-w-56 overflow-y-auto">
+        {allModels.length === 0 ? (
+          <DropdownMenuItem disabled>No models — add a provider in Settings</DropdownMenuItem>
+        ) : (
+          allModels.map((m) => (
+            <DropdownMenuCheckboxItem
+              key={m.id}
+              checked={council.councilModels.includes(m.name)}
+              onCheckedChange={() => council.toggleModel(m.name)}
+            >
+              {m.displayName || m.name} ({m.providerName})
+            </DropdownMenuCheckboxItem>
+          ))
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  ) : null;
 
   const renderMessage = (msg: ChatMessage) => {
     const { siblings, currentIndex } = getSiblings(nodeMap, msg, roots);
@@ -1314,43 +1601,91 @@ export function ChatView() {
                     {activePath.map((node) => renderMessage(node.message))}
 
                     {isThinking && (
-                      <MessageScrollerItem messageId="thinking">
-                        <Message>
-                          <MessageContent>
-                            {streamingReasoning && !streamingContent && (
-                              <button
-                                onClick={() => setShowThinkingProcess((prev) => !prev)}
-                                className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                              >
-                                <Brain className="size-3.5" />
-                                <span className="shimmer">Thinking…</span>
-                                {showThinkingProcess ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
-                              </button>
-                            )}
-                            {streamingReasoning && showThinkingProcess && !streamingContent && (
-                              <div className="mt-1 mb-2 rounded-lg border bg-muted/30 p-3 max-h-60 overflow-y-auto">
-                                <MarkdownRenderer content={streamingReasoning} className="text-xs text-muted-foreground" />
+                      council.isRunning ? (
+                        <MessageScrollerItem messageId="model-council">
+                          <Message>
+                            <MessageContent>
+                              <div className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
+                                <UsersRound className="size-3.5" />
+                                <span className="shimmer">
+                                  {council.phase === "verdict"
+                                    ? "Council chair is writing the verdict…"
+                                    : `Council deliberating — ${council.members.filter((m) => m.status === "done").length}/${council.members.length} responses in…`}
+                                </span>
                               </div>
-                            )}
-                            {streamingContent ? (
-                              <Bubble variant="ghost">
-                                <BubbleContent>
-                                  <MarkdownRenderer content={streamingContent} />
-                                </BubbleContent>
-                              </Bubble>
-                            ) : !streamingReasoning ? (
-                              <Marker role="status">
-                                <MarkerIcon>
-                                  <Spinner />
-                                </MarkerIcon>
-                                <MarkerContent className="shimmer">
-                                  Thinking…
-                                </MarkerContent>
-                              </Marker>
-                            ) : null}
-                          </MessageContent>
-                        </Message>
-                      </MessageScrollerItem>
+                              <div className="mb-2 grid gap-2 sm:grid-cols-2">
+                                {council.members.map((member) => (
+                                  <div key={member.model} className="rounded-lg border bg-muted/30 p-3">
+                                    <div className="mb-1 flex items-center gap-1.5 text-xs font-medium">
+                                      {member.status === "done" ? (
+                                        <Check className="size-3 text-emerald-500" />
+                                      ) : member.status === "error" ? (
+                                        <X className="size-3 text-red-500" />
+                                      ) : (
+                                        <Spinner className="size-3" />
+                                      )}
+                                      <span className="truncate">
+                                        {allModels.find((m) => m.name === member.model)?.displayName || member.model}
+                                      </span>
+                                      <span className="ml-auto shrink-0 truncate text-[10px] text-muted-foreground">
+                                        {member.providerName}
+                                      </span>
+                                    </div>
+                                    <div className="max-h-24 overflow-hidden whitespace-pre-wrap text-xs text-muted-foreground">
+                                      {member.error || member.content || (member.status === "pending" ? "Waiting…" : "")}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                              {council.phase === "verdict" && council.verdict && (
+                                <Bubble variant="ghost">
+                                  <BubbleContent>
+                                    <MarkdownRenderer content={council.verdict} />
+                                  </BubbleContent>
+                                </Bubble>
+                              )}
+                            </MessageContent>
+                          </Message>
+                        </MessageScrollerItem>
+                      ) : (
+                        <MessageScrollerItem messageId="thinking">
+                          <Message>
+                            <MessageContent>
+                              {streamingReasoning && !streamingContent && (
+                                <button
+                                  onClick={() => setShowThinkingProcess((prev) => !prev)}
+                                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                                >
+                                  <Brain className="size-3.5" />
+                                  <span className="shimmer">Thinking…</span>
+                                  {showThinkingProcess ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+                                </button>
+                              )}
+                              {streamingReasoning && showThinkingProcess && !streamingContent && (
+                                <div className="mt-1 mb-2 rounded-lg border bg-muted/30 p-3 max-h-60 overflow-y-auto">
+                                  <MarkdownRenderer content={streamingReasoning} className="text-xs text-muted-foreground" />
+                                </div>
+                              )}
+                              {streamingContent ? (
+                                <Bubble variant="ghost">
+                                  <BubbleContent>
+                                    <MarkdownRenderer content={streamingContent} />
+                                  </BubbleContent>
+                                </Bubble>
+                              ) : !streamingReasoning ? (
+                                <Marker role="status">
+                                  <MarkerIcon>
+                                    <Spinner />
+                                  </MarkerIcon>
+                                  <MarkerContent className="shimmer">
+                                    Thinking…
+                                  </MarkerContent>
+                                </Marker>
+                              ) : null}
+                            </MessageContent>
+                          </Message>
+                        </MessageScrollerItem>
+                      )
                     )}
 
                     {deepResearch.isRunning && (
@@ -1423,6 +1758,8 @@ export function ChatView() {
                   </AttachmentGroup>
                 )}
 
+                {learnSelectors}
+
                 <InputGroup className={isTemporary ? "border-dashed" : undefined}>
                   <InputGroupTextarea
                     value={inputText}
@@ -1430,7 +1767,7 @@ export function ChatView() {
                     onKeyDown={(e) => {
                       if (settings.sendOnEnter && e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
-                        handleSend();
+                        handleModeSend();
                       }
                     }}
                     placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything"}
@@ -1493,27 +1830,8 @@ export function ChatView() {
                         <span className="group-hover:line-through">{currentProjectName}</span>
                       </InputGroupButton>
                     )}
-                    <InputGroupButton
-                      size={isTemporary ? "xs" : "icon-xs"}
-                      variant="ghost"
-                      aria-label="Toggle temporary chat"
-                      title="Temporary message - will be deleted when you close the chat"
-                      onClick={() => setIsTemporary((prev) => !prev)}
-                      className={`group ${isTemporary ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
-                    >
-                      <ClockFading className={isTemporary ? "fill-blue-500/30" : ""} />
-                      {isTemporary && <span className="group-hover:line-through">Temporary</span>}
-                    </InputGroupButton>
-                    <InputGroupButton
-                      size="icon-xs"
-                      variant="ghost"
-                      aria-label="Deep Research"
-                      title="Deep Research: type a topic, paste URLs, or attach a document"
-                      onClick={handleDeepResearch}
-                      disabled={(!inputText.trim() && files.length === 0) || isThinking || deepResearch.isRunning}
-                    >
-                      <Microscope />
-                    </InputGroupButton>
+                    {modeToggles}
+                    {councilPicker}
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1559,7 +1877,7 @@ export function ChatView() {
                         variant="default"
                         size="icon-xs"
                         className="rounded-lg"
-                        onClick={handleSend}
+                        onClick={handleModeSend}
                         disabled={
                           (!inputText.trim() && files.length === 0) || isThinking
                         }
@@ -1582,6 +1900,7 @@ export function ChatView() {
             <div className="flex min-h-0 flex-1">
               <div className="flex flex-col w-2/3 min-h-0 border-r">
                 <div className="shrink-0 p-4">
+                  {learnSelectors}
                   <InputGroup className={isTemporary ? "border-dashed" : undefined}>
                     <InputGroupTextarea
                       value={projectInputText}
@@ -1592,24 +1911,15 @@ export function ChatView() {
                           const text = projectInputText.trim();
                           if (!text || isThinking) return;
                           setProjectInputText("");
-                          handleProjectSend(text);
+                          handleProjectModeSend(text);
                         }
                       }}
                       placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything about this project..."}
                       className="max-h-40 min-h-12"
                     />
                     <InputGroupAddon align="block-end">
-                      <InputGroupButton
-                        size={isTemporary ? "xs" : "icon-xs"}
-                        variant="ghost"
-                        aria-label="Toggle temporary chat"
-                        title="Temporary message - will be deleted when you close the chat"
-                        onClick={() => setIsTemporary((prev) => !prev)}
-                        className={`group ${isTemporary ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
-                      >
-                        <ClockFading className={isTemporary ? "fill-blue-500/30" : ""} />
-                        {isTemporary && <span className="group-hover:line-through">Temporary</span>}
-                      </InputGroupButton>
+                      {modeToggles}
+                      {councilPicker}
                       <div className="flex-1" />
                       {modelSelect()}
                       <InputGroupButton
@@ -1620,7 +1930,7 @@ export function ChatView() {
                           const text = projectInputText.trim();
                           if (!text || isThinking) return;
                           setProjectInputText("");
-                          handleProjectSend(text);
+                          handleProjectModeSend(text);
                         }}
                         disabled={!projectInputText.trim() || isThinking}
                         aria-label="Send message"
@@ -1855,7 +2165,7 @@ export function ChatView() {
         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden bg-black px-4 pb-8">
             <InteractiveGrid className="absolute inset-0" mode={activeTab} />
-            <h2 className="select-none cursor-default relative font-serif z-10 mb-12 text-center text-4xl text-white/70 welcome-fade-in">
+            <h2 className="select-none cursor-default relative font--font-sans z-10 mb-12 text-center text-4xl text-white/70 welcome-fade-in">
               {welcomePrompt}
             </h2>
             <div className="relative z-10 w-full max-w-3xl">
@@ -1891,6 +2201,8 @@ export function ChatView() {
                 </AttachmentGroup>
               )}
 
+              {learnSelectors}
+
               <InputGroup className={`bg-white/5 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
                 <InputGroupTextarea
                   value={inputText}
@@ -1898,7 +2210,7 @@ export function ChatView() {
                   onKeyDown={(e) => {
                     if (settings.sendOnEnter && e.key === "Enter" && !e.shiftKey) {
                       e.preventDefault();
-                      handleSend();
+                      handleModeSend();
                     }
                   }}
                   placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything"}
@@ -1961,27 +2273,8 @@ export function ChatView() {
                       <span className="group-hover:line-through">{currentProjectName}</span>
                     </InputGroupButton>
                   )}
-                  <InputGroupButton
-                    size={isTemporary ? "xs" : "icon-xs"}
-                    variant="ghost"
-                    aria-label="Toggle temporary chat"
-                    title="Temporary chat"
-                    onClick={() => setIsTemporary((prev) => !prev)}
-                    className={`group ${isTemporary ? "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500" : ""}`}
-                  >
-                    <ClockFading className={isTemporary ? "fill-blue-500/30" : ""} />
-                    {isTemporary && <span className="group-hover:line-through">Temporary</span>}
-                  </InputGroupButton>
-                  <InputGroupButton
-                    size="icon-xs"
-                    variant="ghost"
-                    aria-label="Deep Research"
-                    title="Deep Research: type a topic, paste URLs, or attach a document"
-                    onClick={handleDeepResearch}
-                    disabled={(!inputText.trim() && files.length === 0) || isThinking || deepResearch.isRunning}
-                  >
-                    <Microscope />
-                  </InputGroupButton>
+                  {modeToggles}
+                  {councilPicker}
                   <input
                     ref={fileInputRef}
                     type="file"
@@ -2027,7 +2320,7 @@ export function ChatView() {
                       variant="default"
                       size="icon-xs"
                       className="rounded-lg"
-                      onClick={handleSend}
+                      onClick={handleModeSend}
                       disabled={
                         (!inputText.trim() && files.length === 0) || isThinking
                       }
@@ -2382,10 +2675,47 @@ export function ChatView() {
       return;
     }
 
+    if (chatMode === "council") {
+      if (council.councilModels.length < 2) {
+        toast.error("Council needs at least 2 models — pick more in the Council picker.");
+        return;
+      }
+      setIsThinking(true);
+      try {
+        const newSession = createSession(text.slice(0, 30), activeProject?.id);
+        setActiveSessionId(newSession.id);
+        setActiveProjectId(null);
+
+        await newSession.persisted;
+        const userMsg = await addMessage(newSession.id, "user", text, undefined, undefined, undefined, isTemporary);
+
+        const skillsContext = await loadInstalledSkillsPrompt();
+
+        pendingCouncilSessionRef.current = { sessionId: newSession.id, userMsgId: userMsg.id };
+        await council.start(
+          [{ role: "user" as const, content: text }],
+          currentProjectInstructions || undefined,
+          skillsContext,
+        );
+      } catch (err) {
+        toast.error(
+          err instanceof Error ? err.message : "Failed to start Model Council",
+        );
+      } finally {
+        pendingCouncilSessionRef.current = null;
+        setIsThinking(false);
+      }
+      return;
+    }
+
     setIsThinking(true);
     setStreamingContent("");
     setStreamingReasoning("");
     setShowThinkingProcess(false);
+
+    const learnContext = chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
+    const effectiveInstructions = [currentProjectInstructions, learnContext]
+      .filter(Boolean).join("\n\n") || undefined;
 
     try {
       const newSession = createSession(text.slice(0, 30), activeProject?.id);
@@ -2393,7 +2723,7 @@ export function ChatView() {
       setActiveProjectId(null);
 
       await newSession.persisted;
-      const userMsg = await addMessage(newSession.id, "user", text);
+      const userMsg = await addMessage(newSession.id, "user", text, undefined, undefined, undefined, isTemporary);
 
       const completionMessages: ChatCompletionMessage[] = [
         { role: "user" as const, content: text },
@@ -2414,7 +2744,7 @@ export function ChatView() {
           completionMessages,
           controller.signal,
           tools,
-          currentProjectInstructions,
+          effectiveInstructions,
           skillsContext,
         )) {
           if (chunk.content) {
@@ -2429,7 +2759,7 @@ export function ChatView() {
       } catch (err) {
         if (controller.signal.aborted) {
           if (fullResponse) {
-            await addMessage(newSession.id, "assistant", fullResponse, selectedModel, undefined, userMsg.id, undefined, fullReasoning || undefined);
+            await addMessage(newSession.id, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
           }
           return;
         }
@@ -2437,7 +2767,7 @@ export function ChatView() {
       }
 
       if (fullResponse) {
-        await addMessage(newSession.id, "assistant", fullResponse, selectedModel, undefined, userMsg.id, undefined, fullReasoning || undefined);
+        await addMessage(newSession.id, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
       }
     } catch (err) {
       toast.error(
