@@ -38,6 +38,12 @@ import { SettingsDialog } from "@/pages/settings";
 import { InteractiveGrid } from "@/components/interactive-grid";
 import { ArtifactPanel } from "@/components/artifact-panel";
 import { extractArtifacts, type Artifact } from "@/lib/artifacts";
+import {
+  extractUrlsFromText,
+  buildResearchSeed,
+  computeExpansionFrontier,
+  validateResearchInput,
+} from "@/lib/research/seed";
 import { OpenCodeProvider } from "@/lib/opencode-context";
 import {
   Attachment,
@@ -123,6 +129,7 @@ import { useMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
+import { useDeepResearch } from "@/hooks/use-deep-research";
 import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
 import { loadInstalledSkillsPrompt } from "@/lib/skills-library";
 import { getAllTools } from "@/lib/tools";
@@ -176,9 +183,6 @@ const WELCOME_PROMPTS = [
   "Ask away, the floor is yours.",
 ];
 
-const RESEARCH_PROMPT =
-  "You are in research mode. Be thorough: use the web_fetch tool to look up information when needed, cite sources by URL, and provide well-organized, factual answers. Prefer accuracy over brevity.";
-
 export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
   const { sessions, createSession, deleteSession, updateSession } =
@@ -213,6 +217,17 @@ export function ChatView() {
   );
   const [isTemporary, setIsTemporary] = useState(false);
   const [isResearch, setIsResearch] = useState(false);
+  // Deep Research targets whatever session/user-message it was started under, resolved locally in
+  // handleDeepResearch (not via the activeSessionId state, which may not have re-rendered yet if a
+  // new session was just created -- same reason handleSend keeps its own local `sessionId` variable).
+  const deepResearchTargetRef = useRef<{ sessionId: string; userMsgId: string } | null>(null);
+  const deepResearch = useDeepResearch({
+    onReport: async (report, modelUsed) => {
+      const target = deepResearchTargetRef.current;
+      if (!target) return;
+      await addMessage(target.sessionId, "assistant", report, modelUsed, undefined, target.userMsgId, isTemporary);
+    },
+  });
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
   const [projectsOpen, setProjectsOpen] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -360,6 +375,11 @@ export function ChatView() {
   };
 
   const handleSend = async () => {
+    if (isResearch) {
+      void handleDeepResearch();
+      return;
+    }
+
     const text = inputText.trim();
     if ((!text && files.length === 0) || isThinking) return;
 
@@ -441,7 +461,9 @@ export function ChatView() {
       const userContent: string | ContentPart[] = prep.content;
 
       const memoryContext = settings.autoMemory ? await buildMemoryContext(currentProjectId ?? null, text) : "";
-      const effectiveInstructions = [currentProjectInstructions, memoryContext, isResearch ? RESEARCH_PROMPT : null]
+      // isResearch is handled entirely by the early handleSend guard above (dispatches to
+      // handleDeepResearch instead) -- normal-chat instructions no longer branch on it.
+      const effectiveInstructions = [currentProjectInstructions, memoryContext]
         .filter(Boolean).join("\n\n") || undefined;
 
       const completionMessages: ChatCompletionMessage[] = [
@@ -520,6 +542,54 @@ export function ChatView() {
       setStreamingReasoning("");
       setShowThinkingProcess(false);
       setAbortController(null);
+    }
+  };
+
+  const handleDeepResearch = async () => {
+    const text = inputText.trim();
+    if ((!text && files.length === 0) || isThinking || deepResearch.isRunning) return;
+
+    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    if (!provider) {
+      toast.error("No provider configured. Add one in Settings.");
+      setSettingsOpen(true);
+      return;
+    }
+
+    const seedFiles = files
+      .filter((f): f is PendingFile & { file: File } => !!f.file)
+      .map((f) => ({ name: f.name, file: f.file }));
+
+    setInputText("");
+    setFiles([]);
+
+    let sessionId = activeSessionId;
+    let sessionPersisted = Promise.resolve();
+    if (!sessionId) {
+      const newSession = createSession((text || "Deep Research").slice(0, 30), pendingProjectId ?? undefined);
+      sessionId = newSession.id;
+      setActiveSessionId(newSession.id);
+      setPendingProjectId(null);
+      sessionPersisted = newSession.persisted;
+    }
+    if (!sessionId) throw new Error("Failed to create session");
+
+    try {
+      await sessionPersisted;
+      const parentId = activePath.length > 0 ? activePath[activePath.length - 1].message.id : null;
+      const userMsg = await addMessage(sessionId, "user", text, undefined, undefined, parentId, isTemporary);
+      updateSession(sessionId, {});
+
+      deepResearchTargetRef.current = { sessionId, userMsgId: userMsg.id };
+
+      const directUrls = extractUrlsFromText(text);
+      const seed = await buildResearchSeed(seedFiles, directUrls);
+      validateResearchInput(text, seed.text);
+      const providedUrls = Array.from(new Set([...seed.fetchedUrls, ...computeExpansionFrontier(seed)]));
+
+      await deepResearch.start(text, provider, selectedModel, seed.text || undefined, providedUrls, currentProjectInstructions || undefined);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to start Deep Research");
     }
   };
 
@@ -1267,6 +1337,31 @@ export function ChatView() {
                         </Message>
                       </MessageScrollerItem>
                     )}
+
+                    {deepResearch.isRunning && (
+                      <MessageScrollerItem messageId="deep-research">
+                        <Message>
+                          <MessageContent>
+                            {deepResearch.streamingReport ? (
+                              <Bubble variant="ghost">
+                                <BubbleContent>
+                                  <MarkdownRenderer content={deepResearch.streamingReport} />
+                                </BubbleContent>
+                              </Bubble>
+                            ) : (
+                              <Marker role="status">
+                                <MarkerIcon>
+                                  <Spinner />
+                                </MarkerIcon>
+                                <MarkerContent className="shimmer">
+                                  {deepResearch.statusLabel ?? "Researching…"}
+                                </MarkerContent>
+                              </Marker>
+                            )}
+                          </MessageContent>
+                        </Message>
+                      </MessageScrollerItem>
+                    )}
                   </MessageScrollerContent>
                 </MessageScrollerViewport>
                 <MessageScrollerButton />
@@ -1419,13 +1514,13 @@ export function ChatView() {
 
                     {modelSelect()}
 
-                    {isThinking ? (
+                    {(isThinking || deepResearch.isRunning) ? (
                       <InputGroupButton
                         variant="outline"
                         size="icon-xs"
                         className="rounded-lg"
-                        onClick={handleStop}
-                        aria-label="Stop generation"
+                        onClick={isThinking ? handleStop : deepResearch.cancel}
+                        aria-label={isThinking ? "Stop generation" : "Cancel Deep Research"}
                       >
                         <span className="size-3 rounded-sm bg-current" />
                       </InputGroupButton>
@@ -1436,7 +1531,7 @@ export function ChatView() {
                         className="rounded-lg"
                         onClick={handleSend}
                         disabled={
-                          (!inputText.trim() && files.length === 0) || isThinking
+                          (!inputText.trim() && files.length === 0) || isThinking || deepResearch.isRunning
                         }
                         aria-label="Send message"
                       >
@@ -1878,13 +1973,13 @@ export function ChatView() {
 
                   {modelSelect("dark")}
 
-                  {isThinking ? (
+                  {(isThinking || deepResearch.isRunning) ? (
                     <InputGroupButton
                       variant="outline"
                       size="icon-xs"
                       className="rounded-lg"
-                      onClick={handleStop}
-                      aria-label="Stop generation"
+                      onClick={isThinking ? handleStop : deepResearch.cancel}
+                      aria-label={isThinking ? "Stop generation" : "Cancel Deep Research"}
                     >
                       <span className="size-3 rounded-sm bg-current" />
                     </InputGroupButton>
@@ -1895,7 +1990,7 @@ export function ChatView() {
                       className="rounded-lg"
                       onClick={handleSend}
                       disabled={
-                        (!inputText.trim() && files.length === 0) || isThinking
+                        (!inputText.trim() && files.length === 0) || isThinking || deepResearch.isRunning
                       }
                       aria-label="Send message"
                     >
