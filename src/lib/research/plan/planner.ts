@@ -15,6 +15,12 @@ export interface PlanInput {
   readonly topic: string;
   readonly providedUrls: readonly string[];
   readonly capabilities: PlanCapabilities;
+  /** Prose already extracted from uploaded files/URLs (e.g. via buildResearchSeed) -- folded into
+   *  the goal as grounding material. Does not reach buildPlanRequest's sub-question decomposition
+   *  call, only the loop's ongoing context. */
+  readonly seedText?: string;
+  /** Framing context (e.g. "we are Acme Corp") -- folded into the goal, up front. */
+  readonly orgContext?: string;
 }
 
 interface PlanResponse {
@@ -91,6 +97,10 @@ function fallbackPlan(topic: string): PlanResponse {
 function buildGoal(input: PlanInput, strategy: string): string {
   const lines = [`Research question: ${input.topic}`];
 
+  if (input.orgContext?.trim()) {
+    lines.push("", "Organization context:", input.orgContext.trim());
+  }
+
   if (strategy.trim()) {
     lines.push("", `Strategy: ${strategy.trim()}`);
   }
@@ -101,6 +111,14 @@ function buildGoal(input: PlanInput, strategy: string): string {
   // "cleaner" candidateUrls-based mechanism -- it doesn't exist yet.
   if (input.providedUrls.length > 0) {
     lines.push("", "Seed URLs:", ...input.providedUrls.map((u) => `- ${u}`));
+  }
+
+  if (input.seedText?.trim()) {
+    lines.push(
+      "",
+      "Seed material (already extracted from uploaded files/URLs -- ground the plan in this, no need to re-fetch it):",
+      input.seedText.trim(),
+    );
   }
 
   if (!input.capabilities.webSearch) {

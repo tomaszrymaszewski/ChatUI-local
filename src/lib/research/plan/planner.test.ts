@@ -133,4 +133,20 @@ describe("plan", () => {
     expect(session.subQuestions).toHaveLength(1);
     expect(session.subQuestions[0].text).toBe("only one");
   });
+
+  it("folds seedText into the goal when present", async () => {
+    const model = scriptedModel([JSON.stringify({ subQuestions: ["q1"], strategy: "" })]);
+
+    const session = await plan(baseInput({ seedText: "Uploaded doc says X." }), model, new AbortController().signal);
+
+    expect(session.goal).toContain("Uploaded doc says X.");
+  });
+
+  it("folds orgContext into the goal when present", async () => {
+    const model = scriptedModel([JSON.stringify({ subQuestions: ["q1"], strategy: "" })]);
+
+    const session = await plan(baseInput({ orgContext: "We are Acme Corp." }), model, new AbortController().signal);
+
+    expect(session.goal).toContain("We are Acme Corp.");
+  });
 });
