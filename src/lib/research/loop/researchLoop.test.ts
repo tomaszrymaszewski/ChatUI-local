@@ -713,4 +713,22 @@ describe("researchLoop: §10 test matrix", () => {
     state = r4.state;
     expect(state.round).toBe(2);
   });
+
+  it("13. stops retrying immediately once the signal aborts mid-attempt, instead of exhausting the retry ladder", async () => {
+    const controller = new AbortController();
+    let callCount = 0;
+    const abortingModel: ModelPort = {
+      async complete() {
+        callCount++;
+        controller.abort();
+        throw new Error("aborted mid-flight");
+      },
+    };
+    const deps = makeDeps({ model: abortingModel, signal: controller.signal });
+
+    const result = await runIteration(createInitialSession("goal", []), deps);
+
+    expect(callCount).toBe(1);
+    expect(result.termination).toEqual({ reason: "cancelled", partial: true });
+  });
 });

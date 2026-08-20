@@ -55,6 +55,14 @@ export function useDeepResearch({ onReport }: UseDeepResearchOptions): UseDeepRe
       seedUrls: string[],
       orgContext?: string,
     ) => {
+      // Defense-in-depth re-entrancy guard: checked against the ref (set synchronously below),
+      // not the isRunning state (which is only updated via setState and so can't be trusted to
+      // reflect an in-flight call within the same synchronous tick). ChatView's own call site
+      // already checks deepResearch.isRunning before calling start(), so this shouldn't be
+      // reachable today -- it's here so a future caller can't accidentally run two overlapping
+      // pipelines that would stomp on each other's controllerRef/isRunning/streamingReport state.
+      if (controllerRef.current) return;
+
       setIsRunning(true);
       setStatusLabel(PHASE_LABELS.plan);
       setStreamingReport("");

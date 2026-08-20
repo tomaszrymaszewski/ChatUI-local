@@ -217,15 +217,16 @@ export function ChatView() {
   );
   const [isTemporary, setIsTemporary] = useState(false);
   const [isResearch, setIsResearch] = useState(false);
-  // Deep Research targets whatever session/user-message it was started under, resolved locally in
-  // handleDeepResearch (not via the activeSessionId state, which may not have re-rendered yet if a
-  // new session was just created -- same reason handleSend keeps its own local `sessionId` variable).
-  const deepResearchTargetRef = useRef<{ sessionId: string; userMsgId: string } | null>(null);
+  // Deep Research targets whatever session/user-message/temporary-flag it was started under,
+  // snapshotted locally in handleDeepResearch (not read live from state at persist time, which
+  // could reflect a session switch or a Temporary-mode toggle the user made while the run was
+  // still in progress -- same reason handleSend keeps its own local `sessionId` variable).
+  const deepResearchTargetRef = useRef<{ sessionId: string; userMsgId: string; isTemporary: boolean } | null>(null);
   const deepResearch = useDeepResearch({
     onReport: async (report, modelUsed) => {
       const target = deepResearchTargetRef.current;
       if (!target) return;
-      await addMessage(target.sessionId, "assistant", report, modelUsed, undefined, target.userMsgId, isTemporary);
+      await addMessage(target.sessionId, "assistant", report, modelUsed, undefined, target.userMsgId, target.isTemporary);
     },
   });
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
@@ -375,6 +376,8 @@ export function ChatView() {
   };
 
   const handleSend = async () => {
+    if (deepResearch.isRunning) return;
+
     if (isResearch) {
       void handleDeepResearch();
       return;
@@ -580,7 +583,7 @@ export function ChatView() {
       const userMsg = await addMessage(sessionId, "user", text, undefined, undefined, parentId, isTemporary);
       updateSession(sessionId, {});
 
-      deepResearchTargetRef.current = { sessionId, userMsgId: userMsg.id };
+      deepResearchTargetRef.current = { sessionId, userMsgId: userMsg.id, isTemporary };
 
       const directUrls = extractUrlsFromText(text);
       const seed = await buildResearchSeed(seedFiles, directUrls);

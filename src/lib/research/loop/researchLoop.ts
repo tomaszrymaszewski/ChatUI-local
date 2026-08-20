@@ -550,6 +550,12 @@ async function requestAction(state: ResearchSession, deps: IterationDeps, baseRe
     try {
       raw = await deps.model.complete(currentRequest, deps.signal);
     } catch {
+      // A cancellation-triggered rejection should stop the ladder immediately, not spend
+      // remaining attempts re-issuing a request against a signal that's already aborted --
+      // runIteration's own cancellation check right after this call still catches it either
+      // way, but bailing out here avoids wasted retries and gets cancellation to take effect
+      // sooner.
+      if (deps.signal.aborted) break;
       continue;
     }
 
