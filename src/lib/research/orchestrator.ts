@@ -12,6 +12,8 @@ import {
   type ToolPort,
 } from "./loop/researchLoop";
 
+export type DeepResearchPhase = "plan" | "research" | "synthesize";
+
 export interface RunDeepResearchInput {
   readonly topic: string;
   readonly providedUrls: readonly string[];
@@ -21,6 +23,11 @@ export interface RunDeepResearchInput {
   readonly config: LoopConfig;
   readonly signal: AbortSignal;
   readonly clock?: Clock;
+  readonly seedText?: string;
+  readonly orgContext?: string;
+  /** Fired at each of the 3 phase transitions -- lets a caller (e.g. a UI hook) show status
+   *  without runDeepResearch needing to expose live intra-loop progress. */
+  readonly onPhase?: (phase: DeepResearchPhase) => void;
 }
 
 export interface RunDeepResearchResult {
@@ -38,12 +45,20 @@ export interface RunDeepResearchResult {
 // naturally through all three, so even a cancelled run ends with an honest partial report instead
 // of nothing.
 export async function runDeepResearch(input: RunDeepResearchInput): Promise<RunDeepResearchResult> {
+  input.onPhase?.("plan");
   const session = await plan(
-    { topic: input.topic, providedUrls: input.providedUrls, capabilities: input.capabilities },
+    {
+      topic: input.topic,
+      providedUrls: input.providedUrls,
+      capabilities: input.capabilities,
+      seedText: input.seedText,
+      orgContext: input.orgContext,
+    },
     input.model,
     input.signal,
   );
 
+  input.onPhase?.("research");
   const loopResult = await runResearchLoop(session, {
     model: input.model,
     tool: input.tool,
@@ -52,6 +67,7 @@ export async function runDeepResearch(input: RunDeepResearchInput): Promise<RunD
     config: input.config,
   });
 
+  input.onPhase?.("synthesize");
   const report = await synthesize(loopResult.finalState, {
     model: input.model,
     signal: input.signal,

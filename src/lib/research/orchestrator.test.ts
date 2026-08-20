@@ -94,4 +94,16 @@ describe("runDeepResearch", () => {
     expect(result.termination.reason).toBe("step_budget_reached");
     expect(result.finalState.step).toBe(2);
   });
+
+  it("invokes onPhase at plan, research, and synthesize, in order", async () => {
+    const planResponse = JSON.stringify({ subQuestions: ["What is chlorophyll?"], strategy: "Use general knowledge." });
+    const writeAnswer = jsonAction({ action: "write_answer", args: { summary: "final answer" }, confidence: 0.9 });
+    const reportMarkdown = "# Report\n\nFinal answer content [S1].";
+    const model = scriptedModel([planResponse, writeAnswer, reportMarkdown]);
+    const phases: string[] = [];
+
+    await runDeepResearch(baseInput({ model, onPhase: (phase) => phases.push(phase) }));
+
+    expect(phases).toEqual(["plan", "research", "synthesize"]);
+  });
 });
