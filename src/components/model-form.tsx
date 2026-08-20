@@ -165,11 +165,20 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
                     Fetching models...
                   </div>
                 ) : fetchError ? (
-                  <div className="flex flex-col gap-2">
+                  <div className="flex flex-col gap-3">
                     <p className="text-sm text-destructive">{fetchError}</p>
                     <Button type="button" variant="outline" size="sm" onClick={fetchModels}>
                       Try again
                     </Button>
+                    <div className="flex flex-col gap-1">
+                      <p className="text-xs text-muted-foreground">Or enter the model id manually:</p>
+                      <Input
+                        id="model-id"
+                        placeholder="e.g. claude-sonnet-5"
+                        value={modelId}
+                        onChange={(e) => handleModelSelect(e.target.value)}
+                      />
+                    </div>
                   </div>
                 ) : availableModels.length === 0 ? (
                   <p className="text-sm text-muted-foreground py-2">
