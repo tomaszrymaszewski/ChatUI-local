@@ -60,8 +60,16 @@ const WAVE_WAVELENGTH = 220;
 
 const spriteCache = new Map<string, HTMLCanvasElement[]>();
 
+function getIconColor(): string {
+  return getComputedStyle(document.documentElement)
+    .getPropertyValue("--foreground")
+    .trim();
+}
+
 async function generateSprites(mode: string): Promise<HTMLCanvasElement[]> {
-  const cached = spriteCache.get(mode);
+  const color = getIconColor();
+  const cacheKey = `${mode}:${color}`;
+  const cached = spriteCache.get(cacheKey);
   if (cached) return cached;
 
   const icons = mode === "agent" ? AGENT_ICONS : CHAT_ICONS;
@@ -73,7 +81,7 @@ async function generateSprites(mode: string): Promise<HTMLCanvasElement[]> {
       (Icon) =>
         new Promise<HTMLCanvasElement>((resolve, reject) => {
           const svg = renderToStaticMarkup(
-            <Icon size={ICON_PX} strokeWidth={1.5} color="white" />,
+            <Icon size={ICON_PX} strokeWidth={1.5} color={color} />,
           );
           const dataUrl = `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
           const img = document.createElement("img");
@@ -91,7 +99,7 @@ async function generateSprites(mode: string): Promise<HTMLCanvasElement[]> {
     ),
   );
 
-  spriteCache.set(mode, sprites);
+  spriteCache.set(cacheKey, sprites);
   return sprites;
 }
 

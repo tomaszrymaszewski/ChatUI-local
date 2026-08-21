@@ -1728,9 +1728,9 @@ export function ChatView() {
             />
           </div>
         ) : (
-          <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden bg-black px-4 pb-8">
+          <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden bg-background px-4 pb-8">
             <InteractiveGrid className="absolute inset-0" mode={activeTab} />
-            <h2 className="select-none cursor-default relative font-serif z-10 mb-12 text-center text-4xl text-white/70 welcome-fade-in">
+            <h2 className="select-none cursor-default relative font-serif z-10 mb-12 text-center text-4xl text-foreground/70 welcome-fade-in">
               {welcomePrompt}
             </h2>
             <div className="relative z-10 w-full max-w-3xl">
@@ -1766,7 +1766,7 @@ export function ChatView() {
                 </AttachmentGroup>
               )}
 
-              <InputGroup className={`bg-white/5 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
+              <InputGroup className={isTemporary ? "border-dashed" : undefined}>
                 <InputGroupTextarea
                   value={inputText}
                   onChange={(e) => setInputText(e.currentTarget.value)}
@@ -1777,7 +1777,7 @@ export function ChatView() {
                     }
                   }}
                   placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything"}
-                  className="max-h-40 min-h-12 placeholder:text-white/30"
+                  className="max-h-40 min-h-12"
                 />
                 <InputGroupAddon align="block-end">
                   <DropdownMenu>
@@ -1876,7 +1876,7 @@ export function ChatView() {
 
                   <div className="flex-1" />
 
-                  {modelSelect("dark")}
+                  {modelSelect()}
 
                   {isThinking ? (
                     <InputGroupButton
@@ -1905,7 +1905,7 @@ export function ChatView() {
                 </InputGroupAddon>
               </InputGroup>
 
-              <p className="mt-2 text-center text-xs text-white/30 bg-black w-fit mx-auto">
+              <p className="mt-2 text-center text-xs text-muted-foreground w-fit mx-auto">
                 AI can make mistakes. Check important information.
               </p>
             </div>
