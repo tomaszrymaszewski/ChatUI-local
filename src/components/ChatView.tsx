@@ -35,7 +35,6 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/app-sidebar";
-import { AgentView } from "@/components/AgentView";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SettingsDialog } from "@/pages/settings";
 import { InteractiveGrid } from "@/components/interactive-grid";
@@ -203,7 +202,6 @@ export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
   const { sessions, createSession, deleteSession, updateSession } =
     useSessions(activeTab);
-  const { sessions: agentSessions } = useSessions("agent");
   const { projects, createProject, updateProject, deleteProject, addProjectFile, deleteProjectFile, addProjectImage, deleteProjectImage, refetch: refetchProjects } =
     useProjects();
   const { providers } = useProviders();
@@ -1149,32 +1147,38 @@ export function ChatView() {
         "Learn",
         "Learn mode - structured tutoring with a comprehension check",
         <GraduationCap />,
-        "bg-emerald-500/15 text-emerald-500 hover:bg-emerald-500/25 hover:text-emerald-500",
+        "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
       )}
       {modeToggle(
         "research",
         "Research",
         "Deep Research - multi-round, search-driven cited report",
         <Microscope />,
-        "bg-violet-500/15 text-violet-500 hover:bg-violet-500/25 hover:text-violet-500",
+        "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
       )}
       {modeToggle(
         "council",
         "Council",
         "Model Council - several models answer, the selected model writes the verdict",
         <UsersRound />,
-        "bg-amber-500/15 text-amber-500 hover:bg-amber-500/25 hover:text-amber-500",
+        "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
       )}
     </>
   );
 
   const learnSelectors = chatMode === "learn" ? (
-    <div className="mb-2 flex items-center gap-2">
+    <>
       <Select value={learnLevel} onValueChange={(value) => updateLearnPreferences(value as LearnLevel, learnSubject)}>
-        <SelectTrigger size="sm" className="w-36">
+        <SelectTrigger
+          size="sm"
+          aria-label="Choose learn level"
+          title="Choose the learner level"
+          className="h-6 gap-1 rounded-[calc(var(--radius)-5px)] border-0 bg-blue-500/15 px-2 text-blue-500 shadow-none hover:bg-blue-500/25 hover:text-blue-500 dark:bg-blue-500/15 dark:hover:bg-blue-500/25 [&_svg:not([class*='size-'])]:size-3.5"
+        >
+          <GraduationCap />
           <SelectValue />
         </SelectTrigger>
-        <SelectContent>
+        <SelectContent position="popper" side="top" align="start" sideOffset={4}>
           {LEARN_LEVELS.map((level) => (
             <SelectItem key={level.value} value={level.value}>
               {level.label}
@@ -1183,10 +1187,16 @@ export function ChatView() {
         </SelectContent>
       </Select>
       <Select value={learnSubject} onValueChange={(value) => updateLearnPreferences(learnLevel, value as LearnSubject)}>
-        <SelectTrigger size="sm" className="w-44">
+        <SelectTrigger
+          size="sm"
+          aria-label="Choose learn subject"
+          title="Choose the subject to learn"
+          className="h-6 gap-1 rounded-[calc(var(--radius)-5px)] border-0 bg-blue-500/15 px-2 text-blue-500 shadow-none hover:bg-blue-500/25 hover:text-blue-500 dark:bg-blue-500/15 dark:hover:bg-blue-500/25 [&_svg:not([class*='size-'])]:size-3.5"
+        >
+          <Globe />
           <SelectValue />
         </SelectTrigger>
-        <SelectContent>
+        <SelectContent position="popper" side="top" align="start" sideOffset={4}>
           {LEARN_SUBJECTS.map((subject) => (
             <SelectItem key={subject.value} value={subject.value}>
               {subject.label}
@@ -1194,7 +1204,7 @@ export function ChatView() {
           ))}
         </SelectContent>
       </Select>
-    </div>
+    </>
   ) : null;
 
   const councilPicker = chatMode === "council" ? (
@@ -1205,7 +1215,7 @@ export function ChatView() {
           variant="ghost"
           aria-label="Choose council models"
           title="Choose which models sit on the council"
-          className="bg-amber-500/15 text-amber-500 hover:bg-amber-500/25 hover:text-amber-500"
+          className="bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500"
         >
           <UsersRound />
           Council ({council.councilModels.length})
@@ -1481,10 +1491,7 @@ export function ChatView() {
     >
       <AppSidebar
         sessions={sessions}
-        agentSessions={agentSessions}
         activeSessionId={activeSessionId}
-        activeTab={activeTab}
-        onTabChange={setActiveTab}
         onSelectSession={selectSession}
         onNewChat={handleNewChat}
         onDeleteChat={handleDeleteSession}
@@ -1579,7 +1586,7 @@ export function ChatView() {
           <div className="ml-auto flex items-center gap-2" />
         </header>
 
-        <div className={activeTab === "agent" ? "hidden" : "flex min-h-0 flex-1 flex-col"}>
+        <div className="flex min-h-0 flex-1 flex-col">
         {activeSession ? (
           <div className="relative flex min-h-0 flex-1 flex-col">
             {artifactPanel && (
@@ -1758,8 +1765,6 @@ export function ChatView() {
                   </AttachmentGroup>
                 )}
 
-                {learnSelectors}
-
                 <InputGroup className={isTemporary ? "border-dashed" : undefined}>
                   <InputGroupTextarea
                     value={inputText}
@@ -1831,6 +1836,7 @@ export function ChatView() {
                       </InputGroupButton>
                     )}
                     {modeToggles}
+                    {learnSelectors}
                     {councilPicker}
                     <input
                       ref={fileInputRef}
@@ -1900,7 +1906,6 @@ export function ChatView() {
             <div className="flex min-h-0 flex-1">
               <div className="flex flex-col w-2/3 min-h-0 border-r">
                 <div className="shrink-0 p-4">
-                  {learnSelectors}
                   <InputGroup className={isTemporary ? "border-dashed" : undefined}>
                     <InputGroupTextarea
                       value={projectInputText}
@@ -1919,6 +1924,7 @@ export function ChatView() {
                     />
                     <InputGroupAddon align="block-end">
                       {modeToggles}
+                      {learnSelectors}
                       {councilPicker}
                       <div className="flex-1" />
                       {modelSelect()}
@@ -2164,7 +2170,7 @@ export function ChatView() {
           </div>
         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden bg-black px-4 pb-8">
-            <InteractiveGrid className="absolute inset-0" mode={activeTab} />
+            <InteractiveGrid className="absolute inset-0" mode="chat" />
             <h2 className="select-none cursor-default relative font--font-sans z-10 mb-12 text-center text-4xl text-white/70 welcome-fade-in">
               {welcomePrompt}
             </h2>
@@ -2200,8 +2206,6 @@ export function ChatView() {
                   ))}
                 </AttachmentGroup>
               )}
-
-              {learnSelectors}
 
               <InputGroup className={`bg-white/5 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
                 <InputGroupTextarea
@@ -2274,6 +2278,7 @@ export function ChatView() {
                     </InputGroupButton>
                   )}
                   {modeToggles}
+                  {learnSelectors}
                   {councilPicker}
                   <input
                     ref={fileInputRef}
@@ -2338,9 +2343,6 @@ export function ChatView() {
             </div>
           </div>
         )}
-        </div>
-        <div className={activeTab === "agent" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
-          <AgentView />
         </div>
       </SidebarInset>
 
@@ -2548,7 +2550,7 @@ export function ChatView() {
           </DialogHeader>
           <div className="flex-1 overflow-y-auto">
             <div className="flex flex-col gap-2 pb-1">
-              {[...sessions, ...agentSessions]
+              {sessions
                 .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
                 .filter((s) =>
                   s.title.toLowerCase().includes(historySearch.toLowerCase())
@@ -2604,7 +2606,7 @@ export function ChatView() {
                     </CardHeader>
                   </Card>
                 ))}
-              {[...sessions, ...agentSessions]
+              {sessions
                 .filter((s) =>
                   s.title.toLowerCase().includes(historySearch.toLowerCase())
                 ).length === 0 && (
