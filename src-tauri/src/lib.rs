@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 
 const OPENCODE_PORT: &str = "2138";
 const OPENCODE_URL: &str = "http://localhost:2138";
@@ -998,6 +998,11 @@ pub fn run() {
             delete_local_session,
             update_local_session_title,
         ])
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                window.app_handle().exit(0);
+            }
+        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 

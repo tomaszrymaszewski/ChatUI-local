@@ -43,6 +43,10 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "ChatUI ${{ github.ref_name }}"
-          releaseBody: "See the assets below to download and install this version."
+          releaseBody: |
+            See the assets below to download and install this version.
+
+            **macOS note (unsigned build):** after copying chatui.app to Applications, run
+            `xattr -cr /Applications/chatui.app` in Terminal once, then open the app normally.
           releaseDraft: true
           prerelease: false
