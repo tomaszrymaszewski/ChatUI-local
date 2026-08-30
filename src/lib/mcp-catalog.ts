@@ -30,9 +30,11 @@ export interface McpCatalogEntry {
   category: McpCategory;
   /** "Official" badge source label. */
   vendor: string;
-  auth: McpAuthType;
+  auth: McpAuthType;              // "oauth" | "apikey" | "none"
   /** Environment variable keys the user must provide (when auth === "apikey"). */
   envKeys?: string[];
+  /** Extra search keywords that the agent's search_connectors tool matches against. */
+  keywords?: string[];
   install:
     | { type: "remote"; url: string }
     | { type: "local"; command: string[] };
@@ -85,10 +87,11 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
   {
     id: "zapier",
     name: "Zapier",
-    tagline: "Connect the AI to 9,000+ apps through your Zapier automations.",
+    tagline: "Connect the AI to 9,000+ apps — including Gmail, Google Calendar, Google Docs, Drive, Outlook, Microsoft 365, and Slack — through your Zapier automations.",
     category: "Productivity",
     vendor: "Zapier",
     auth: "oauth",
+    keywords: ["gmail", "google", "google calendar", "google docs", "drive", "sheets", "outlook", "office", "microsoft 365", "microsoft", "excel", "word", "teams", "slack", "email", "calendar"],
     install: { type: "remote", url: "https://mcp.zapier.com/api/v1/connect" },
     registryName: "com.zapier/mcp",
   },

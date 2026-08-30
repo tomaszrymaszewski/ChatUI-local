@@ -44,6 +44,18 @@ pub struct ScaffoldPayload {
     pub data: String,
 }
 
+// camelCase on the wire: Tauri converts command *arguments* from JS camelCase
+// automatically, but *return values* are serialized as-is — the frontend
+// (src/lib/http-fetch.ts) reads statusText/contentType.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpFetchResponse {
+    pub status: u16,
+    pub status_text: String,
+    pub content_type: String,
+    pub body: String,
+}
+
 // ─── Path helpers ─────────────────────────────────────────────────────────
 
 fn make_display_path(path: &PathBuf) -> String {
@@ -566,6 +578,150 @@ async fn opencode_mcp_auth(name: String) -> Result<(), String> {
     Ok(())
 }
 
+// ─── Web fetch (CORS-free) ─────────────────────────────────────────────────
+
+/// Fetch an arbitrary URL from the Rust side. The webview's own fetch() is
+/// subject to CORS, and most websites (and DuckDuckGo's HTML search) don't
+/// send Access-Control-Allow-Origin, so web_fetch / Deep Research fetching
+/// goes through here instead. A real browser User-Agent is required —
+/// DuckDuckGo 403s bot-like UAs.
+#[tauri::command]
+async fn http_fetch(url: String, timeout_ms: Option<u64>) -> Result<HttpFetchResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(timeout_ms.unwrap_or(15000)))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .get(&url)
+            .header(
+                reqwest::header::USER_AGENT,
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
+            )
+            .header(reqwest::header::ACCEPT, "text/html, text/plain, */*")
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        let status = resp.status().as_u16();
+        let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.text().unwrap_or_default();
+        // Bound the payload crossing IPC; callers truncate further themselves.
+        let body: String = body.chars().take(500_000).collect();
+
+        Ok(HttpFetchResponse { status, status_text, content_type, body })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ─── Python execution ──────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PythonRunResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub timed_out: bool,
+}
+
+/// Run a Python snippet with the system python3 (used by the agent's
+/// run_python tool and the artifact panel's Run button). The code is written
+/// to a temp file and the child is polled with try_wait; on timeout it is
+/// killed so a runaway script cannot hang the IPC call. stdout/stderr are
+/// drained on separate threads so a full pipe buffer can't deadlock the child.
+#[tauri::command]
+async fn run_python(code: String, timeout_ms: Option<u64>) -> Result<PythonRunResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000));
+
+        let script_path = std::env::temp_dir().join(format!(
+            "chatui-python-{}-{}.py",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::write(&script_path, &code)
+            .map_err(|e| format!("Failed to write temp script: {}", e))?;
+
+        let mut child = Command::new("python3")
+            .arg(&script_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                let _ = fs::remove_file(&script_path);
+                format!("Failed to start python3: {}", e)
+            })?;
+
+        let stdout_handle = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = out.read_to_string(&mut s);
+                s
+            })
+        });
+        let stderr_handle = child.stderr.take().map(|mut err| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = err.read_to_string(&mut s);
+                s
+            })
+        });
+
+        let start = std::time::Instant::now();
+        let mut timed_out = false;
+        let mut final_status: Option<std::process::ExitStatus> = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    final_status = Some(status);
+                    break;
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        timed_out = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&script_path);
+                    return Err(format!("Failed to wait on python3: {}", e));
+                }
+            }
+        }
+
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+
+        let exit_code = final_status.and_then(|s| s.code()).unwrap_or(-1);
+
+        let _ = fs::remove_file(&script_path);
+
+        // Bound the payloads crossing IPC.
+        let stdout: String = stdout.chars().take(200_000).collect();
+        let stderr: String = stderr.chars().take(200_000).collect();
+
+        Ok(PythonRunResult { stdout, stderr, exit_code, timed_out })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ─── Scaffolding ───────────────────────────────────────────────────────────
 
 fn scaffold_command(template: &str) -> Result<(String, Vec<String>), String> {
@@ -745,11 +901,73 @@ fn update_local_session_title(id: String, title: String) -> Result<(), String> {
 
 // ─── Entry point ──────────────────────────────────────────────────────────
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The frontend reads resp.statusText / resp.contentType (src/lib/http-fetch.ts);
+    // a snake_case payload would silently break web_fetch with a JS TypeError.
+    #[test]
+    fn http_fetch_response_serializes_to_camel_case() {
+        let value = serde_json::to_value(HttpFetchResponse {
+            status: 200,
+            status_text: "OK".into(),
+            content_type: "text/html".into(),
+            body: "hi".into(),
+        })
+        .unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("status"));
+        assert!(obj.contains_key("statusText"));
+        assert!(obj.contains_key("contentType"));
+        assert!(obj.contains_key("body"));
+        assert!(!obj.contains_key("status_text"));
+        assert!(!obj.contains_key("content_type"));
+    }
+
+    // The frontend reads result.exitCode / result.timedOut (src/lib/run-python.ts);
+    // a snake_case payload would silently break the run_python tool.
+    #[test]
+    fn python_run_result_serializes_to_camel_case() {
+        let value = serde_json::to_value(PythonRunResult {
+            stdout: "hi".into(),
+            stderr: "".into(),
+            exit_code: 0,
+            timed_out: false,
+        })
+        .unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("stdout"));
+        assert!(obj.contains_key("stderr"));
+        assert!(obj.contains_key("exitCode"));
+        assert!(obj.contains_key("timedOut"));
+        assert!(!obj.contains_key("exit_code"));
+        assert!(!obj.contains_key("timed_out"));
+    }
+
+    // Live smoke test (network) — run explicitly: cargo test -- --ignored.
+    // Uses Bing's RSS endpoint (the keyless-search primary) because DuckDuckGo
+    // intermittently answers plain clients with a 202 anomaly challenge.
+    #[test]
+    #[ignore]
+    fn http_fetch_live_smoke() {
+        let resp = tauri::async_runtime::block_on(super::http_fetch(
+            "https://www.bing.com/search?q=iceland+drone+rules&format=rss".into(),
+            None,
+        ))
+        .expect("Bing RSS fetch should not error");
+        assert_eq!(resp.status, 200, "Bing RSS should return 200, got {}", resp.status);
+        assert!(resp.body.contains("<item>"), "Bing RSS should contain result items");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             ensure_chat_ui_directory,
             create_project_directory,
@@ -772,6 +990,8 @@ pub fn run() {
             opencode_server_log,
             opencode_serve_in_dir,
             opencode_mcp_auth,
+            http_fetch,
+            run_python,
             run_scaffold,
             list_local_sessions,
             save_local_session,

@@ -4,11 +4,9 @@ import {
   ArrowUp,
   ArrowLeft,
   Paperclip,
-  ChartColumnBig,
   Check,
   ClockFading,
   Copy,
-  ChevronDown,
   ChevronRight,
   Image as ImageIcon,
   Microscope,
@@ -17,7 +15,6 @@ import {
   Plus,
   Puzzle,
   ScrollText,
-  GalleryVerticalEnd,
   Search,
   FolderPlus,
   FileText,
@@ -27,19 +24,22 @@ import {
   RotateCcw,
   ChevronLeft,
   SquareTerminal,
-  Brain,
   Globe,
-  Telescope,
   GraduationCap,
   UsersRound,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/app-sidebar";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
-import { SettingsDialog } from "@/pages/settings";
-import { InteractiveGrid } from "@/components/interactive-grid";
+import { MessageStream } from "@/components/message-stream";
+import { SettingsView, type SettingsTab } from "@/pages/settings";
+import { PatternBackground } from "@/components/background-pattern";
 import { ArtifactPanel } from "@/components/artifact-panel";
-import { extractArtifacts, type Artifact } from "@/lib/artifacts";
+import { StructuredInputForm } from "@/components/structured-input-form";
+import { SuggestionCard, installSkillByName } from "@/components/suggestion-card";
+import { type Artifact } from "@/lib/artifacts";
+import { checkForUpdate, loadUpdateSettings, isUpdaterAvailable } from "@/lib/updater";
+import { detectModeTrigger } from "@/lib/mode-triggers";
 import { OpenCodeProvider } from "@/lib/opencode-context";
 import {
   Attachment,
@@ -64,13 +64,11 @@ import {
 import {
   Dialog,
   DialogContent,
-  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
-  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
@@ -126,21 +124,16 @@ import { useMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
-import { useDeepResearch } from "@/hooks/use-deep-research";
-import { useModelCouncil } from "@/hooks/use-model-council";
-import { buildResearchSeed, computeExpansionFrontier, extractUrlsFromText } from "@/lib/research/seed";
+import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController } from "@/hooks/use-deep-agent";
+import type { AgentMode, AgentRunResult } from "@/lib/agent/types";
 import {
   buildLearnSystemPrompt,
   loadLearnPreferences,
-  saveLearnPreferences,
-  LEARN_LEVELS,
-  LEARN_SUBJECTS,
   type LearnLevel,
   type LearnSubject,
 } from "@/lib/learn-mode";
-import { streamChatCompletion, generateChatTitle, type ChatCompletionMessage, type ContentPart } from "@/lib/llm";
-import { loadInstalledSkillsPrompt } from "@/lib/skills-library";
-import { getAllTools } from "@/lib/tools";
+import { generateChatTitle, type ContentPart } from "@/lib/llm";
+import type { AgentMessage } from "@/lib/agent/runtime";
 import {
   buildMessageTree,
   getActivePath,
@@ -198,13 +191,22 @@ const WELCOME_PROMPTS = [
   "Ask away, the floor is yours.",
 ];
 
+// The chat column must keep at least this much width so the composer and
+// messages never overflow. The artifact panel's max width is derived from it:
+// max artifact width = container content width - overhead - CHAT_MIN_WIDTH_PX.
+const CHAT_MIN_WIDTH_PX = 440;
+/** Drag handle (6px) + two flex gaps (2 × 8px) in the chat/artifact row. */
+const ARTIFACT_ROW_OVERHEAD_PX = 22;
+/** The session container's p-2 padding (2 × 8px). */
+const CONTAINER_PADDING_PX = 16;
+
 export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
   const { sessions, createSession, deleteSession, updateSession } =
     useSessions(activeTab);
   const { projects, createProject, updateProject, deleteProject, addProjectFile, deleteProjectFile, addProjectImage, deleteProjectImage, refetch: refetchProjects } =
     useProjects();
-  const { providers } = useProviders();
+  const { providers, refetch: refetchProviders } = useProviders();
   const { settings } = useUserSettings();
 
   const [activeSessionByTab, setActiveSessionByTab] = useState<
@@ -216,13 +218,14 @@ export function ChatView() {
       setActiveSessionByTab((prev) => ({ ...prev, [activeTab]: id })),
     [activeTab],
   );
-  const { messages, addMessage, deleteTemporaryMessages } = useMessages(activeSessionId);
+  const { messages, addMessage, updateMessage, deleteMessage, deleteTemporaryMessages } = useMessages(activeSessionId);
+  const agent = useAgentController(activeSessionId);
+  const runningIds = useRunningSessionIds();
+  // Maps sessionId → in-progress assistant message id so the persisted message can
+  // be hidden from the tree while its live streaming bubble is shown instead.
+  const inProgressMsgIds = useRef<Map<string, string>>(new Map());
   const [inputText, setInputText] = useState("");
   const [files, setFiles] = useState<PendingFile[]>([]);
-  const [isThinking, setIsThinking] = useState(false);
-  const [streamingContent, setStreamingContent] = useState("");
-  const [streamingReasoning, setStreamingReasoning] = useState("");
-  const [showThinkingProcess, setShowThinkingProcess] = useState(false);
   const [webFetchEnabled, setWebFetchEnabled] = useState(true);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
@@ -231,12 +234,12 @@ export function ChatView() {
   );
   const [chatMode, setChatMode] = useState<ChatMode>("none");
   const isTemporary = chatMode === "temporary";
-  const [learnLevel, setLearnLevel] = useState<LearnLevel>(() => loadLearnPreferences().level);
-  const [learnSubject, setLearnSubject] = useState<LearnSubject>(() => loadLearnPreferences().subject);
+  const [learnLevel] = useState<LearnLevel>(() => loadLearnPreferences().level);
+  const [learnSubject] = useState<LearnSubject>(() => loadLearnPreferences().subject);
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
-  const [projectsOpen, setProjectsOpen] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [view, setView] = useState<"chat" | "settings" | "projects" | "history">("chat");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  const openSettings = () => setView("settings");
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [projectSearch, setProjectSearch] = useState("");
   const [historySearch, setHistorySearch] = useState("");
@@ -244,8 +247,6 @@ export function ChatView() {
   const [historyRenameDraft, setHistoryRenameDraft] = useState("");
   const [projectInputText, setProjectInputText] = useState("");
   const [selectedModel, setSelectedModel] = useState<string>("");
-  const [abortController, setAbortController] =
-    useState<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [selectedChildMap, setSelectedChildMap] = useState<
@@ -254,7 +255,6 @@ export function ChatView() {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
   const [showRawOutput, setShowRawOutput] = useState<Set<string>>(new Set());
-  const [expandedReasoning, setExpandedReasoning] = useState<Set<string>>(new Set());
   const projectFileInputRef = useRef<HTMLInputElement>(null);
   const projectImageInputRef = useRef<HTMLInputElement>(null);
   const [editingProjectField, setEditingProjectField] = useState<string | null>(null);
@@ -264,6 +264,11 @@ export function ChatView() {
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectInstructions, setNewProjectInstructions] = useState("");
   const [artifactPanel, setArtifactPanel] = useState<{ artifacts: Artifact[]; activeIndex: number } | null>(null);
+  const [artifactWindowMode, setArtifactWindowMode] = useState<"open" | "minimized" | "expanded">("open");
+  const [artifactWidth, setArtifactWidth] = useState<number | null>(null);
+  const sessionContainerRef = useRef<HTMLDivElement>(null);
+  const autoOpenedArtifacts = useRef<Set<string>>(new Set());
+  const autoModeRef = useRef<ChatMode>("none");
 
   useEffect(() => {
     if (settings.temporaryByDefault) {
@@ -271,11 +276,55 @@ export function ChatView() {
     }
   }, [settings.temporaryByDefault]);
 
-  const updateLearnPreferences = (level: LearnLevel, subject: LearnSubject) => {
-    setLearnLevel(level);
-    setLearnSubject(subject);
-    saveLearnPreferences({ level, subject });
-  };
+  // Check for app updates once on launch (silently).
+  useEffect(() => {
+    if (!isUpdaterAvailable()) return;
+    const updateSettings = loadUpdateSettings();
+    if (!updateSettings.autoCheck) return;
+    if (document.readyState === "complete") {
+      void checkForUpdate().then((result) => {
+        if (result.available && result.info) {
+          if (updateSettings.skippedVersion === result.info.version) return;
+          toast(`Update available — v${result.info.version}`, {
+            action: {
+              label: "View",
+              onClick: () => {
+                setSettingsTab("updates");
+                setView("settings");
+              },
+            },
+          });
+        }
+      }).catch(() => { /* silent failure on launch */ });
+    }
+  }, []);
+
+  // Auto-detect chat mode from the first word(s) typed in the composer.
+  // "discuss…" → council, "teach me…"/"i want to learn…" → learn,
+  // "research…" → research. Deleting the trigger word reverts the mode.
+  // A manual toggle always wins: once the user changes the mode by hand,
+  // the auto-detection stops fighting them.
+  useEffect(() => {
+    const detected = detectModeTrigger(inputText);
+    const detectedMode: ChatMode = detected ?? "none";
+
+    if (detectedMode !== autoModeRef.current) {
+      const prevAuto = autoModeRef.current;
+      autoModeRef.current = detectedMode;
+      if (detectedMode === "none") {
+        if (chatMode === prevAuto) setChatMode("none");
+      } else {
+        if (chatMode === prevAuto || chatMode === "none") setChatMode(detectedMode);
+      }
+    }
+  }, [inputText, chatMode]);
+
+  // Settings manages its own provider state; refresh ours when leaving it.
+  useEffect(() => {
+    if (view !== "settings") {
+      void refetchProviders();
+    }
+  }, [view, refetchProviders]);
 
   useEffect(() => {
     if (!selectedModel && settings.defaultModel) {
@@ -306,6 +355,8 @@ export function ChatView() {
   const currentProjectInstructions = projects.find(
     (p) => p.id === currentProjectId,
   )?.instructions;
+  const currentProjectDirectory =
+    projects.find((p) => p.id === currentProjectId)?.directory ?? null;
 
   const displayMessages: ChatMessage[] = activeSessionId
     ? messages
@@ -325,10 +376,67 @@ export function ChatView() {
     setSelectedChildMap(new Map());
     setEditingMessageId(null);
     setShowRawOutput(new Set());
-    setExpandedReasoning(new Set());
+    setArtifactPanel(null);
+    setArtifactWindowMode("open");
+    autoOpenedArtifacts.current = new Set();
   }, [activeSessionId]);
 
+  // Auto-open the artifact panel the moment a new artifact is emitted during a
+  // run (create_artifact mid-run, or research/discuss synthesis at the end).
+  // Each artifact id is opened only once — tracked in a ref Set that persists
+  // across session switches (ids are globally unique via Date.now + counter).
+  useEffect(() => {
+    if (!agent) return;
+    const fresh = agent.artifacts.filter((a) => !autoOpenedArtifacts.current.has(a.id));
+    if (fresh.length === 0) return;
+    fresh.forEach((a) => autoOpenedArtifacts.current.add(a.id));
+    setArtifactPanel({ artifacts: agent.artifacts, activeIndex: agent.artifacts.length - 1 });
+    setArtifactWindowMode("open");
+    setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
+  }, [agent?.artifacts]);
+
   const comingSoon = (feature: string) => toast(`${feature} is coming soon`);
+
+  const startArtifactDrag = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const container = sessionContainerRef.current;
+    if (!container) return;
+    const containerWidth = container.getBoundingClientRect().width;
+    const startX = e.clientX;
+    const startWidth = artifactWidth ?? containerWidth * 0.7;
+    // Never let the artifact grow past the point where the chat column drops
+    // below its minimum width.
+    const maxWidth = Math.max(
+      containerWidth * 0.4,
+      containerWidth - CONTAINER_PADDING_PX - ARTIFACT_ROW_OVERHEAD_PX - CHAT_MIN_WIDTH_PX,
+    );
+    const onMove = (ev: MouseEvent) => {
+      const delta = startX - ev.clientX;
+      const newWidth = Math.max(containerWidth * 0.25, Math.min(maxWidth, startWidth + delta));
+      setArtifactWidth(newWidth);
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+
+  const handleOpenArtifactFromContent = (content: string, language: string) => {
+    const title = language.charAt(0).toUpperCase() + language.slice(1);
+    const artifact: Artifact = {
+      id: `inline-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title,
+      language,
+      content,
+      index: 0,
+    };
+    setArtifactPanel({ artifacts: [artifact], activeIndex: 0 });
+    setArtifactWindowMode("open");
+    setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
+  };
 
   const startDrag = (e: React.MouseEvent) => {
     if (e.button === 0) getCurrentWindow().startDragging();
@@ -389,14 +497,17 @@ export function ChatView() {
 
   const handleSend = async () => {
     const text = inputText.trim();
-    if ((!text && files.length === 0) || isThinking || deepResearch.isRunning || council.isRunning) return;
+    if ((!text && files.length === 0) || agent?.isRunning) return;
 
     const provider = selectedModel ? findProviderForModel(selectedModel) : null;
     if (!provider) {
       toast.error("No provider configured. Add one in Settings.");
-      setSettingsOpen(true);
+      openSettings();
       return;
     }
+
+    const mode: AgentMode =
+      chatMode === "research" ? "research" : chatMode === "council" ? "council" : "chat";
 
     // Vision check: block image attachments for non-vision models
     const hasImages = files.some((f) => f.type.startsWith("image/"));
@@ -413,10 +524,6 @@ export function ChatView() {
     const attachments = files.length > 0 ? files : undefined;
     setInputText("");
     setFiles([]);
-    setIsThinking(true);
-    setStreamingContent("");
-    setStreamingReasoning("");
-    setShowThinkingProcess(false);
 
     let sessionId = activeSessionId;
     let sessionPersisted = Promise.resolve();
@@ -473,57 +580,74 @@ export function ChatView() {
       const effectiveInstructions = [currentProjectInstructions, learnContext, memoryContext]
         .filter(Boolean).join("\n\n") || undefined;
 
-      const completionMessages: ChatCompletionMessage[] = [
+      const completionMessages: AgentMessage[] = [
         ...activePath.map((n) => ({
-          role: n.message.role as "user" | "assistant" | "system",
+          role: n.message.role,
           content: n.message.content,
         })),
         { role: "user" as const, content: userContent },
       ];
 
-      const controller = new AbortController();
-      setAbortController(controller);
+      const ctrl = getAgentController(sessionId);
 
-      const tools = getAllTools(webFetchEnabled);
-      const skillsContext = await loadInstalledSkillsPrompt();
+      // Add the assistant message to the tree immediately and refresh it on an
+      // interval so partial output survives an app crash/restart mid-run. It is
+      // hidden from rendering while the live streaming bubble shows progress.
+      const assistantMsg = await addMessage(
+        sessionId,
+        "assistant",
+        "",
+        selectedModel,
+        undefined,
+        userMsg.id,
+        isTemporary,
+      );
+      inProgressMsgIds.current.set(sessionId, assistantMsg.id);
+      const saveInterval = setInterval(() => {
+        updateMessage(sessionId, assistantMsg.id, {
+          content: ctrl.streamingContent,
+          reasoning: ctrl.streamingReasoning || undefined,
+          activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+          reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          artifacts: ctrl.artifacts.length ? [...ctrl.artifacts] : undefined,
+        });
+      }, 2500);
 
-      let fullResponse = "";
-      let fullReasoning = "";
+      let result: AgentRunResult;
       try {
-        for await (const chunk of streamChatCompletion(
+        result = await ctrl.run({
           provider,
-          selectedModel,
-          completionMessages,
-          controller.signal,
-          tools,
-          effectiveInstructions,
-          skillsContext,
-        )) {
-          if (chunk.content) {
-            fullResponse += chunk.content;
-            setStreamingContent(fullResponse);
-          }
-          if (chunk.reasoning) {
-            fullReasoning += chunk.reasoning;
-            setStreamingReasoning(fullReasoning);
-          }
-        }
-      } catch (err) {
-        if (controller.signal.aborted) {
-          if (fullResponse) {
-            await addMessage(sessionId, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
-          }
-          return;
-        }
-        throw err;
+          modelName: selectedModel,
+          messages: completionMessages,
+          instructions: effectiveInstructions,
+          mode,
+          webFetchEnabled,
+          projectDir: currentProjectDirectory,
+          availableModels: allModels.map((m) => ({ name: m.name, providerId: m.providerId, displayName: m.displayName })),
+          providers,
+        });
+      } finally {
+        clearInterval(saveInterval);
+        inProgressMsgIds.current.delete(sessionId);
       }
 
-      if (fullResponse) {
-        await addMessage(sessionId, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
+      if ((mode === "research" || mode === "council") && result.completed) setChatMode("none");
+
+      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0;
+      if (hasOutput) {
+        updateMessage(sessionId, assistantMsg.id, {
+          content: result.content,
+          reasoning: result.reasoning || undefined,
+          activities: result.activities,
+          reasoningStreams: result.reasoningStreams,
+          artifacts: result.artifacts?.length ? result.artifacts : undefined,
+        });
+      } else {
+        deleteMessage(sessionId, assistantMsg.id);
       }
 
-      if (isNewSession && fullResponse) {
-        generateChatTitle(provider, selectedModel, text, fullResponse)
+      if (isNewSession && result.content) {
+        generateChatTitle(provider, selectedModel, text, result.content)
           .then((title) => {
             if (title && sessionId) {
               updateSession(sessionId, { title });
@@ -533,250 +657,35 @@ export function ChatView() {
       }
 
       // Auto-extract durable memories (background, best-effort)
-      if (settings.autoMemory && !isTemporary && fullResponse) {
-        void extractAndSaveMemory(provider, selectedModel, text, fullResponse, "global", loadMemory("global"), sessionId).catch(() => {});
+      if (settings.autoMemory && !isTemporary && result.content) {
+        void extractAndSaveMemory(provider, selectedModel, text, result.content, "global", loadMemory("global"), sessionId).catch(() => {});
         if (currentProjectId) {
-          void extractAndSaveMemory(provider, selectedModel, text, fullResponse, currentProjectId, loadMemory(currentProjectId), sessionId).catch(() => {});
+          void extractAndSaveMemory(provider, selectedModel, text, result.content, currentProjectId, loadMemory(currentProjectId), sessionId).catch(() => {});
         }
       }
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to send message",
       );
-    } finally {
-      setIsThinking(false);
-      setStreamingContent("");
-      setStreamingReasoning("");
-      setShowThinkingProcess(false);
-      setAbortController(null);
     }
   };
 
   const handleStop = () => {
-    if (council.isRunning) {
-      council.cancel();
-      return;
-    }
-    abortController?.abort();
+    agent?.stop();
   };
 
-  // Deep Research targets whatever session/user-message it was started under,
-  // resolved locally in handleDeepResearch (not via the activeSessionId state,
-  // which may not have re-rendered yet if a new session was just created —
-  // same reason handleSend keeps its own local `sessionId` variable).
-  const pendingResearchSessionRef = useRef<{ sessionId: string; userMsgId: string } | null>(null);
-
-  const deepResearch = useDeepResearch({
-    onReport: async (report, modelUsed) => {
-      const pending = pendingResearchSessionRef.current;
-      if (!pending) return;
-      await addMessage(pending.sessionId, "assistant", report, modelUsed, undefined, pending.userMsgId, isTemporary);
-    },
-  });
-
-  // Model Council targets whatever session/user-message it was started under,
-  // resolved locally in handleCouncilSend (same pattern as Deep Research above).
-  const pendingCouncilSessionRef = useRef<{ sessionId: string; userMsgId: string } | null>(null);
-
-  const council = useModelCouncil({
-    providers,
-    selectedModel,
-    onVerdict: async (verdict, memberLabels) => {
-      const pending = pendingCouncilSessionRef.current;
-      if (!pending) return;
-      const content = `${verdict}\n\n---\n*Council of ${memberLabels.length}: ${memberLabels.join(" · ")}*`;
-      await addMessage(pending.sessionId, "assistant", content, selectedModel, undefined, pending.userMsgId, isTemporary);
-    },
-  });
-
-  const handleDeepResearch = async (topicOverride?: string) => {
-    const topic = (topicOverride ?? inputText).trim();
-    if ((!topic && files.length === 0) || isThinking || deepResearch.isRunning || council.isRunning) return;
-
-    const urlsInText = extractUrlsFromText(topic);
-
-    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
-    if (!provider) {
-      toast.error("No provider configured. Add one in Settings.");
-      setSettingsOpen(true);
-      return;
-    }
-
-    const seedFiles = files.filter((f) => f.file).map((f) => ({ name: f.name, file: f.file! }));
-    const attachedFiles = files;
-    const displayText = topic || `Uploaded: ${attachedFiles.map((f) => f.name).join(", ")}`;
-    const userAttachments = attachedFiles.length > 0
-      ? attachedFiles.map((f) => ({ id: f.id, name: f.name, size: f.size, type: f.type }))
-      : undefined;
-
-    if (topicOverride === undefined) setInputText("");
-    else setProjectInputText("");
-    setFiles([]);
-
-    let sessionId = activeSessionId;
-    let sessionPersisted = Promise.resolve();
-
-    if (!sessionId) {
-      const newSession = createSession(displayText.slice(0, 30), pendingProjectId ?? undefined);
-      sessionId = newSession.id;
-      setActiveSessionId(newSession.id);
-      setPendingProjectId(null);
-      sessionPersisted = newSession.persisted;
-    }
-    if (!sessionId) throw new Error("Failed to create session");
-
-    try {
-      await sessionPersisted;
-      const parentId = activePath.length > 0 ? activePath[activePath.length - 1].message.id : null;
-      const userMsg = await addMessage(sessionId, "user", displayText, undefined, userAttachments, parentId, isTemporary);
-      updateSession(sessionId, {});
-
-      // Pasted URLs and attached files seed round 0; a bare topic needs no
-      // seed — the search-driven rounds look everything up themselves (and
-      // degrade to flagged model-knowledge findings if search is unavailable).
-      const hasSeedMaterial = seedFiles.length > 0 || urlsInText.length > 0;
-      const seed = hasSeedMaterial ? await buildResearchSeed(seedFiles, urlsInText) : undefined;
-      const seedUrls = seed ? computeExpansionFrontier(seed) : [];
-
-      pendingResearchSessionRef.current = { sessionId, userMsgId: userMsg.id };
-      await deepResearch.start(topic, provider, selectedModel, seed?.text, seedUrls, currentProjectInstructions || undefined);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Failed to start Deep Research");
-    } finally {
-      pendingResearchSessionRef.current = null;
-    }
-  };
-
-  const handleCouncilSend = async () => {
-    const text = inputText.trim();
-    if ((!text && files.length === 0) || isThinking || council.isRunning || deepResearch.isRunning) return;
-
-    // Roster guard before anything is persisted, so a too-small council never
-    // leaves behind an orphaned user message (the hook re-checks after
-    // resolving providers, as a backstop).
-    if (council.councilModels.length < 2) {
-      toast.error("Council needs at least 2 models — pick more in the Council picker.");
-      return;
-    }
-
-    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
-    if (!provider) {
-      toast.error("No provider configured. Add one in Settings.");
-      setSettingsOpen(true);
-      return;
-    }
-
-    // Vision check: block image attachments for non-vision models
-    const hasImages = files.some((f) => f.type.startsWith("image/"));
-    if (hasImages) {
-      const caps = await getModelCapabilities(provider, selectedModel);
-      if (!caps.vision) {
-        toast.error(
-          `${selectedModelLabel?.displayName || selectedModelLabel?.name || selectedModel} doesn't support image input. Remove the image or switch to a vision-capable model.`,
-        );
-        return;
-      }
-    }
-
-    const attachments = files.length > 0 ? files : undefined;
-    setInputText("");
-    setFiles([]);
-    setIsThinking(true);
-
-    let sessionId = activeSessionId;
-    let sessionPersisted = Promise.resolve();
-
-    if (!sessionId) {
-      const newSession = createSession(
-        (text || "Attachments").slice(0, 30),
-        pendingProjectId ?? undefined,
-      );
-      sessionId = newSession.id;
-      setActiveSessionId(newSession.id);
-      setPendingProjectId(null);
-      sessionPersisted = newSession.persisted;
-    }
-
-    if (!sessionId) throw new Error("Failed to create session");
-
-    const userAttachments = attachments?.map((a) => ({
-      id: a.id,
-      name: a.name,
-      size: a.size,
-      type: a.type,
-    }));
-
-    try {
-      await sessionPersisted;
-      const parentId = activePath.length > 0
-        ? activePath[activePath.length - 1].message.id
-        : null;
-      const userMsg = await addMessage(
-        sessionId,
-        "user",
-        text,
-        undefined,
-        userAttachments,
-        parentId,
-        isTemporary,
-      );
-
-      updateSession(sessionId, {});
-
-      const modelLabel = selectedModelLabel?.displayName || selectedModelLabel?.name || selectedModel;
-      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, selectedModel, modelLabel);
-      if (prep.blocked) {
-        toast.error(prep.warning ?? "This model doesn't support images.");
-        return;
-      }
-      const userContent: string | ContentPart[] = prep.content;
-
-      const memoryContext = settings.autoMemory ? await buildMemoryContext(currentProjectId ?? null, text) : "";
-      const effectiveInstructions = [currentProjectInstructions, memoryContext]
-        .filter(Boolean).join("\n\n") || undefined;
-
-      const completionMessages: ChatCompletionMessage[] = [
-        ...activePath.map((n) => ({
-          role: n.message.role as "user" | "assistant" | "system",
-          content: n.message.content,
-        })),
-        { role: "user" as const, content: userContent },
-      ];
-
-      const skillsContext = await loadInstalledSkillsPrompt();
-
-      pendingCouncilSessionRef.current = { sessionId, userMsgId: userMsg.id };
-      await council.start(completionMessages, effectiveInstructions, skillsContext);
-    } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Failed to start Model Council",
-      );
-    } finally {
-      pendingCouncilSessionRef.current = null;
-      setIsThinking(false);
-    }
-  };
-
-  // Send dispatches per active mode: research and council have their own
-  // flows; none/temporary/learn all go through handleSend (learn injects its
-  // tutor prompt via the instructions path, temporary is derived from mode).
+  // Sending while a structured-input form is pending switches back to free
+  // text: the interrupted run is cancelled, the typed message waits for the
+  // next send click.
   const handleModeSend = () => {
-    if (chatMode === "research") {
-      handleDeepResearch();
-      return;
-    }
-    if (chatMode === "council") {
-      handleCouncilSend();
+    if (agent?.pendingInput) {
+      agent?.skipInput();
       return;
     }
     handleSend();
   };
 
   const handleProjectModeSend = (text: string) => {
-    if (chatMode === "research") {
-      handleDeepResearch(text);
-      return;
-    }
     handleProjectSend(text);
   };
 
@@ -808,14 +717,9 @@ export function ChatView() {
     const provider = selectedModel ? findProviderForModel(selectedModel) : null;
     if (!provider) {
       toast.error("No provider configured. Add one in Settings.");
-      setSettingsOpen(true);
+      openSettings();
       return;
     }
-
-    setIsThinking(true);
-    setStreamingContent("");
-    setStreamingReasoning("");
-    setShowThinkingProcess(false);
 
     try {
       const parentId = msg.parent_id ?? null;
@@ -831,154 +735,149 @@ export function ChatView() {
 
       updateSession(activeSessionId, {});
 
-      const completionMessages: ChatCompletionMessage[] = [];
+      const completionMessages: AgentMessage[] = [];
       const pathToParent = activePath.slice(
         0,
         activePath.findIndex((n) => n.message.id === msg.id),
       );
       for (const n of pathToParent) {
         completionMessages.push({
-          role: n.message.role as "user" | "assistant" | "system",
+          role: n.message.role,
           content: n.message.content,
         });
       }
       completionMessages.push({ role: "user" as const, content: text });
 
-      const controller = new AbortController();
-      setAbortController(controller);
+      const ctrl = getAgentController(activeSessionId!);
+      const assistantMsg = await addMessage(
+        activeSessionId,
+        "assistant",
+        "",
+        selectedModel,
+        undefined,
+        userMsg.id,
+        isTemporary,
+      );
+      inProgressMsgIds.current.set(activeSessionId, assistantMsg.id);
+      const saveInterval = setInterval(() => {
+        updateMessage(activeSessionId, assistantMsg.id, {
+          content: ctrl.streamingContent,
+          reasoning: ctrl.streamingReasoning || undefined,
+          activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+          reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+        });
+      }, 2500);
 
-      const tools = getAllTools(webFetchEnabled);
-      const skillsContext = await loadInstalledSkillsPrompt();
-
-      let fullResponse = "";
-      let fullReasoning = "";
+      let result: AgentRunResult;
       try {
-        for await (const chunk of streamChatCompletion(
+        result = await ctrl.run({
           provider,
-          selectedModel,
-          completionMessages,
-          controller.signal,
-          tools,
-          currentProjectInstructions,
-          skillsContext,
-        )) {
-          if (chunk.content) {
-            fullResponse += chunk.content;
-            setStreamingContent(fullResponse);
-          }
-          if (chunk.reasoning) {
-            fullReasoning += chunk.reasoning;
-            setStreamingReasoning(fullReasoning);
-          }
-        }
-      } catch (err) {
-        if (controller.signal.aborted) {
-          if (fullResponse) {
-            await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
-          }
-          return;
-        }
-        throw err;
+          modelName: selectedModel,
+          messages: completionMessages,
+          instructions: currentProjectInstructions || undefined,
+          webFetchEnabled,
+          projectDir: currentProjectDirectory,
+        });
+      } finally {
+        clearInterval(saveInterval);
+        inProgressMsgIds.current.delete(activeSessionId);
       }
 
-      if (fullResponse) {
-        await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
+      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0;
+      if (hasOutput) {
+        updateMessage(activeSessionId, assistantMsg.id, {
+          content: result.content,
+          reasoning: result.reasoning || undefined,
+          activities: result.activities,
+          reasoningStreams: result.reasoningStreams,
+        });
+      } else {
+        deleteMessage(activeSessionId, assistantMsg.id);
       }
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to regenerate response",
       );
-    } finally {
-      setIsThinking(false);
-      setStreamingContent("");
-      setStreamingReasoning("");
-      setShowThinkingProcess(false);
-      setAbortController(null);
     }
   };
 
   const handleRegenerate = async (msg: ChatMessage) => {
-    if (!activeSessionId || isThinking) return;
+    if (!activeSessionId || agent?.isRunning) return;
 
     const provider = selectedModel ? findProviderForModel(selectedModel) : null;
     if (!provider) {
       toast.error("No provider configured. Add one in Settings.");
-      setSettingsOpen(true);
+      openSettings();
       return;
     }
-
-    setIsThinking(true);
-    setStreamingContent("");
-    setStreamingReasoning("");
-    setShowThinkingProcess(false);
 
     try {
       const parentId = msg.parent_id ?? null;
       const msgIsTemporary = msg.is_temporary ?? false;
 
-      const completionMessages: ChatCompletionMessage[] = [];
+      const completionMessages: AgentMessage[] = [];
       const pathToParent = activePath.slice(
         0,
         activePath.findIndex((n) => n.message.id === msg.id),
       );
       for (const n of pathToParent) {
         completionMessages.push({
-          role: n.message.role as "user" | "assistant" | "system",
+          role: n.message.role,
           content: n.message.content,
         });
       }
 
-      const controller = new AbortController();
-      setAbortController(controller);
+      const ctrl = getAgentController(activeSessionId);
+      const assistantMsg = await addMessage(
+        activeSessionId,
+        "assistant",
+        "",
+        selectedModel,
+        undefined,
+        parentId,
+        msgIsTemporary,
+      );
+      inProgressMsgIds.current.set(activeSessionId, assistantMsg.id);
+      const saveInterval = setInterval(() => {
+        updateMessage(activeSessionId, assistantMsg.id, {
+          content: ctrl.streamingContent,
+          reasoning: ctrl.streamingReasoning || undefined,
+          activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+          reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+        });
+      }, 2500);
 
-      const tools = getAllTools(webFetchEnabled);
-      const skillsContext = await loadInstalledSkillsPrompt();
-
-      let fullResponse = "";
-      let fullReasoning = "";
+      let result: AgentRunResult;
       try {
-        for await (const chunk of streamChatCompletion(
+        result = await ctrl.run({
           provider,
-          selectedModel,
-          completionMessages,
-          controller.signal,
-          tools,
-          currentProjectInstructions,
-          skillsContext,
-        )) {
-          if (chunk.content) {
-            fullResponse += chunk.content;
-            setStreamingContent(fullResponse);
-          }
-          if (chunk.reasoning) {
-            fullReasoning += chunk.reasoning;
-            setStreamingReasoning(fullReasoning);
-          }
-        }
-      } catch (err) {
-        if (controller.signal.aborted) {
-          if (fullResponse) {
-            await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, parentId, msgIsTemporary, fullReasoning || undefined);
-          }
-          return;
-        }
-        throw err;
+          modelName: selectedModel,
+          messages: completionMessages,
+          instructions: currentProjectInstructions || undefined,
+          webFetchEnabled,
+          projectDir: currentProjectDirectory,
+        });
+      } finally {
+        clearInterval(saveInterval);
+        inProgressMsgIds.current.delete(activeSessionId);
       }
 
-      if (fullResponse) {
-        await addMessage(activeSessionId, "assistant", fullResponse, selectedModel, undefined, parentId, msgIsTemporary, fullReasoning || undefined);
+      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0;
+      if (hasOutput) {
+        updateMessage(activeSessionId, assistantMsg.id, {
+          content: result.content,
+          reasoning: result.reasoning || undefined,
+          activities: result.activities,
+          reasoningStreams: result.reasoningStreams,
+        });
+      } else {
+        deleteMessage(activeSessionId, assistantMsg.id);
       }
       updateSession(activeSessionId, {});
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to regenerate response",
       );
-    } finally {
-      setIsThinking(false);
-      setStreamingContent("");
-      setStreamingReasoning("");
-      setShowThinkingProcess(false);
-      setAbortController(null);
     }
   };
 
@@ -1016,6 +915,7 @@ export function ChatView() {
     }
     setActiveSessionId(null);
     setActiveProjectId(null);
+    setView("chat");
     setWelcomePrompt(
       WELCOME_PROMPTS[Math.floor(Math.random() * WELCOME_PROMPTS.length)],
     );
@@ -1027,10 +927,12 @@ export function ChatView() {
     }
     setActiveSessionId(id);
     setActiveProjectId(null);
+    setView("chat");
   };
 
   const handleDeleteSession = async (id: string) => {
     try {
+      disposeAgentController(id);
       await deleteSession(id);
       if (activeSessionId === id) {
         setActiveSessionId(null);
@@ -1090,15 +992,11 @@ export function ChatView() {
 
   const selectedModelLabel = allModels.find((m) => m.name === selectedModel);
 
-  const modelSelect = (variant: "light" | "dark" = "light") => (
+  const modelSelect = () => (
     <Select value={selectedModel} onValueChange={setSelectedModel}>
       <SelectTrigger
         size="sm"
-        className={
-          variant === "dark"
-            ? "border-0 bg-transparent text-white/70 shadow-none hover:text-white"
-            : "border-0 bg-transparent shadow-none dark:bg-transparent"
-        }
+        className="border-0 bg-transparent shadow-none dark:bg-transparent"
       >
         <SelectValue placeholder="Select model">
           {selectedModelLabel
@@ -1118,9 +1016,10 @@ export function ChatView() {
     activeClass: string,
   ) => {
     const active = chatMode === mode;
+    const artifactOpen = !!artifactPanel;
     return (
       <InputGroupButton
-        size={active ? "xs" : "icon-xs"}
+        size={active && !artifactOpen ? "xs" : "icon-xs"}
         variant="ghost"
         aria-label={`Toggle ${label} mode`}
         title={title}
@@ -1128,7 +1027,7 @@ export function ChatView() {
         className={`group ${active ? activeClass : ""}`}
       >
         {icon}
-        {active && <span className="group-hover:line-through">{label}</span>}
+        {active && !artifactOpen && <span className="group-hover:line-through">{label}</span>}
       </InputGroupButton>
     );
   };
@@ -1158,86 +1057,13 @@ export function ChatView() {
       )}
       {modeToggle(
         "council",
-        "Council",
-        "Model Council - several models answer, the selected model writes the verdict",
+        "Discuss",
+        "Discuss mode - a panel of agents deliberates and the chairman synthesizes the answer",
         <UsersRound />,
         "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
       )}
     </>
   );
-
-  const learnSelectors = chatMode === "learn" ? (
-    <>
-      <Select value={learnLevel} onValueChange={(value) => updateLearnPreferences(value as LearnLevel, learnSubject)}>
-        <SelectTrigger
-          size="sm"
-          aria-label="Choose learn level"
-          title="Choose the learner level"
-          className="h-6 gap-1 rounded-[calc(var(--radius)-5px)] border-0 bg-blue-500/15 px-2 text-blue-500 shadow-none hover:bg-blue-500/25 hover:text-blue-500 dark:bg-blue-500/15 dark:hover:bg-blue-500/25 [&_svg:not([class*='size-'])]:size-3.5"
-        >
-          <GraduationCap />
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent position="popper" side="top" align="start" sideOffset={4}>
-          {LEARN_LEVELS.map((level) => (
-            <SelectItem key={level.value} value={level.value}>
-              {level.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-      <Select value={learnSubject} onValueChange={(value) => updateLearnPreferences(learnLevel, value as LearnSubject)}>
-        <SelectTrigger
-          size="sm"
-          aria-label="Choose learn subject"
-          title="Choose the subject to learn"
-          className="h-6 gap-1 rounded-[calc(var(--radius)-5px)] border-0 bg-blue-500/15 px-2 text-blue-500 shadow-none hover:bg-blue-500/25 hover:text-blue-500 dark:bg-blue-500/15 dark:hover:bg-blue-500/25 [&_svg:not([class*='size-'])]:size-3.5"
-        >
-          <Globe />
-          <SelectValue />
-        </SelectTrigger>
-        <SelectContent position="popper" side="top" align="start" sideOffset={4}>
-          {LEARN_SUBJECTS.map((subject) => (
-            <SelectItem key={subject.value} value={subject.value}>
-              {subject.label}
-            </SelectItem>
-          ))}
-        </SelectContent>
-      </Select>
-    </>
-  ) : null;
-
-  const councilPicker = chatMode === "council" ? (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <InputGroupButton
-          size="xs"
-          variant="ghost"
-          aria-label="Choose council models"
-          title="Choose which models sit on the council"
-          className="bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500"
-        >
-          <UsersRound />
-          Council ({council.councilModels.length})
-        </InputGroupButton>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent side="top" align="start" className="max-h-72 min-w-56 overflow-y-auto">
-        {allModels.length === 0 ? (
-          <DropdownMenuItem disabled>No models — add a provider in Settings</DropdownMenuItem>
-        ) : (
-          allModels.map((m) => (
-            <DropdownMenuCheckboxItem
-              key={m.id}
-              checked={council.councilModels.includes(m.name)}
-              onCheckedChange={() => council.toggleModel(m.name)}
-            >
-              {m.displayName || m.name} ({m.providerName})
-            </DropdownMenuCheckboxItem>
-          ))
-        )}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  ) : null;
 
   const renderMessage = (msg: ChatMessage) => {
     const { siblings, currentIndex } = getSiblings(nodeMap, msg, roots);
@@ -1309,7 +1135,7 @@ export function ChatView() {
                 msg.content && (
                   <Bubble>
                     <BubbleContent>
-                      <MarkdownRenderer content={msg.content} />
+                      <MarkdownRenderer content={msg.content} onOpenArtifact={handleOpenArtifactFromContent} />
                     </BubbleContent>
                   </Bubble>
                 )
@@ -1364,53 +1190,36 @@ export function ChatView() {
         ) : (
           <Message>
             <MessageContent>
-              {msg.reasoning && (
-                <div className="mb-1">
-                  <button
-                    onClick={() =>
-                      setExpandedReasoning((prev) => {
-                        const next = new Set(prev);
-                        if (next.has(msg.id)) next.delete(msg.id);
-                        else next.add(msg.id);
-                        return next;
-                      })
-                    }
-                    className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    <Brain className="size-3.5" />
-                    <span>Thinking</span>
-                    {expandedReasoning.has(msg.id) ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
-                  </button>
-                  {expandedReasoning.has(msg.id) && (
-                    <div className="mt-1 rounded-lg border bg-muted/30 p-3 max-h-60 overflow-y-auto">
-                      <MarkdownRenderer content={msg.reasoning} className="text-xs text-muted-foreground" />
-                    </div>
-                  )}
-                </div>
-              )}
-              <Bubble variant="ghost">
-                <BubbleContent>
-                  {isRaw ? (
+              {isRaw ? (
+                <Bubble variant="ghost">
+                  <BubbleContent>
                     <pre className="whitespace-pre-wrap text-xs font-mono">
                       {msg.content}
                     </pre>
-                  ) : (
-                    <MarkdownRenderer content={msg.content} />
-                  )}
-                </BubbleContent>
-              </Bubble>
+                  </BubbleContent>
+                </Bubble>
+              ) : (
+                <MessageStream
+                  content={msg.content}
+                  activities={msg.activities}
+                  reasoning={msg.reasoning}
+                  reasoningStreams={msg.reasoningStreams}
+                  onOpenArtifact={handleOpenArtifactFromContent}
+                />
+              )}
               {(() => {
-                const arts = extractArtifacts(msg.content);
-                if (arts.length === 0) return null;
+                const persisted = msg.artifacts ?? [];
+                if (persisted.length === 0) return null;
+                const arts = persisted;
                 return (
-                  <div className="mb-1 flex flex-wrap gap-1.5">
-                    {arts.map((a) => (
+                  <div className="mb-1 flex flex-col gap-1.5">
+                    {arts.map((a, i) => (
                       <button
                         key={a.id}
-                        onClick={() => setArtifactPanel({ artifacts: arts, activeIndex: a.index })}
-                        className="flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs transition-colors hover:bg-accent"
+                        onClick={() => { setArtifactPanel({ artifacts: arts, activeIndex: i }); setArtifactWindowMode("open"); }}
+                        className="flex w-full items-center gap-2 rounded-lg border px-4 py-3 text-sm transition-opacity hover:bg-accent"
                       >
-                        <FileCode className="size-3.5 text-muted-foreground" />
+                        <FileCode className="size-4 shrink-0 text-muted-foreground" />
                         <span className="font-medium">{a.title}</span>
                         <span className="text-muted-foreground">{a.language}</span>
                       </button>
@@ -1448,7 +1257,7 @@ export function ChatView() {
                   onClick={() => handleRegenerate(msg)}
                   aria-label="Regenerate response"
                   title="Regenerate"
-                  disabled={isThinking}
+                  disabled={agent?.isRunning}
                 >
                   <RotateCcw />
                 </Button>
@@ -1492,20 +1301,332 @@ export function ChatView() {
       <AppSidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
+        view={view}
+        settingsTab={settingsTab}
         onSelectSession={selectSession}
         onNewChat={handleNewChat}
         onDeleteChat={handleDeleteSession}
         onRenameChat={(id, title) => updateSession(id, { title })}
-        onSettings={() => setSettingsOpen(true)}
-        onProjects={() => setProjectsOpen(true)}
-        onHistory={() => setHistoryOpen(true)}
+        onSettings={openSettings}
+        onSettingsTabChange={setSettingsTab}
+        onExitSettings={() => setView("chat")}
+        onProjects={() => setView("projects")}
+        onHistory={() => setView("history")}
         onComingSoon={comingSoon}
         projects={projects}
+        runningIds={runningIds}
       />
 
-      <SidebarTrigger className="fixed left-18 top-1.5 z-50 size-4.5 [&_svg]:size-3 hover:bg-accent hover:text-accent-foreground peer-data-[state=expanded]:text-sidebar-foreground peer-data-[state=expanded]:hover:bg-sidebar-accent peer-data-[state=expanded]:hover:text-sidebar-accent-foreground" />
+      <SidebarTrigger
+        className="fixed left-18 top-1.5 z-50 size-4.5 [&_svg]:size-3 hover:bg-accent hover:text-accent-foreground peer-data-[state=expanded]:text-sidebar-foreground peer-data-[state=expanded]:hover:bg-sidebar-accent peer-data-[state=expanded]:hover:text-sidebar-accent-foreground"
+        onClick={() => {
+          if (artifactPanel && artifactWindowMode !== "minimized") {
+            setArtifactWindowMode("minimized");
+          }
+        }}
+      />
 
       <SidebarInset>
+        {view === "settings" ? (
+          <div
+            key="settings-view"
+            className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-right-3 duration-300"
+          >
+            <header
+              data-tauri-drag-region
+              onMouseDown={startDrag}
+              className="relative flex h-10 shrink-0 select-none items-center px-4"
+            >
+              <span className="absolute left-1/2 -translate-x-1/2 text-sm font-medium">
+                Settings
+              </span>
+            </header>
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-4 sm:px-8">
+              <SettingsView activeTab={settingsTab} />
+            </div>
+          </div>
+        ) : view === "projects" ? (
+          <div
+            key="projects-view"
+            className="relative flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-right-3 duration-300"
+          >
+            <PatternBackground pattern={settings.backgroundPattern} />
+            <header
+              data-tauri-drag-region
+              onMouseDown={startDrag}
+              className="relative flex h-10 shrink-0 select-none items-center px-4"
+            >
+              <span className="absolute left-1/2 -translate-x-1/2 text-sm font-medium">
+                Projects
+              </span>
+            </header>
+            <div className="relative min-h-0 flex-1 overflow-y-auto px-4 pt-4 sm:px-8">
+              <div className="mx-auto flex w-full max-w-4xl flex-col gap-4 pb-8">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="text-sm text-muted-foreground">
+                    Organize your conversations into projects.
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <div className="relative">
+                      <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        value={projectSearch}
+                        onChange={(e) => setProjectSearch(e.target.value)}
+                        placeholder="Search projects..."
+                        className="h-9 w-56 pl-9"
+                      />
+                    </div>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setShowNewProjectCard(true);
+                        setNewProjectName("");
+                        setNewProjectInstructions("");
+                      }}
+                    >
+                      <Plus />
+                      New Project
+                    </Button>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  {showNewProjectCard && (
+                    <Card className="col-span-2 gap-0 py-0">
+                      <CardHeader className="py-4">
+                        <div className="flex flex-col gap-3">
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm font-medium">New Project</span>
+                            <Button
+                              variant="ghost"
+                              size="icon-xs"
+                              onClick={() => setShowNewProjectCard(false)}
+                              aria-label="Cancel"
+                            >
+                              <X />
+                            </Button>
+                          </div>
+                          <Input
+                            autoFocus
+                            value={newProjectName}
+                            onChange={(e) => setNewProjectName(e.target.value)}
+                            placeholder="Project name (required)"
+                          />
+                          <Textarea
+                            value={newProjectInstructions}
+                            onChange={(e) => setNewProjectInstructions(e.currentTarget.value)}
+                            placeholder="Instructions for the AI..."
+                            className="min-h-24 text-xs"
+                          />
+                          <div className="flex justify-end gap-2">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              onClick={() => setShowNewProjectCard(false)}
+                            >
+                              Cancel
+                            </Button>
+                            <Button
+                              size="sm"
+                              disabled={!newProjectName.trim()}
+                              onClick={async () => {
+                                try {
+                                  await createProject(
+                                    newProjectName.trim(),
+                                    "",
+                                    newProjectInstructions.trim(),
+                                  );
+                                  setShowNewProjectCard(false);
+                                } catch {
+                                  toast.error("Failed to create project");
+                                }
+                              }}
+                            >
+                              Create
+                            </Button>
+                          </div>
+                        </div>
+                      </CardHeader>
+                    </Card>
+                  )}
+                  {projects
+                    .filter((p) =>
+                      p.name.toLowerCase().includes(projectSearch.toLowerCase()) ||
+                      p.description.toLowerCase().includes(projectSearch.toLowerCase())
+                    )
+                    .map((project) => (
+                      <Card key={project.id} className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent/50" onClick={() => {
+                        setActiveTab("chat");
+                        setActiveSessionId(null);
+                        setActiveProjectId(project.id);
+                        setView("chat");
+                      }}>
+                        <CardHeader className="py-4">
+                          <div className="flex items-start justify-between gap-2">
+                            <div className="flex flex-col gap-1">
+                              <CardTitle className="text-sm">{project.name}</CardTitle>
+                              <CardDescription>{project.description}</CardDescription>
+                            </div>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  className="shrink-0"
+                                  aria-label="More options"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <MoreHorizontal />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end">
+                                <DropdownMenuItem
+                                  variant="destructive"
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    try {
+                                      await deleteProject(project.id);
+                                      refetchProjects();
+                                    } catch {
+                                      toast.error("Failed to delete project");
+                                    }
+                                  }}
+                                >
+                                  <Trash2 />
+                                  Delete
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </div>
+                        </CardHeader>
+                        <CardContent className="pb-4 pt-0">
+                          <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs text-secondary-foreground">
+                            {sessions.filter((s) => s.projectId === project.id).length} chats
+                          </span>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  {projects.filter((p) =>
+                    p.name.toLowerCase().includes(projectSearch.toLowerCase()) ||
+                    p.description.toLowerCase().includes(projectSearch.toLowerCase())
+                  ).length === 0 && (
+                    <div className="col-span-2 py-8 text-center text-sm text-muted-foreground">
+                      {projectSearch ? "No projects match your search." : "No projects yet. Create one to get started."}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : view === "history" ? (
+          <div
+            key="history-view"
+            className="relative flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-right-3 duration-300"
+          >
+            <PatternBackground pattern={settings.backgroundPattern} />
+            <header
+              data-tauri-drag-region
+              onMouseDown={startDrag}
+              className="relative flex h-10 shrink-0 select-none items-center px-4"
+            >
+              <span className="absolute left-1/2 -translate-x-1/2 text-sm font-medium">
+                History
+              </span>
+            </header>
+            <div className="relative min-h-0 flex-1 overflow-y-auto px-4 pt-4 sm:px-8">
+              <div className="mx-auto flex w-full max-w-4xl flex-col gap-4 pb-8">
+                <div className="flex items-center justify-end gap-2">
+                  <div className="relative">
+                    <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={historySearch}
+                      onChange={(e) => setHistorySearch(e.target.value)}
+                      placeholder="Search history..."
+                      className="h-9 w-56 pl-9"
+                    />
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      handleNewChat();
+                    }}
+                  >
+                    <Plus />
+                    New Chat
+                  </Button>
+                </div>
+                <div className="flex flex-col gap-2">
+                  {sessions
+                    .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+                    .filter((s) =>
+                      s.title.toLowerCase().includes(historySearch.toLowerCase())
+                    )
+                    .map((session) => (
+                      <Card key={session.id} className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent" onClick={() => {
+                        selectSession(session.id);
+                      }}>
+                        <CardHeader className="flex items-center justify-between py-3.5">
+                          <span className="truncate text-sm font-medium">
+                            {session.title}
+                          </span>
+                          <div className="ml-4 flex shrink-0 items-center gap-2">
+                            <span className="text-xs text-muted-foreground">
+                              {session.updatedAt.toLocaleDateString([], {
+                                month: "short",
+                                day: "numeric",
+                              })}{" "}
+                              {formatTime(session.updatedAt)}
+                            </span>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon-xs"
+                                  className="shrink-0"
+                                  aria-label="More options"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <MoreHorizontal />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end">
+                                <DropdownMenuItem onClick={(e) => { e.stopPropagation(); setHistoryRenameDraft(session.title); setRenamingHistory({ id: session.id, title: session.title }); }}>
+                                  <Pencil />
+                                  Rename
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  variant="destructive"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleDeleteSession(session.id);
+                                  }}
+                                >
+                                  <Trash2 />
+                                  Delete
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                          </div>
+                        </CardHeader>
+                      </Card>
+                    ))}
+                  {sessions
+                    .filter((s) =>
+                      s.title.toLowerCase().includes(historySearch.toLowerCase())
+                    ).length === 0 && (
+                    <p className="py-8 text-center text-sm text-muted-foreground">
+                      {historySearch ? "No conversations match your search." : "No conversation history yet."}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : (
+        <div className="relative flex min-h-0 flex-1 flex-col">
+        {!activeSession && <PatternBackground pattern={settings.backgroundPattern} />}
         <header
           data-tauri-drag-region
           onMouseDown={startDrag}
@@ -1588,15 +1709,8 @@ export function ChatView() {
 
         <div className="flex min-h-0 flex-1 flex-col">
         {activeSession ? (
-          <div className="relative flex min-h-0 flex-1 flex-col">
-            {artifactPanel && (
-              <ArtifactPanel
-                artifacts={artifactPanel.artifacts}
-                activeIndex={artifactPanel.activeIndex}
-                onSelectIndex={(i) => setArtifactPanel((prev) => prev ? { ...prev, activeIndex: i } : null)}
-                onClose={() => setArtifactPanel(null)}
-              />
-            )}
+          <div ref={sessionContainerRef} className="relative flex min-h-0 flex-1 gap-2 overflow-hidden p-2">
+            <div className={`relative flex min-h-0 min-w-0 flex-1 flex-col transition-[flex] duration-300 ease-out${artifactWindowMode === "expanded" ? " hidden" : ""}`}>
             <MessageScrollerProvider
               autoScroll
               defaultScrollPosition="last-anchor"
@@ -1605,119 +1719,38 @@ export function ChatView() {
               <MessageScroller className="flex-1">
                 <MessageScrollerViewport>
                   <MessageScrollerContent className="mx-auto w-full max-w-3xl px-4 py-6">
-                    {activePath.map((node) => renderMessage(node.message))}
+                    {activePath.map((node) => {
+                      // Hide the in-progress assistant message while its live
+                      // streaming bubble (below) is showing the same run.
+                      if (
+                        agent?.isRunning &&
+                        node.message.id === inProgressMsgIds.current.get(activeSessionId ?? "")
+                      ) {
+                        return null;
+                      }
+                      return renderMessage(node.message);
+                    })}
 
-                    {isThinking && (
-                      council.isRunning ? (
-                        <MessageScrollerItem messageId="model-council">
-                          <Message>
-                            <MessageContent>
-                              <div className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
-                                <UsersRound className="size-3.5" />
-                                <span className="shimmer">
-                                  {council.phase === "verdict"
-                                    ? "Council chair is writing the verdict…"
-                                    : `Council deliberating — ${council.members.filter((m) => m.status === "done").length}/${council.members.length} responses in…`}
-                                </span>
-                              </div>
-                              <div className="mb-2 grid gap-2 sm:grid-cols-2">
-                                {council.members.map((member) => (
-                                  <div key={member.model} className="rounded-lg border bg-muted/30 p-3">
-                                    <div className="mb-1 flex items-center gap-1.5 text-xs font-medium">
-                                      {member.status === "done" ? (
-                                        <Check className="size-3 text-emerald-500" />
-                                      ) : member.status === "error" ? (
-                                        <X className="size-3 text-red-500" />
-                                      ) : (
-                                        <Spinner className="size-3" />
-                                      )}
-                                      <span className="truncate">
-                                        {allModels.find((m) => m.name === member.model)?.displayName || member.model}
-                                      </span>
-                                      <span className="ml-auto shrink-0 truncate text-[10px] text-muted-foreground">
-                                        {member.providerName}
-                                      </span>
-                                    </div>
-                                    <div className="max-h-24 overflow-hidden whitespace-pre-wrap text-xs text-muted-foreground">
-                                      {member.error || member.content || (member.status === "pending" ? "Waiting…" : "")}
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                              {council.phase === "verdict" && council.verdict && (
-                                <Bubble variant="ghost">
-                                  <BubbleContent>
-                                    <MarkdownRenderer content={council.verdict} />
-                                  </BubbleContent>
-                                </Bubble>
-                              )}
-                            </MessageContent>
-                          </Message>
-                        </MessageScrollerItem>
-                      ) : (
-                        <MessageScrollerItem messageId="thinking">
-                          <Message>
-                            <MessageContent>
-                              {streamingReasoning && !streamingContent && (
-                                <button
-                                  onClick={() => setShowThinkingProcess((prev) => !prev)}
-                                  className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                                >
-                                  <Brain className="size-3.5" />
-                                  <span className="shimmer">Thinking…</span>
-                                  {showThinkingProcess ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
-                                </button>
-                              )}
-                              {streamingReasoning && showThinkingProcess && !streamingContent && (
-                                <div className="mt-1 mb-2 rounded-lg border bg-muted/30 p-3 max-h-60 overflow-y-auto">
-                                  <MarkdownRenderer content={streamingReasoning} className="text-xs text-muted-foreground" />
-                                </div>
-                              )}
-                              {streamingContent ? (
-                                <Bubble variant="ghost">
-                                  <BubbleContent>
-                                    <MarkdownRenderer content={streamingContent} />
-                                  </BubbleContent>
-                                </Bubble>
-                              ) : !streamingReasoning ? (
-                                <Marker role="status">
-                                  <MarkerIcon>
-                                    <Spinner />
-                                  </MarkerIcon>
-                                  <MarkerContent className="shimmer">
-                                    Thinking…
-                                  </MarkerContent>
-                                </Marker>
-                              ) : null}
-                            </MessageContent>
-                          </Message>
-                        </MessageScrollerItem>
-                      )
-                    )}
-
-                    {deepResearch.isRunning && (
-                      <MessageScrollerItem messageId="deep-research">
+                    {agent?.isRunning && (
+                      <MessageScrollerItem messageId="thinking">
                         <Message>
                           <MessageContent>
-                            {deepResearch.streamingReport ? (
-                              <>
-                                <div className="mb-2 flex items-center gap-1.5 text-xs text-muted-foreground">
-                                  <Telescope className="size-3.5" />
-                                  <span className="shimmer">{deepResearch.statusLabel ?? "Writing report…"}</span>
-                                </div>
-                                <Bubble variant="ghost">
-                                  <BubbleContent>
-                                    <MarkdownRenderer content={deepResearch.streamingReport} />
-                                  </BubbleContent>
-                                </Bubble>
-                              </>
+                            {agent?.streamingContent || agent?.streamingReasoning || agent?.activities.length > 0 ? (
+                              <MessageStream
+                                content={agent?.streamingContent}
+                                activities={agent?.activities}
+                                reasoning={agent?.streamingReasoning}
+                                reasoningStreams={agent?.reasoningStreams}
+                                todos={agent?.todos}
+                                live
+                              />
                             ) : (
                               <Marker role="status">
                                 <MarkerIcon>
                                   <Spinner />
                                 </MarkerIcon>
                                 <MarkerContent className="shimmer">
-                                  {deepResearch.statusLabel ?? "Researching…"}
+                                  Thinking…
                                 </MarkerContent>
                               </Marker>
                             )}
@@ -1765,6 +1798,24 @@ export function ChatView() {
                   </AttachmentGroup>
                 )}
 
+                {agent?.pendingInput ? (
+                  <StructuredInputForm
+                    request={agent?.pendingInput}
+                    onSubmit={(values) => agent?.submitInput(values)}
+                    onSwitchToText={() => agent?.skipInput()}
+                  />
+                ) : agent?.pendingSuggestion ? (
+                  <SuggestionCard
+                    suggestion={agent.pendingSuggestion}
+                    onDismiss={() => agent?.dismissSuggestion()}
+                    onInstallSkill={installSkillByName}
+                    onOpenConnectors={() => {
+                      setSettingsTab("connectors");
+                      setView("settings");
+                    }}
+                    onEnableMode={(mode) => setChatMode(mode)}
+                  />
+                ) : (
                 <InputGroup className={isTemporary ? "border-dashed" : undefined}>
                   <InputGroupTextarea
                     value={inputText}
@@ -1836,8 +1887,6 @@ export function ChatView() {
                       </InputGroupButton>
                     )}
                     {modeToggles}
-                    {learnSelectors}
-                    {councilPicker}
                     <input
                       ref={fileInputRef}
                       type="file"
@@ -1858,23 +1907,13 @@ export function ChatView() {
 
                     {modelSelect()}
 
-                    {isThinking ? (
+                    {agent?.isRunning ? (
                       <InputGroupButton
                         variant="outline"
                         size="icon-xs"
                         className="rounded-lg"
                         onClick={handleStop}
                         aria-label="Stop generation"
-                      >
-                        <span className="size-3 rounded-sm bg-current" />
-                      </InputGroupButton>
-                    ) : deepResearch.isRunning ? (
-                      <InputGroupButton
-                        variant="outline"
-                        size="icon-xs"
-                        className="rounded-lg"
-                        onClick={deepResearch.cancel}
-                        aria-label="Cancel Deep Research"
                       >
                         <span className="size-3 rounded-sm bg-current" />
                       </InputGroupButton>
@@ -1885,7 +1924,7 @@ export function ChatView() {
                         className="rounded-lg"
                         onClick={handleModeSend}
                         disabled={
-                          (!inputText.trim() && files.length === 0) || isThinking
+                          (!inputText.trim() && files.length === 0) || agent?.isRunning
                         }
                         aria-label="Send message"
                       >
@@ -1894,15 +1933,66 @@ export function ChatView() {
                     )}
                   </InputGroupAddon>
                 </InputGroup>
+                )}
 
                 <p className="mt-2 text-center text-xs text-muted-foreground">
                   ChatUI can make mistakes. Check important information.
                 </p>
               </div>
             </div>
+            </div>
+            {artifactPanel && artifactWindowMode !== "minimized" && artifactWindowMode !== "expanded" && (
+              <div
+                className="flex w-1.5 shrink-0 cursor-col-resize items-center justify-center rounded-full transition-colors hover:bg-primary/20 active:bg-primary/40"
+                onMouseDown={startArtifactDrag}
+              >
+                <div className="h-8 w-0.5 rounded-full bg-border" />
+              </div>
+            )}
+            {artifactPanel && (
+              <div
+                className={
+                  artifactWindowMode === "minimized"
+                    ? "absolute right-0 top-2 bottom-2 z-40 max-w-[80vw] cursor-pointer animate-in slide-in-from-right duration-300"
+                    : "relative h-full max-w-[80vw] shrink-0 animate-in slide-in-from-right duration-300"
+                }
+                style={{
+                  width: artifactWindowMode === "minimized"
+                    ? "70%"
+                    : artifactWindowMode === "expanded"
+                      ? "100%"
+                      : artifactWidth !== null
+                        ? `${(artifactWidth / (sessionContainerRef.current?.getBoundingClientRect().width ?? 1)) * 100}%`
+                        : "70%",
+                  // Cap the artifact so the chat column keeps its minimum width
+                  // and the composer never overflows. The minimized overlay is
+                  // absolute-positioned and does not squeeze the chat column.
+                  // When expanded, allow full width (chat column is hidden).
+                  maxWidth: artifactWindowMode === "minimized"
+                    ? undefined
+                    : artifactWindowMode === "expanded"
+                      ? "100%"
+                      : `max(280px, calc(100% - ${CHAT_MIN_WIDTH_PX + ARTIFACT_ROW_OVERHEAD_PX}px))`,
+                  transform: artifactWindowMode === "minimized" ? "translateX(88%) scale(0.95)" : undefined,
+                  opacity: artifactWindowMode === "minimized" ? 0.35 : 1,
+                  transition: "transform 300ms ease, opacity 300ms ease, width 300ms ease",
+                }}
+                onClick={artifactWindowMode === "minimized" ? () => setArtifactWindowMode("open") : undefined}
+              >
+                <ArtifactPanel
+                  artifacts={artifactPanel.artifacts}
+                  activeIndex={artifactPanel.activeIndex}
+                  onSelectIndex={(i) => setArtifactPanel((prev) => prev ? { ...prev, activeIndex: i } : null)}
+                  onClose={() => { setArtifactPanel(null); setArtifactWindowMode("open"); }}
+                  windowMode={artifactWindowMode}
+                  onMinimize={() => setArtifactWindowMode((prev) => prev === "minimized" ? "open" : "minimized")}
+                  onExpand={() => setArtifactWindowMode((prev) => prev === "expanded" ? "open" : "expanded")}
+                />
+              </div>
+            )}
           </div>
         ) : activeProject ? (
-          <div className="flex min-h-0 flex-1 flex-col">
+        <div className="relative flex min-h-0 flex-1 flex-col">
             <div className="flex min-h-0 flex-1">
               <div className="flex flex-col w-2/3 min-h-0 border-r">
                 <div className="shrink-0 p-4">
@@ -1914,7 +2004,7 @@ export function ChatView() {
                         if (settings.sendOnEnter && e.key === "Enter" && !e.shiftKey) {
                           e.preventDefault();
                           const text = projectInputText.trim();
-                          if (!text || isThinking) return;
+                          if (!text || agent?.isRunning) return;
                           setProjectInputText("");
                           handleProjectModeSend(text);
                         }
@@ -1924,8 +2014,6 @@ export function ChatView() {
                     />
                     <InputGroupAddon align="block-end">
                       {modeToggles}
-                      {learnSelectors}
-                      {councilPicker}
                       <div className="flex-1" />
                       {modelSelect()}
                       <InputGroupButton
@@ -1934,11 +2022,11 @@ export function ChatView() {
                         className="rounded-lg"
                         onClick={() => {
                           const text = projectInputText.trim();
-                          if (!text || isThinking) return;
+                          if (!text || agent?.isRunning) return;
                           setProjectInputText("");
                           handleProjectModeSend(text);
                         }}
-                        disabled={!projectInputText.trim() || isThinking}
+                        disabled={!projectInputText.trim() || agent?.isRunning}
                         aria-label="Send message"
                       >
                         <ArrowUp />
@@ -2169,11 +2257,10 @@ export function ChatView() {
             />
           </div>
         ) : (
-          <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden bg-black px-4 pb-8">
-            <InteractiveGrid className="absolute inset-0" mode="chat" />
-            <h2 className="select-none cursor-default relative font--font-sans z-10 mb-12 text-center text-4xl text-white/70 welcome-fade-in">
+          <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-4 pb-8">
+            <h1 className="select-none cursor-default relative z-10 mb-12 text-center text-4xl font-semibold tracking-tight welcome-fade-in">
               {welcomePrompt}
-            </h2>
+            </h1>
             <div className="relative z-10 w-full max-w-3xl">
               {files.length > 0 && (
                 <AttachmentGroup className="mb-2">
@@ -2207,7 +2294,25 @@ export function ChatView() {
                 </AttachmentGroup>
               )}
 
-              <InputGroup className={`bg-white/5 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
+              {agent?.pendingInput ? (
+                <StructuredInputForm
+                  request={agent?.pendingInput}
+                  onSubmit={(values) => agent?.submitInput(values)}
+                  onSwitchToText={() => agent?.skipInput()}
+                />
+              ) : agent?.pendingSuggestion ? (
+                <SuggestionCard
+                  suggestion={agent.pendingSuggestion}
+                  onDismiss={() => agent?.dismissSuggestion()}
+                  onInstallSkill={installSkillByName}
+                  onOpenConnectors={() => {
+                    setSettingsTab("connectors");
+                    setView("settings");
+                  }}
+                  onEnableMode={(mode) => setChatMode(mode)}
+                />
+              ) : (
+              <InputGroup className={`bg-card/60 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
                 <InputGroupTextarea
                   value={inputText}
                   onChange={(e) => setInputText(e.currentTarget.value)}
@@ -2218,7 +2323,7 @@ export function ChatView() {
                     }
                   }}
                   placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything"}
-                  className="max-h-40 min-h-12 placeholder:text-white/30"
+                  className="max-h-40 min-h-12 placeholder:text-muted-foreground/60"
                 />
                 <InputGroupAddon align="block-end">
                   <DropdownMenu>
@@ -2278,8 +2383,6 @@ export function ChatView() {
                     </InputGroupButton>
                   )}
                   {modeToggles}
-                  {learnSelectors}
-                  {councilPicker}
                   <input
                     ref={fileInputRef}
                     type="file"
@@ -2298,25 +2401,15 @@ export function ChatView() {
 
                   <div className="flex-1" />
 
-                  {modelSelect("dark")}
+                  {modelSelect()}
 
-                  {isThinking ? (
+                  {agent?.isRunning ? (
                     <InputGroupButton
                       variant="outline"
                       size="icon-xs"
                       className="rounded-lg"
                       onClick={handleStop}
                       aria-label="Stop generation"
-                    >
-                      <span className="size-3 rounded-sm bg-current" />
-                    </InputGroupButton>
-                  ) : deepResearch.isRunning ? (
-                    <InputGroupButton
-                      variant="outline"
-                      size="icon-xs"
-                      className="rounded-lg"
-                      onClick={deepResearch.cancel}
-                      aria-label="Cancel Deep Research"
                     >
                       <span className="size-3 rounded-sm bg-current" />
                     </InputGroupButton>
@@ -2327,7 +2420,7 @@ export function ChatView() {
                       className="rounded-lg"
                       onClick={handleModeSend}
                       disabled={
-                        (!inputText.trim() && files.length === 0) || isThinking
+                        (!inputText.trim() && files.length === 0) || agent?.isRunning
                       }
                       aria-label="Send message"
                     >
@@ -2336,288 +2429,18 @@ export function ChatView() {
                   )}
                 </InputGroupAddon>
               </InputGroup>
+              )}
 
-              <p className="mt-2 text-center text-xs text-white/30 bg-black w-fit mx-auto">
+              <p className="mt-2 text-center text-xs text-foreground opacity-40 bg-background w-fit mx-auto">
                 AI can make mistakes. Check important information.
               </p>
             </div>
           </div>
         )}
         </div>
+        </div>
+        )}
       </SidebarInset>
-
-      <Dialog open={projectsOpen} onOpenChange={setProjectsOpen}>
-        <DialogContent>
-          <DialogHeader className="shrink-0 gap-0 pr-10">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex flex-col gap-1">
-                <DialogTitle className="flex items-center gap-2">
-                  <ChartColumnBig className="size-5" />
-                  Projects
-                </DialogTitle>
-                <DialogDescription>
-                  Organize your conversations into projects.
-                </DialogDescription>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="relative">
-                  <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    value={projectSearch}
-                    onChange={(e) => setProjectSearch(e.target.value)}
-                    placeholder="Search projects..."
-                    className="h-9 w-56 pl-9"
-                  />
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    setShowNewProjectCard(true);
-                    setNewProjectName("");
-                    setNewProjectInstructions("");
-                  }}
-                >
-                  <Plus />
-                  New Project
-                </Button>
-              </div>
-            </div>
-          </DialogHeader>
-          <div className="flex-1 overflow-y-auto">
-            <div className="grid grid-cols-2 gap-3 pb-1">
-              {showNewProjectCard && (
-                <Card className="col-span-2 gap-0 py-0">
-                  <CardHeader className="py-4">
-                    <div className="flex flex-col gap-3">
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm font-medium">New Project</span>
-                        <Button
-                          variant="ghost"
-                          size="icon-xs"
-                          onClick={() => setShowNewProjectCard(false)}
-                          aria-label="Cancel"
-                        >
-                          <X />
-                        </Button>
-                      </div>
-                      <Input
-                        autoFocus
-                        value={newProjectName}
-                        onChange={(e) => setNewProjectName(e.target.value)}
-                        placeholder="Project name (required)"
-                      />
-                      <Textarea
-                        value={newProjectInstructions}
-                        onChange={(e) => setNewProjectInstructions(e.currentTarget.value)}
-                        placeholder="Instructions for the AI..."
-                        className="min-h-24 text-xs"
-                      />
-                      <div className="flex justify-end gap-2">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => setShowNewProjectCard(false)}
-                        >
-                          Cancel
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={!newProjectName.trim()}
-                          onClick={async () => {
-                            try {
-                              await createProject(
-                                newProjectName.trim(),
-                                "",
-                                newProjectInstructions.trim(),
-                              );
-                              setShowNewProjectCard(false);
-                            } catch {
-                              toast.error("Failed to create project");
-                            }
-                          }}
-                        >
-                          Create
-                        </Button>
-                      </div>
-                    </div>
-                  </CardHeader>
-                </Card>
-              )}
-              {projects
-                .filter((p) =>
-                  p.name.toLowerCase().includes(projectSearch.toLowerCase()) ||
-                  p.description.toLowerCase().includes(projectSearch.toLowerCase())
-                )
-                .map((project) => (
-                  <Card key={project.id} className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent/50" onClick={() => {
-                    setActiveTab("chat");
-                    setActiveSessionId(null);
-                    setActiveProjectId(project.id);
-                    setProjectsOpen(false);
-                  }}>
-                    <CardHeader className="py-4">
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="flex flex-col gap-1">
-                          <CardTitle className="text-sm">{project.name}</CardTitle>
-                          <CardDescription>{project.description}</CardDescription>
-                        </div>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon-xs"
-                              className="shrink-0"
-                              aria-label="More options"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <MoreHorizontal />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            <DropdownMenuItem
-                              variant="destructive"
-                              onClick={async (e) => {
-                                e.stopPropagation();
-                                try {
-                                  await deleteProject(project.id);
-                                  refetchProjects();
-                                } catch {
-                                  toast.error("Failed to delete project");
-                                }
-                              }}
-                            >
-                              <Trash2 />
-                              Delete
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </div>
-                    </CardHeader>
-                    <CardContent className="pb-4 pt-0">
-                      <span className="rounded-full bg-secondary px-2.5 py-0.5 text-xs text-secondary-foreground">
-                        {sessions.filter((s) => s.projectId === project.id).length} chats
-                      </span>
-                    </CardContent>
-                  </Card>
-                ))}
-              {projects.filter((p) =>
-                p.name.toLowerCase().includes(projectSearch.toLowerCase()) ||
-                p.description.toLowerCase().includes(projectSearch.toLowerCase())
-              ).length === 0 && (
-                <div className="col-span-2 py-8 text-center text-sm text-muted-foreground">
-                  {projectSearch ? "No projects match your search." : "No projects yet. Create one to get started."}
-                </div>
-              )}
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
-        <DialogContent>
-          <DialogHeader className="shrink-0 gap-0 pr-10">
-            <div className="flex items-center justify-between gap-3">
-              <div className="flex flex-col gap-1">
-                <DialogTitle className="flex items-center gap-2">
-                  <GalleryVerticalEnd className="size-5" />
-                  History
-                </DialogTitle>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="relative">
-                  <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    value={historySearch}
-                    onChange={(e) => setHistorySearch(e.target.value)}
-                    placeholder="Search history..."
-                    className="h-9 w-56 pl-9"
-                  />
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => {
-                    handleNewChat();
-                    setHistoryOpen(false);
-                  }}
-                >
-                  <Plus />
-                  New Chat
-                </Button>
-              </div>
-            </div>
-          </DialogHeader>
-          <div className="flex-1 overflow-y-auto">
-            <div className="flex flex-col gap-2 pb-1">
-              {sessions
-                .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
-                .filter((s) =>
-                  s.title.toLowerCase().includes(historySearch.toLowerCase())
-                )
-                .map((session) => (
-                  <Card key={session.id} className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent" onClick={() => {
-                    selectSession(session.id);
-                    setHistoryOpen(false);
-                  }}>
-                    <CardHeader className="flex items-center justify-between py-3.5">
-                      <span className="truncate text-sm font-medium">
-                        {session.title}
-                      </span>
-                      <div className="ml-4 flex shrink-0 items-center gap-2">
-                        <span className="text-xs text-muted-foreground">
-                          {session.updatedAt.toLocaleDateString([], {
-                            month: "short",
-                            day: "numeric",
-                          })}{" "}
-                          {formatTime(session.updatedAt)}
-                        </span>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button
-                              variant="ghost"
-                              size="icon-xs"
-                              className="shrink-0"
-                              aria-label="More options"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              <MoreHorizontal />
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            <DropdownMenuItem onClick={(e) => { e.stopPropagation(); setHistoryRenameDraft(session.title); setRenamingHistory({ id: session.id, title: session.title }); }}>
-                              <Pencil />
-                              Rename
-                            </DropdownMenuItem>
-                            <DropdownMenuSeparator />
-                            <DropdownMenuItem
-                              variant="destructive"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleDeleteSession(session.id);
-                              }}
-                            >
-                              <Trash2 />
-                              Delete
-                            </DropdownMenuItem>
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      </div>
-                    </CardHeader>
-                  </Card>
-                ))}
-              {sessions
-                .filter((s) =>
-                  s.title.toLowerCase().includes(historySearch.toLowerCase())
-                ).length === 0 && (
-                <p className="py-8 text-center text-sm text-muted-foreground">
-                  {historySearch ? "No conversations match your search." : "No conversation history yet."}
-                </p>
-              )}
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
 
       <Dialog open={!!renamingHistory} onOpenChange={(open) => { if (!open) { setRenamingHistory(null); setHistoryRenameDraft(""); } }}>
         <DialogContent>
@@ -2664,7 +2487,6 @@ export function ChatView() {
         </DialogContent>
       </Dialog>
 
-      <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
     </SidebarProvider>
     </OpenCodeProvider>
   );
@@ -2673,51 +2495,12 @@ export function ChatView() {
     const provider = selectedModel ? findProviderForModel(selectedModel) : null;
     if (!provider) {
       toast.error("No provider configured. Add one in Settings.");
-      setSettingsOpen(true);
+      openSettings();
       return;
     }
 
-    if (chatMode === "council") {
-      if (council.councilModels.length < 2) {
-        toast.error("Council needs at least 2 models — pick more in the Council picker.");
-        return;
-      }
-      setIsThinking(true);
-      try {
-        const newSession = createSession(text.slice(0, 30), activeProject?.id);
-        setActiveSessionId(newSession.id);
-        setActiveProjectId(null);
-
-        await newSession.persisted;
-        const userMsg = await addMessage(newSession.id, "user", text, undefined, undefined, undefined, isTemporary);
-
-        const skillsContext = await loadInstalledSkillsPrompt();
-
-        pendingCouncilSessionRef.current = { sessionId: newSession.id, userMsgId: userMsg.id };
-        await council.start(
-          [{ role: "user" as const, content: text }],
-          currentProjectInstructions || undefined,
-          skillsContext,
-        );
-      } catch (err) {
-        toast.error(
-          err instanceof Error ? err.message : "Failed to start Model Council",
-        );
-      } finally {
-        pendingCouncilSessionRef.current = null;
-        setIsThinking(false);
-      }
-      return;
-    }
-
-    setIsThinking(true);
-    setStreamingContent("");
-    setStreamingReasoning("");
-    setShowThinkingProcess(false);
-
-    const learnContext = chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
-    const effectiveInstructions = [currentProjectInstructions, learnContext]
-      .filter(Boolean).join("\n\n") || undefined;
+    const mode: AgentMode =
+      chatMode === "research" ? "research" : chatMode === "council" ? "council" : "chat";
 
     try {
       const newSession = createSession(text.slice(0, 30), activeProject?.id);
@@ -2727,60 +2510,86 @@ export function ChatView() {
       await newSession.persisted;
       const userMsg = await addMessage(newSession.id, "user", text, undefined, undefined, undefined, isTemporary);
 
-      const completionMessages: ChatCompletionMessage[] = [
-        { role: "user" as const, content: text },
-      ];
+      const memoryContext = settings.autoMemory ? await buildMemoryContext(activeProject?.id ?? null, text) : "";
+      const learnContext = chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
+      const effectiveInstructions = [currentProjectInstructions, learnContext, memoryContext]
+        .filter(Boolean).join("\n\n") || undefined;
 
-      const controller = new AbortController();
-      setAbortController(controller);
+      const ctrl = getAgentController(newSession.id);
 
-      const tools = getAllTools(webFetchEnabled);
-      const skillsContext = await loadInstalledSkillsPrompt();
+      const assistantMsg = await addMessage(
+        newSession.id,
+        "assistant",
+        "",
+        selectedModel,
+        undefined,
+        userMsg.id,
+        isTemporary,
+      );
+      inProgressMsgIds.current.set(newSession.id, assistantMsg.id);
+      const saveInterval = setInterval(() => {
+        updateMessage(newSession.id, assistantMsg.id, {
+          content: ctrl.streamingContent,
+          reasoning: ctrl.streamingReasoning || undefined,
+          activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+          reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          artifacts: ctrl.artifacts.length ? [...ctrl.artifacts] : undefined,
+        });
+      }, 2500);
 
-      let fullResponse = "";
-      let fullReasoning = "";
+      let result: AgentRunResult;
       try {
-        for await (const chunk of streamChatCompletion(
+        result = await ctrl.run({
           provider,
-          selectedModel,
-          completionMessages,
-          controller.signal,
-          tools,
-          effectiveInstructions,
-          skillsContext,
-        )) {
-          if (chunk.content) {
-            fullResponse += chunk.content;
-            setStreamingContent(fullResponse);
-          }
-          if (chunk.reasoning) {
-            fullReasoning += chunk.reasoning;
-            setStreamingReasoning(fullReasoning);
-          }
-        }
-      } catch (err) {
-        if (controller.signal.aborted) {
-          if (fullResponse) {
-            await addMessage(newSession.id, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
-          }
-          return;
-        }
-        throw err;
+          modelName: selectedModel,
+          messages: [{ role: "user" as const, content: text }],
+          instructions: effectiveInstructions,
+          mode,
+          webFetchEnabled,
+          projectDir: currentProjectDirectory,
+          availableModels: allModels.map((m) => ({ name: m.name, providerId: m.providerId, displayName: m.displayName })),
+          providers,
+        });
+      } finally {
+        clearInterval(saveInterval);
+        inProgressMsgIds.current.delete(newSession.id);
       }
 
-      if (fullResponse) {
-        await addMessage(newSession.id, "assistant", fullResponse, selectedModel, undefined, userMsg.id, isTemporary, fullReasoning || undefined);
+      if ((mode === "research" || mode === "council") && result.completed) setChatMode("none");
+
+      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0;
+      if (hasOutput) {
+        updateMessage(newSession.id, assistantMsg.id, {
+          content: result.content,
+          reasoning: result.reasoning || undefined,
+          activities: result.activities,
+          reasoningStreams: result.reasoningStreams,
+          artifacts: result.artifacts?.length ? result.artifacts : undefined,
+        });
+
+        if (result.content) {
+          generateChatTitle(provider, selectedModel, text, result.content)
+          .then((title) => {
+            if (title) {
+              updateSession(newSession.id, { title });
+            }
+          })
+          .catch(() => {});
+        }
+
+        if (settings.autoMemory && !isTemporary && result.content) {
+          void extractAndSaveMemory(provider, selectedModel, text, result.content, "global", loadMemory("global"), newSession.id).catch(() => {});
+          if (activeProject?.id) {
+            void extractAndSaveMemory(provider, selectedModel, text, result.content, activeProject.id, loadMemory(activeProject.id), newSession.id).catch(() => {});
+          }
+        }
+      } else {
+        deleteMessage(newSession.id, assistantMsg.id);
       }
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to send message",
       );
-    } finally {
-      setIsThinking(false);
-      setStreamingContent("");
-      setStreamingReasoning("");
-      setShowThinkingProcess(false);
-      setAbortController(null);
     }
   }
 }

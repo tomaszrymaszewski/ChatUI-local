@@ -106,6 +106,7 @@ export const SUBJECT_GUIDANCE: Record<LearnSubject, string> = {
 export function buildLearnSystemPrompt(level: LearnLevel, subject: LearnSubject): string {
   return [
     "You are in Learn mode: your role is a patient, encouraging tutor, not just an answer engine. Prioritize the learner's understanding over speed or brevity, and adapt pacing to their responses.",
+    `Unless the learner has already stated their level and subject in this conversation, begin by asking them what level they are (beginner, intermediate, or advanced) and what subject they are exploring. Use their answer to guide your teaching for the rest of the conversation. If they have already stated it, proceed directly.`,
     LEVEL_GUIDANCE[level],
     SUBJECT_GUIDANCE[subject],
     TUTOR_STRUCTURE,

@@ -75,3 +75,56 @@ export function extractArtifacts(content: string): Artifact[] {
 export function isPreviewable(language: string): boolean {
   return ["html", "svg", "markdown", "md"].includes(language.toLowerCase());
 }
+
+export function isRunnable(language: string): boolean {
+  return ["python", "py"].includes(language.toLowerCase());
+}
+
+export function isReactPreviewable(language: string): boolean {
+  return ["jsx", "tsx"].includes(language.toLowerCase());
+}
+
+// ─── Edit overrides ────────────────────────────────────────────────────────
+// Artifacts are re-derived from message content on every render, so edits
+// made in the panel are kept in a session-scoped store keyed by the original
+// (as-extracted) artifact.
+
+function hashString(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  }
+  return h.toString(36);
+}
+
+const overrides = new Map<string, string>();
+
+function overrideKey(a: Pick<Artifact, "language" | "content">): string {
+  return `${a.language}:${hashString(a.content)}`;
+}
+
+export function getArtifactOverride(
+  a: Pick<Artifact, "language" | "content">,
+): string | undefined {
+  return overrides.get(overrideKey(a));
+}
+
+export function setArtifactOverride(
+  a: Pick<Artifact, "language" | "content">,
+  content: string,
+): void {
+  overrides.set(overrideKey(a), content);
+}
+
+export function clearArtifactOverride(
+  a: Pick<Artifact, "language" | "content">,
+): void {
+  overrides.delete(overrideKey(a));
+}
+
+export function isArtifactModified(
+  a: Pick<Artifact, "language" | "content">,
+): boolean {
+  const override = overrides.get(overrideKey(a));
+  return override !== undefined && override !== a.content;
+}

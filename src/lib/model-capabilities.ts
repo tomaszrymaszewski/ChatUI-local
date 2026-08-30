@@ -8,6 +8,7 @@ interface ModelsDevModel {
   id?: string;
   name?: string;
   modalities?: { input?: string[]; output?: string[] };
+  limit?: { context?: number; output?: number };
 }
 
 type ModelsDevCatalog = Record<string, {
@@ -64,6 +65,7 @@ function providerKeyForBaseUrl(baseUrl: string): string | null {
   if (u.includes("groq.com")) return "groq";
   if (u.includes("mistral.ai")) return "mistral";
   if (u.includes("localhost:11434") || u.includes("ollama")) return "ollama";
+  if (u.includes("localhost:1234") || u.includes("lmstudio")) return "lmstudio";
   if (u.includes("x.ai")) return "xai";
   if (u.includes("deepseek.com")) return "deepseek";
   return null;
@@ -161,4 +163,26 @@ export function getModelCapabilitiesSync(provider: Provider, modelName: string):
     }
   }
   return { vision: heuristicVision(modelName), source: "heuristic" };
+}
+
+/**
+ * Best-effort context-window size (tokens) from the models.dev catalog.
+ * Returns null when unknown — callers should apply their own fallback.
+ */
+export async function getModelContextWindow(
+  provider: Provider,
+  modelName: string,
+): Promise<number | null> {
+  const providerKey = providerKeyForBaseUrl(provider.baseUrl);
+  if (!providerKey) return null;
+  const catalog = await getModelsDevCatalog();
+  const models = catalog?.[providerKey]?.models;
+  if (!models) return null;
+  const entry =
+    models[modelName] ??
+    Object.values(models).find(
+      (m) => m.id === modelName || m.name?.toLowerCase() === modelName.toLowerCase(),
+    );
+  const ctx = entry?.limit?.context;
+  return typeof ctx === "number" && ctx > 0 ? ctx : null;
 }

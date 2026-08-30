@@ -1,5 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import type { Message } from "@/types";
+import type { ActivityItem, ReasoningStream } from "@/lib/agent/types";
+import type { Artifact } from "@/lib/artifacts";
 
 function storageKey(sessionId: string) {
   return `chatui:messages:${sessionId}`;
@@ -20,6 +22,9 @@ function loadMessages(sessionId: string): Message[] {
       parent_id?: string | null;
       is_temporary?: boolean;
       reasoning?: string;
+      reasoningStreams?: ReasoningStream[];
+      activities?: ActivityItem[];
+      artifacts?: Artifact[];
     }>;
     return data.map((m) => ({
       id: m.id,
@@ -32,6 +37,14 @@ function loadMessages(sessionId: string): Message[] {
       parent_id: m.parent_id ?? null,
       is_temporary: m.is_temporary ?? false,
       reasoning: m.reasoning,
+      reasoningStreams: m.reasoningStreams,
+      artifacts: m.artifacts,
+      // A message loaded from storage is never mid-run, so any activity that was
+      // still "running" when the app quit/crashed is settled to "done" to avoid
+      // permanently-pulsing chips and stuck-open sub-agent boxes.
+      activities: m.activities?.map((a) =>
+        a.status === "running" ? { ...a, status: "done" as const } : a,
+      ),
     }));
   } catch {
     return [];
@@ -53,6 +66,9 @@ function saveMessages(sessionId: string, messages: Message[]) {
         parent_id: m.parent_id,
         is_temporary: m.is_temporary,
         reasoning: m.reasoning,
+        reasoningStreams: m.reasoningStreams,
+        activities: m.activities,
+        artifacts: m.artifacts,
       })),
     ),
   );
@@ -82,6 +98,8 @@ export function useMessages(sessionId: string | null) {
       parentId?: string | null,
       isTemporary?: boolean,
       reasoning?: string,
+      activities?: ActivityItem[],
+      reasoningStreams?: ReasoningStream[],
     ) => {
       const id = crypto.randomUUID();
       const msg: Message = {
@@ -95,6 +113,8 @@ export function useMessages(sessionId: string | null) {
         parent_id: parentId ?? null,
         is_temporary: isTemporary ?? false,
         reasoning: reasoning || undefined,
+        reasoningStreams: reasoningStreams?.length ? reasoningStreams : undefined,
+        activities: activities?.length ? activities : undefined,
       };
       setMessages((prev) => {
         const next = [...prev, msg];
@@ -105,6 +125,54 @@ export function useMessages(sessionId: string | null) {
     },
     [],
   );
+
+  /**
+   * Update a message's streaming fields, keeping React state and localStorage in
+   * sync. When the message is in the current state we update it there and
+   * persist the full list (consistent with addMessage, so nothing is clobbered).
+   * When the user has navigated to another session the message is no longer in
+   * state, so we persist it directly to disk to keep the in-progress run safe.
+   */
+  const updateMessage = useCallback(
+    (
+      sessionId: string,
+      messageId: string,
+      updates: Partial<
+        Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts">
+      >,
+    ) => {
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === messageId)) {
+          const next = prev.map((m) =>
+            m.id === messageId ? { ...m, ...updates } : m,
+          );
+          saveMessages(sessionId, next);
+          return next;
+        }
+        const loaded = loadMessages(sessionId);
+        if (loaded.some((m) => m.id === messageId)) {
+          saveMessages(
+            sessionId,
+            loaded.map((m) => (m.id === messageId ? { ...m, ...updates } : m)),
+          );
+        }
+        return prev;
+      });
+    },
+    [],
+  );
+
+  const deleteMessage = useCallback((sessionId: string, messageId: string) => {
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === messageId)) {
+        const next = prev.filter((m) => m.id !== messageId);
+        saveMessages(sessionId, next);
+        return next;
+      }
+      saveMessages(sessionId, loadMessages(sessionId).filter((m) => m.id !== messageId));
+      return prev;
+    });
+  }, []);
 
   const deleteTemporaryMessages = useCallback(async (sessionId: string) => {
     setMessages((prev) => {
@@ -126,6 +194,8 @@ export function useMessages(sessionId: string | null) {
     messages,
     loading,
     addMessage,
+    updateMessage,
+    deleteMessage,
     deleteTemporaryMessages,
     refetch,
   };

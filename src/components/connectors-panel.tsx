@@ -3,7 +3,6 @@ import {
   Plug,
   Search,
   Plus,
-  Trash2,
   Check,
   RefreshCw,
   ShieldCheck,
@@ -17,13 +16,6 @@ import {
   Flame,
 } from "lucide-react";
 import { toast } from "sonner";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -76,7 +68,6 @@ import {
   readOpencodeConfig,
   getMcpEntries,
   setMcpEntry,
-  removeMcpEntry,
   type McpEntry,
 } from "@/lib/opencode-config";
 import { searchMcpRegistry, type RegistryServer } from "@/lib/mcp-registry";
@@ -123,38 +114,8 @@ const FALLBACK_ICON: { Icon: IconComponent; tile: string } = {
   tile: "bg-muted text-muted-foreground",
 };
 
-function mcpIcon(id: string): { Icon: IconComponent; tile: string } {
+export function mcpIcon(id: string): { Icon: IconComponent; tile: string } {
   return MCP_ICONS[id] ?? FALLBACK_ICON;
-}
-
-function StatusBadge({ status }: { status: McpStatus | undefined }) {
-  if (!status) return <Badge variant="secondary" className="text-[10px]">—</Badge>;
-  const s = status.status;
-  const map: Record<string, { label: string; variant: "default" | "secondary" | "destructive" | "outline" }> = {
-    connected: { label: "Connected", variant: "default" },
-    disabled: { label: "Disabled", variant: "secondary" },
-    failed: { label: "Failed", variant: "destructive" },
-    needs_auth: { label: "Needs sign-in", variant: "outline" },
-    needs_client_registration: { label: "Needs setup", variant: "outline" },
-  };
-  const info = map[s] ?? { label: s, variant: "secondary" as const };
-  return <Badge variant={info.variant} className="text-[10px]">{info.label}</Badge>;
-}
-
-function statusTint(status: McpStatus | undefined): string {
-  switch (status?.status) {
-    case "connected":
-      return "border-emerald-500/30 bg-emerald-500/5";
-    case "needs_auth":
-    case "needs_client_registration":
-      return "border-amber-500/40 bg-amber-500/5";
-    case "failed":
-      return "border-destructive/40 bg-destructive/5";
-    case "disabled":
-      return "opacity-60";
-    default:
-      return "";
-  }
 }
 
 function authLabel(entry: McpCatalogEntry): string {
@@ -168,14 +129,10 @@ function authLabel(entry: McpCatalogEntry): string {
   }
 }
 
-export function McpDialog({
-  open,
-  onOpenChange,
+export function ConnectorsPanel({
   serving,
   activeDirectory,
 }: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
   serving: boolean;
   activeDirectory: string | null;
 }) {
@@ -219,8 +176,8 @@ export function McpDialog({
   }, [config, serving, directory]);
 
   useEffect(() => {
-    if (open) void refresh();
-  }, [open, refresh, tick]);
+    void refresh();
+  }, [refresh, tick]);
 
   // Debounced registry search (advanced only)
   useEffect(() => {
@@ -301,11 +258,6 @@ export function McpDialog({
     }
   };
 
-  const handleDelete = async (name: string) => {
-    await removeMcpEntry(directory, name);
-    setTick((t) => t + 1);
-  };
-
   const handleAuth = async (name: string) => {
     setAuthing(name);
     try {
@@ -364,8 +316,6 @@ export function McpDialog({
     }
   };
 
-  const entryList = Object.entries(mcpEntries);
-
   const filteredCatalog = useMemo(() => {
     const q = query.trim().toLowerCase();
     return MCP_CATALOG.filter((e) => {
@@ -380,18 +330,17 @@ export function McpDialog({
   }, [query, category]);
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="h-[90vh] w-[90vw] max-w-[1500px]">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Plug className="size-5" /> App Connections
-          </DialogTitle>
-          <DialogDescription>
-            Connect the AI to your other apps — like Notion, GitHub, or Figma — so it can read
-            and update them for you. Add an app, sign in once in your browser, and you're done.
-            These are official connections from each app's maker.
-          </DialogDescription>
-        </DialogHeader>
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1">
+        <h2 className="flex items-center gap-2 text-xl font-semibold">
+          <Plug className="size-5" /> Connectors
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Connect the AI to your other apps — like Notion, GitHub, or Figma — so it can read
+          and update them for you. Add an app, sign in once in your browser, and you're done.
+          These are official connections from each app's maker.
+        </p>
+      </div>
 
         <div className="flex flex-col gap-2.5">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -444,74 +393,6 @@ export function McpDialog({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto pr-1">
-          {/* ─── Connected ─── */}
-          <div className="flex flex-col gap-2.5 pb-4">
-            <span className="text-sm font-medium">Connected apps</span>
-            {entryList.length === 0 && (
-              <p className="text-xs text-muted-foreground">
-                No apps connected yet. Browse the directory below to add one.
-              </p>
-            )}
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
-              {entryList.map(([name, entry]) => {
-                const { Icon, tile } = mcpIcon(name);
-                return (
-                  <div
-                    key={name}
-                    className={cn(
-                      "flex items-center gap-3 rounded-xl border p-3",
-                      statusTint(mcpStatus[name]),
-                    )}
-                  >
-                    <div
-                      className={cn(
-                        "flex size-9 shrink-0 items-center justify-center rounded-lg",
-                        tile,
-                      )}
-                    >
-                      <Icon className="size-4.5" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-1.5">
-                        <span className="truncate text-sm font-medium">{name}</span>
-                        <StatusBadge status={mcpStatus[name]} />
-                      </div>
-                      <div className="truncate text-[10px] text-muted-foreground">
-                        {entry.type === "remote" ? entry.url : entry.command?.join(" ")}
-                      </div>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-1">
-                      {mcpStatus[name]?.status === "needs_auth" && (
-                        <Button
-                          size="xs"
-                          variant="outline"
-                          disabled={authing === name}
-                          onClick={() => handleAuth(name)}
-                        >
-                          {authing === name ? (
-                            <Loader2 className="size-3 animate-spin" />
-                          ) : (
-                            <ShieldCheck className="size-3" />
-                          )}
-                          Sign in
-                        </Button>
-                      )}
-                      <Button
-                        size="icon-xs"
-                        variant="ghost"
-                        className="text-muted-foreground hover:text-destructive"
-                        onClick={() => handleDelete(name)}
-                      >
-                        <Trash2 className="size-3" />
-                      </Button>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          <Separator />
 
           {/* ─── Directory ─── */}
           <div className="flex flex-col gap-3 pt-4">
@@ -747,7 +628,6 @@ export function McpDialog({
             maker provides its own connection — you only grant access to what you choose.
           </span>
         </div>
-      </DialogContent>
-    </Dialog>
+    </div>
   );
 }

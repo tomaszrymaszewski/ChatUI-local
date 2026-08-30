@@ -1,3 +1,6 @@
+import type { ActivityItem, ReasoningStream } from "@/lib/agent/types";
+import type { Artifact } from "@/lib/artifacts";
+
 export type MessageRole = "user" | "assistant" | "system";
 
 export interface MessageAttachment {
@@ -19,6 +22,9 @@ export interface Message {
   parent_id?: string | null;
   is_temporary?: boolean;
   reasoning?: string;
+  reasoningStreams?: ReasoningStream[];
+  activities?: ActivityItem[];
+  artifacts?: Artifact[];
 }
 
 export interface ProjectFile {
@@ -68,6 +74,8 @@ export interface Provider {
   builtinKey?: string;
 }
 
+export type BackgroundPattern = "none" | "lines" | "plus" | "dots";
+
 export interface UserSettings {
   defaultModel: string | null;
   sendOnEnter: boolean;
@@ -75,8 +83,8 @@ export interface UserSettings {
   soundEffects: boolean;
   temporaryByDefault: boolean;
   autoMemory: boolean;
-  fullName: string;
   nickname: string;
   instructions: string;
   embeddingModel: string;
+  backgroundPattern: BackgroundPattern;
 }

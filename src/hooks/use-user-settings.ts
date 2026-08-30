@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from "react";
 import type { UserSettings } from "@/types";
 
 const STORAGE_KEY = "chatui:settings";
+const SETTINGS_EVENT = "chatui:settings-changed";
 
 const DEFAULT_SETTINGS: UserSettings = {
   defaultModel: null,
@@ -10,10 +11,10 @@ const DEFAULT_SETTINGS: UserSettings = {
   soundEffects: false,
   temporaryByDefault: false,
   autoMemory: true,
-  fullName: "",
   nickname: "",
   instructions: "",
   embeddingModel: "Xenova/all-MiniLM-L6-v2",
+  backgroundPattern: "dots",
 };
 
 function loadSettings(): UserSettings {
@@ -29,6 +30,7 @@ function loadSettings(): UserSettings {
 
 function saveSettings(settings: UserSettings) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  window.dispatchEvent(new Event(SETTINGS_EVENT));
 }
 
 export function useUserSettings() {
@@ -38,6 +40,9 @@ export function useUserSettings() {
   useEffect(() => {
     setSettings(loadSettings());
     setLoading(false);
+    const sync = () => setSettings(loadSettings());
+    window.addEventListener(SETTINGS_EVENT, sync);
+    return () => window.removeEventListener(SETTINGS_EVENT, sync);
   }, []);
 
   const updateSettings = useCallback(

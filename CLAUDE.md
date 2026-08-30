@@ -1,85 +1,100 @@
 # CLAUDE.md — Working rules for ChatUI-local
 
-Persistent instructions for Claude Code on this repo. Keep changes tightly scoped.
-Detailed fixes live in `IMPROVEMENT_PLAN.md` (stages 1–6). This file governs *how* to work.
+Persistent instructions for AI coding agents on this repo. Keep changes tightly scoped.
 
 ## What this repo is
 
-Two apps in one Tauri + React 19 + TypeScript + Tailwind + shadcn/ui shell:
-- **Chat half** — `src/components/ChatView.tsx`, talks to OpenAI-compatible provider APIs,
-  persists via **Supabase** (`src/lib/supabase.ts`, `src/hooks/use-*.ts`, `src/lib/llm.ts`).
-- **Agent half** — `src/components/AgentView.tsx` + `src/hooks/use-opencode.ts`
-  + `src/lib/opencode.ts`, talks to a local **OpenCode server** over REST + SSE.
+A local-first desktop chat app: **Tauri 2 (Rust shell) + React 19 + TypeScript + Vite 7
++ Tailwind + shadcn/ui**. No Supabase, no router, no auth — all persistence is
+localStorage plus JSON files under `~/Documents/chatUI` (managed by the Rust side).
 
-The two halves are separate. A change to one must not touch the other unless a stage says so.
+- **Chat** — `src/components/ChatView.tsx` (the whole UI: sessions, projects, settings
+  views). Every send runs through a **LangChain Deep Agents** runtime:
+  - `src/hooks/use-deep-agent.ts` — run/stop/interrupt state machine consumed by ChatView.
+  - `src/lib/agent/runtime.ts` — `DeepAgentSession` (createDeepAgent, v3 streamEvents,
+    system prompts incl. council/research mode prompts).
+  - `src/lib/agent/tools.ts` — built-in tools (time/date/weather/web_fetch,
+    create_artifact, run_python, request_structured_input, search_skills,
+    search_connectors, suggest).
+  - `src/lib/agent/{models,skills,mcp,run-context,types}.ts` — ChatOpenAI factory
+    (OpenAI-compatible endpoints only), skill files, remote MCP tools, per-run context.
+  - `src/lib/run-python.ts` → Tauri command `run_python` in `src-tauri/src/lib.rs`
+    (system python3, temp file, try_wait poll + kill on timeout).
+- **Rich content** — `src/components/markdown-renderer.tsx` renders LaTeX (KaTeX),
+  ```mermaid, ```chart (Vega-Lite), ```svg fences, prism syntax highlighting.
+  `src/components/artifact-panel.tsx` is the editable side panel (CodeMirror editing
+  with overrides in `src/lib/artifacts.ts`, Python run console, React preview via
+  esbuild-wasm + esm.sh in `src/lib/react-preview.ts`, md/html/pdf/docx export in
+  `src/lib/export-artifact.ts`).
+- **Legacy/dead but kept** — `AgentView.tsx`, `use-opencode.ts`, `use-deep-research.ts`,
+  `use-model-council.ts`, `src/lib/research/`, `src/lib/tools.ts`. Unwired from the send
+  flow; do not re-wire or delete without asking.
+- `src/lib/llm.ts` is still used for chat titles + memory extraction
+  (`buildSystemPrompt` is exported and reused by the agent runtime).
 
-## Global working rules
+## Working rules
 
-1. **One stage at a time.** Do exactly the requested stage. Never combine stages.
-2. **Only touch the allowed files** listed for that issue below. If a fix seems to need a
-   file outside the allowed list, STOP and tell me why before editing it.
-3. **Never touch the "Do NOT touch" files** for the current issue.
-4. **Always end with:** run `npm run build` (the TypeScript check), then show the full diff
-   and explain each change *before* I accept anything.
-5. **No refactors, renames, dependency changes, or reformatting** unless explicitly asked.
-   Match the existing code style in each file exactly.
-6. **Ask, don't assume.** If an API endpoint or type is uncertain, verify it (server docs /
-   the codebase) and tell me what you found — do not guess and move on.
-7. **Dev auth bypass stays OFF before any commit.** The `VITE_DEV_BYPASS_AUTH` flag and its
-   gate in `App.tsx` are local-only; never commit them enabled.
+1. **Scope first.** Only touch files the task needs; if a fix seems to need a surprising
+   file, stop and say why before editing it.
+2. **Always end with:** `npm run build` (runs `tsc && vite build`) and `npm test`
+   (vitest). After Rust changes also `cargo check` + `cargo test` in `src-tauri/`.
+   Show the diff and explain each change before anything is accepted.
+3. **No refactors, renames, dependency changes, or reformatting** unless explicitly
+   asked. Match the existing code style in each file exactly.
+4. **Ask, don't assume.** If an API/library surface is uncertain, verify it in
+   `node_modules` or docs first — do not guess.
+5. **LSP lies.** The editor LSP sometimes reports stale "cannot find module" errors for
+   `src/components/skills-dialog.tsx`, `src/components/mcp-dialog.tsx`, and
+   `src/components/suggestion-card.tsx`. Trust `tsc` (the build), not those diagnostics.
+6. **Never commit secrets.** Provider API keys live in localStorage only.
 
-## Global do-NOT-touch (all early stages)
+## Architecture notes that bite
 
-- `src/lib/supabase.ts`, `src/lib/auth.tsx` — auth/backend wiring.
-- `src/App.tsx` routing — except the existing dev-bypass gate, which must not be committed on.
-- Anything under `src-tauri/` — the Rust shell.
-- `package.json` / lockfile — no dependency changes unless a stage requires one and I approve.
+- **One agent run per send.** A fresh langgraph `thread_id` is created per user message;
+  history is replayed from the message tree. A thread is reused only to resume
+  structured-input interrupts (max 4 rounds, see `use-deep-agent.ts`).
+- **Artifacts are derived, not stored.** `extractArtifacts()` re-parses message content
+  on every render; edits in the panel live in the module-level override store in
+  `src/lib/artifacts.ts`, keyed by the original artifact.
+- **Custom Tauri commands need no capabilities entries** (mirrors `http_fetch`).
+  Command return values serialize as-is — use `#[serde(rename_all = "camelCase")]`
+  (see `HttpFetchResponse`, `PythonRunResult` and their unit tests).
+- **React preview iframes** use `sandbox="allow-scripts allow-same-origin"` because the
+  compiled module is loaded from a blob URL; plain HTML previews stay `allow-scripts` only.
+- **CORS: strip X-Stainless-* AND User-Agent headers.** The openai client under ChatOpenAI
+  adds telemetry headers (and a custom User-Agent) that break CORS preflights against most
+  OpenAI-compatible providers; `models.ts` passes a `corsSafeFetch` that removes them.
+  Chrome silently drops the forbidden User-Agent, but WKWebView includes it in the
+  preflight's Access-Control-Request-Headers — so with it, requests fail with "Load failed"
+  **in the Tauri app only**. Never let those headers reach the wire.
+- **web_fetch has three transports** (`src/lib/http-fetch.ts`): Rust `http_fetch` command
+  under Tauri, a vite dev middleware (`/__http-fetch` in `vite.config.ts`, skipped under
+  vitest via `MODE !== "test"`), and native fetch as last resort (CORS-restricted).
+- **History is truncated to a token budget** (`src/lib/agent/history.ts`) before replay:
+  models.dev `limit.context` when known, 8k for localhost providers, 32k fallback, minus
+  4k reserve for system prompt + tool schemas + output.
+- **OpenCode server** (port 2138) is spawned/adopted by the Rust shell for the legacy
+  agent half; env vars are sanitized there — keep that behavior.
+- **App updates** (`src/lib/updater.ts` + `src/components/updates-panel.tsx`): the app
+  pings a static `latest.json` on GitHub Releases on launch (if auto-check is on in
+  Settings → Updates). `tauri-plugin-updater` verifies the signed bundle against the
+  pubkey in `tauri.conf.json` before installing. Building release artifacts requires
+  `TAURI_SIGNING_PRIVATE_KEY` env var (set in CI secrets, not committed). The release
+  workflow is `.github/workflows/release.yml` (tauri-action on `v*` tag push).
+- **Mode triggers** (`src/lib/mode-triggers.ts`): typing "discuss…", "teach me…",
+  "i want to learn…", or "research…" as the first word of the composer auto-activates
+  the corresponding chat mode (button lights up blue + expands). Detection is live:
+  deleting the word reverts the mode. Manual toggles always win over auto-detection.
+- **Skill/connector discovery** (`search_skills` / `search_connectors` / `suggest` tools):
+  the agent can search the skill and connector catalogs at runtime and present actionable
+  suggestion cards (`src/components/suggestion-card.tsx`) in place of the composer textbox.
+  Suggestions are non-blocking (the run continues). The `suggest` tool emits a `suggestion`
+  AgentEvent via `RunContext.emit` (same pattern as `create_artifact`). Google Workspace
+  and Microsoft 365 are covered by the Zapier connector (keywords field in `McpCatalogEntry`).
 
----
+## Commands
 
-## Scope map (per issue)
-
-### Issue 1 & 3 — Agent send/stop bugs + flaky start (do together)
-- **Target:** SSE subscription, `isBusy`, reasoning rendering, new-session send, abort.
-- **Allowed files:** `src/hooks/use-opencode.ts`, `src/components/AgentView.tsx`.
-  (May add an *optional* `sessionId` param to `sendMessageAsync` in `src/lib/opencode.ts`
-  only if truly needed — ask first.)
-- **Do NOT touch:** `ChatView.tsx`, `src/lib/llm.ts`, any `use-*` Supabase hook,
-  the API-client functions in `opencode.ts` beyond the optional param above.
-
-### Issue 2 — Large / real files don't send in chat
-- **Target:** `handleFiles` + `handleSend` (attachment content is currently never read/sent).
-- **Allowed files:** `src/components/ChatView.tsx`, `src/lib/llm.ts`
-  (message-content typing + `streamChatCompletion`), `src/types.ts` (attachment type only).
-- **Do NOT touch:** any agent file (`AgentView.tsx`, `use-opencode.ts`, `opencode.ts`),
-  settings, auth.
-
-### Issue 4 — Chat & agent settings
-- **Target:** add "Chat" and "Agent" tabs to the settings dialog.
-- **Allowed files:** `src/pages/settings.tsx`, `src/hooks/use-user-settings.ts` (chat prefs),
-  `src/lib/opencode.ts` (reuse `getStoredConfig`/`saveConfig` pattern for agent settings).
-- **Do NOT touch:** the Providers tab CRUD logic, `ChatView.tsx` send flow,
-  `AgentView.tsx` message rendering. Persist agent settings to localStorage, NOT Supabase.
-
-### Issue 5 — Compaction (button + automatic)
-- **Target:** add a summarize/compact call, a Compact button, and an auto-trigger.
-- **Allowed files:** `src/lib/opencode.ts` (add `summarizeSession`),
-  `src/hooks/use-opencode.ts` (summarize action + auto-trigger),
-  `src/components/AgentView.tsx` (Compact button in the session header).
-- **Do NOT touch:** the chat side, provider config.
-- **Note:** confirm the real summarize endpoint from the OpenCode server API before coding.
-
-### Issue 6 — Unify model selection (do last)
-- **Target:** one shared model picker used by both Chat and Agent; agent passes its model.
-- **Allowed files:** new `src/components/model-picker.tsx`, `src/components/ChatView.tsx`
-  (wire picker, no behavior change), `src/components/AgentView.tsx` (wire picker + pass model
-  into `sendMessageAsync`), `src/lib/opencode.ts` (use `getConfigProviders`).
-- **Do NOT touch:** provider CRUD, Supabase schema. Do NOT merge the two provider backends —
-  UI unification only; list follow-ups for me to decide separately.
-
----
-
-## Order
-
-1 & 3 (agent core) → 5 (compaction) → 4 (settings) → 6 (models) → 2 (chat files).
-Start narrow (reasoning visibility, `AgentView.tsx` only) before the structural agent work.
+- `npm run dev` — Vite dev server (Tauri dev via `npm run tauri dev`)
+- `npm run build` — `tsc && vite build` (the type check)
+- `npm test` — vitest run
+- `cargo test` in `src-tauri/` — Rust unit tests (network smoke tests are `#[ignore]`)

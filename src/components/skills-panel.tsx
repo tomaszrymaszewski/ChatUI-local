@@ -33,17 +33,8 @@ import {
   Telescope,
 } from "lucide-react";
 import { toast } from "sonner";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-} from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Badge } from "@/components/ui/badge";
-import { Separator } from "@/components/ui/separator";
 import {
   Select,
   SelectContent,
@@ -107,22 +98,19 @@ const FALLBACK_ICON: { Icon: IconComponent; tile: string } = {
   tile: "bg-muted text-muted-foreground",
 };
 
-function skillIcon(name: string): { Icon: IconComponent; tile: string } {
+export function skillIcon(name: string): { Icon: IconComponent; tile: string } {
   return SKILL_ICONS[name] ?? FALLBACK_ICON;
 }
 
-export function SkillsDialog({
-  open,
-  onOpenChange,
+export function SkillsPanel({
   activeDirectory,
 }: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
   activeDirectory: string | null;
 }) {
   const [scope, setScope] = useState<"global" | "project">("global");
   const [installedSkills, setInstalledSkills] = useState<InstalledSkill[]>([]);
   const [installing, setInstalling] = useState<string | null>(null);
+  const [uninstalling, setUninstalling] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState<SkillCategory | "All">("All");
@@ -146,8 +134,8 @@ export function SkillsDialog({
   }, []);
 
   useEffect(() => {
-    if (open) void refresh();
-  }, [open, refresh, tick]);
+    void refresh();
+  }, [refresh, tick]);
 
   const installedNames = useMemo(
     () => new Set(installedSkills.map((s) => s.name)),
@@ -172,12 +160,19 @@ export function SkillsDialog({
     }
   };
 
-  const handleDelete = async (skill: InstalledSkill) => {
+  const handleUninstall = async (name: string) => {
+    const matches = installedSkills.filter((s) => s.name === name);
+    if (matches.length === 0) return;
+    setUninstalling(name);
     try {
-      await deleteSkill(skill.name, skill.scope, activeDirectory ?? undefined);
+      for (const skill of matches) {
+        await deleteSkill(skill.name, skill.scope, activeDirectory ?? undefined);
+      }
       setTick((t) => t + 1);
     } catch {
       toast.error("Failed to delete skill");
+    } finally {
+      setUninstalling(null);
     }
   };
 
@@ -198,18 +193,17 @@ export function SkillsDialog({
   }, [library, query, category]);
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="h-[90vh] w-[90vw] max-w-[1500px]">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <Sparkles className="size-5" /> Skills
-          </DialogTitle>
-          <DialogDescription>
-            Skills are instruction packs that make the AI great at a specific task — like
-            creating polished PDFs, designing on-brand slides, or reviewing code. Install one
-            once and it works in both Chat and the Agent.
-          </DialogDescription>
-        </DialogHeader>
+    <div className="flex flex-col gap-4">
+      <div className="flex flex-col gap-1">
+        <h2 className="flex items-center gap-2 text-xl font-semibold">
+          <Sparkles className="size-5" /> Skills
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Skills are instruction packs that make the AI great at a specific task — like
+          creating polished PDFs, designing on-brand slides, or reviewing code. Install one
+          once and it works everywhere.
+        </p>
+      </div>
 
         <div className="flex flex-col gap-2.5">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
@@ -262,54 +256,8 @@ export function SkillsDialog({
         </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto pr-1">
-          {/* ─── Installed ─── */}
-          <div className="flex flex-col gap-2.5 pb-4">
-            <span className="text-sm font-medium">Installed</span>
-            {installedSkills.length === 0 && (
-              <p className="text-xs text-muted-foreground">
-                No skills installed yet. Pick one from the library below.
-              </p>
-            )}
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
-              {installedSkills.map((skill) => {
-                const { Icon, tile } = skillIcon(skill.name);
-                return (
-                  <div
-                    key={`${skill.scope}-${skill.name}`}
-                    className="flex items-center gap-3 rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3"
-                  >
-                    <div
-                      className={cn(
-                        "flex size-9 shrink-0 items-center justify-center rounded-lg",
-                        tile,
-                      )}
-                    >
-                      <Icon className="size-4.5" />
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-medium">{skill.name}</div>
-                      <div className="text-[10px] text-muted-foreground">
-                        {skill.scope === "global" ? "All projects" : "This project"}
-                      </div>
-                    </div>
-                    <Button
-                      size="icon-xs"
-                      variant="ghost"
-                      className="shrink-0 text-muted-foreground hover:text-destructive"
-                      onClick={() => handleDelete(skill)}
-                    >
-                      <Trash2 className="size-3" />
-                    </Button>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-
-          <Separator />
-
           {/* ─── Library ─── */}
-          <div className="flex flex-col gap-3 pt-4">
+          <div className="flex flex-col gap-3">
             <span className="text-sm font-medium">Skill library</span>
 
             <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
@@ -344,12 +292,27 @@ export function SkillsDialog({
                         <Icon className="size-5" />
                       </div>
                       {installed ? (
-                        <Badge
-                          variant="secondary"
-                          className="border-emerald-500/30 bg-emerald-500/10 text-[10px] text-emerald-700 dark:text-emerald-300"
+                        <button
+                          onClick={() => handleUninstall(name)}
+                          disabled={uninstalling === name}
+                          className={cn(
+                            "group inline-flex h-6 items-center gap-1 rounded-md border px-2 text-xs font-medium transition-colors",
+                            "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+                            "hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive dark:hover:text-destructive",
+                            "disabled:pointer-events-none disabled:opacity-50",
+                          )}
                         >
-                          <Check className="size-2.5" /> Installed
-                        </Badge>
+                          {uninstalling === name ? (
+                            <Loader2 className="size-3 animate-spin" />
+                          ) : (
+                            <>
+                              <Check className="size-2.5 group-hover:hidden" />
+                              <Trash2 className="hidden size-2.5 group-hover:block" />
+                            </>
+                          )}
+                          <span className="group-hover:hidden">Installed</span>
+                          <span className="hidden group-hover:inline">Uninstall</span>
+                        </button>
                       ) : (
                         <Button
                           size="xs"
@@ -393,7 +356,6 @@ export function SkillsDialog({
             what a skill covers — you don't need to do anything special after installing.
           </span>
         </div>
-      </DialogContent>
-    </Dialog>
+    </div>
   );
 }

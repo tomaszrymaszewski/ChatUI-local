@@ -1,3 +1,5 @@
+import { httpFetch } from "@/lib/http-fetch";
+
 export interface ToolDefinition {
   type: "function";
   function: {
@@ -197,16 +199,15 @@ async function executeWebFetch(args: Record<string, unknown>): Promise<string> {
   if (!url) return "Error: No URL provided.";
 
   try {
-    const resp = await fetch(url, {
-      headers: { Accept: "text/html, text/plain" },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!resp.ok) return `Error: Fetch failed (${resp.status} ${resp.statusText}).`;
+    // Goes through the Rust shell under Tauri — a webview fetch() would be
+    // blocked by CORS for most websites (see src/lib/http-fetch.ts).
+    const resp = await httpFetch(url);
+    if (resp.status < 200 || resp.status >= 300) {
+      return `Error: Fetch failed (${resp.status} ${resp.statusText}).`;
+    }
 
-    const contentType = resp.headers.get("content-type") ?? "";
-    if (contentType.includes("text/html")) {
-      const html = await resp.text();
-      const text = html
+    if (resp.contentType.includes("text/html")) {
+      const text = resp.body
         .replace(/<script[\s\S]*?<\/script>/gi, "")
         .replace(/<style[\s\S]*?<\/style>/gi, "")
         .replace(/<nav[\s\S]*?<\/nav>/gi, "")
@@ -224,13 +225,9 @@ async function executeWebFetch(args: Record<string, unknown>): Promise<string> {
       return text.slice(0, 8000);
     }
 
-    const text = await resp.text();
-    return text.slice(0, 8000);
+    return resp.body.slice(0, 8000);
   } catch (err) {
-    if (err instanceof DOMException && err.name === "TimeoutError") {
-      return "Error: Request timed out.";
-    }
-    return `Error: Failed to fetch URL - ${err instanceof Error ? err.message : "unknown error"}`;
+    return `Error: Failed to fetch URL - ${err instanceof Error ? err.message : String(err)}`;
   }
 }
 

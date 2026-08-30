@@ -31,6 +31,7 @@ import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import type { ChatSession, Project } from "@/types"
+import { Spinner } from "@/components/ui/spinner"
 
 export function NavChats({
   sessions,
@@ -40,6 +41,7 @@ export function NavChats({
   onRename,
   projects = [],
   label = "Recents",
+  runningIds,
 }: {
   sessions: ChatSession[]
   activeSessionId: string | null
@@ -48,6 +50,7 @@ export function NavChats({
   onRename?: (id: string, title: string) => void
   projects?: Project[]
   label?: string
+  runningIds?: Set<string>
 }) {
   const { isMobile } = useSidebar()
   const [renameTarget, setRenameTarget] = useState<{ id: string; title: string } | null>(null)
@@ -87,7 +90,10 @@ export function NavChats({
                 onClick={() => onSelect(session.id)}
               >
                 <span className="truncate">{session.title}</span>
-                {projectName && (
+                {runningIds?.has(session.id) && (
+                  <Spinner className="ml-auto size-3" />
+                )}
+                {projectName && !runningIds?.has(session.id) && (
                   <Badge variant="secondary" className="ml-auto text-[10px]">
                     {initialsFor(projectName)}
                   </Badge>

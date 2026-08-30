@@ -1,17 +1,16 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/inter";
 @import "katex/dist/katex.min.css";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme {
-  --font-sans: "Inter Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Helvetica Neue", system-ui, sans-serif;
 }
 
 :root {
-  --radius: 0.625rem;
+  --radius: 0.70rem;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -130,6 +129,39 @@
 
 .welcome-fade-in {
   animation: welcome-fade-in 0.8s ease-out 0.3s both;
+}
+
+:root {
+  --bg-pattern-color: color-mix(in oklab, var(--foreground) 6%, transparent);
+}
+
+.dark {
+  --bg-pattern-color: color-mix(in oklab, var(--foreground) 9%, transparent);
+}
+
+.bg-pattern-lines {
+  background-image:
+    linear-gradient(to right, var(--bg-pattern-color) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--bg-pattern-color) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.bg-pattern-dots {
+  background-image: radial-gradient(
+    circle,
+    var(--bg-pattern-color) 1px,
+    transparent 1.5px
+  );
+  background-size: 20px 20px;
+}
+
+.bg-pattern-plus {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M12 9v6M9 12h6' fill='none' stroke='rgba(9,9,11,0.08)' stroke-width='1' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-size: 24px 24px;
+}
+
+.dark .bg-pattern-plus {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'%3E%3Cpath d='M12 9v6M9 12h6' fill='none' stroke='rgba(250,250,250,0.10)' stroke-width='1' stroke-linecap='round'/%3E%3C/svg%3E");
 }
 
 @layer base {

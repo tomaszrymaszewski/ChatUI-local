@@ -43,6 +43,18 @@ export const BUILTIN_PROVIDERS: BuiltinProvider[] = [
     requiresApiKey: false,
   },
   {
+    key: "ollama-cloud",
+    name: "Ollama Cloud",
+    baseUrl: "https://ollama.com/v1",
+    requiresApiKey: true,
+  },
+  {
+    key: "openrouter",
+    name: "OpenRouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    requiresApiKey: true,
+  },
+  {
     key: "custom",
     name: "Custom",
     baseUrl: "",

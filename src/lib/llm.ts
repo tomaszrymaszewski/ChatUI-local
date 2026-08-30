@@ -228,7 +228,7 @@ function loadUserSettings(): UserSettings | null {
   }
 }
 
-function buildSystemPrompt(projectInstructions?: string, skillsContext?: string): string | null {
+export function buildSystemPrompt(projectInstructions?: string, skillsContext?: string): string | null {
   const settings = loadUserSettings();
   const parts: string[] = [];
   if (settings?.nickname?.trim()) {
@@ -534,4 +534,25 @@ export async function generateChatTitle(
   const title = raw.replace(/["'\n.]/g, "").trim();
   if (!title || isTitleLeak(title)) return "";
   return title.slice(0, 50);
+}
+
+// ─── Tavily search API key (optional, stored in localStorage) ──────────────
+
+const TAVILY_KEY_STORAGE = "chatui:tavily-key";
+
+export function getTavilyApiKey(): string {
+  try {
+    return localStorage.getItem(TAVILY_KEY_STORAGE) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+export function setTavilyApiKey(key: string): void {
+  try {
+    if (key) localStorage.setItem(TAVILY_KEY_STORAGE, key);
+    else localStorage.removeItem(TAVILY_KEY_STORAGE);
+  } catch {
+    // ignore storage errors
+  }
 }
