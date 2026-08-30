@@ -9,7 +9,15 @@ jobs:
   publish-tauri:
     permissions:
       contents: write
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: ""
+          - platform: windows-latest
+            args: ""
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
 
@@ -35,6 +43,7 @@ jobs:
       # unsigned builds. Once the Apple secrets are configured, this step
       # activates signing + notarization automatically.
       - name: Configure Apple signing (if secrets are set)
+        if: matrix.platform == 'macos-latest'
         shell: bash
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -71,5 +80,10 @@ jobs:
 
             **macOS note:** if macOS says chatui is "damaged" (happens with unsigned builds),
             run `xattr -cr /Applications/chatui.app` in Terminal once, then open the app normally.
+
+            **Windows note:** if SmartScreen says "Windows protected your PC", click
+            **More info → Run anyway** to install.
           releaseDraft: true
           prerelease: false
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }}

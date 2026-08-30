@@ -13,6 +13,7 @@ import {
   User,
 } from "lucide-react"
 import { getCurrentWindow } from "@tauri-apps/api/window"
+import { isMacOS } from "@/lib/platform"
 import { NavChats } from "@/components/nav-chats"
 import {
   Sidebar,
@@ -80,8 +81,8 @@ export function AppSidebar({
   };
 
   return (
-    <Sidebar collapsible="icon" {...props}>
-      <div data-tauri-drag-region onMouseDown={startDrag} className="h-10 w-full shrink-0" />
+      <Sidebar collapsible="icon" {...props}>
+        {isMacOS && <div data-tauri-drag-region onMouseDown={startDrag} className="h-10 w-full shrink-0" />}
 
       {view !== "settings" ? (
         <div key="chat" className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
