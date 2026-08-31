@@ -58,11 +58,9 @@ import {
   MicrosoftLogo,
 } from "@/components/brand-logos";
 import {
-  getMcpStatus,
   addMcpServer,
   runOpendcodeMcpAuth,
   getDefaultConfig,
-  type McpStatus,
 } from "@/lib/opencode";
 import {
   readOpencodeConfig,
@@ -70,6 +68,7 @@ import {
   setMcpEntry,
   type McpEntry,
 } from "@/lib/opencode-config";
+import { readMcpAuth, hasToken, type McpAuthData } from "@/lib/mcp-auth";
 import { searchMcpRegistry, type RegistryServer } from "@/lib/mcp-registry";
 import {
   MCP_CATALOG,
@@ -139,7 +138,7 @@ export function ConnectorsPanel({
   const config = useMemo(() => getDefaultConfig(), []);
   const [scope, setScope] = useState<"global" | "project">("global");
   const [mcpEntries, setMcpEntries] = useState<Record<string, McpEntry>>({});
-  const [mcpStatus, setMcpStatus] = useState<Record<string, McpStatus>>({});
+  const [mcpAuth, setMcpAuth] = useState<McpAuthData>({});
   const [authing, setAuthing] = useState<string | null>(null);
   const [adding, setAdding] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
@@ -165,15 +164,10 @@ export function ConnectorsPanel({
   const refresh = useCallback(async () => {
     const configObj = await readOpencodeConfig(directory);
     setMcpEntries(getMcpEntries(configObj));
-    if (serving) {
-      try {
-        const status = await getMcpStatus(config, directory ?? undefined);
-        setMcpStatus(status);
-      } catch {
-        /* ignore */
-      }
-    }
-  }, [config, serving, directory]);
+    // Sign-in status comes from the shared token store on disk — no running
+    // opencode server needed (the app no longer keeps one connected).
+    setMcpAuth(await readMcpAuth());
+  }, [directory]);
 
   useEffect(() => {
     void refresh();
@@ -262,11 +256,12 @@ export function ConnectorsPanel({
     setAuthing(name);
     try {
       await runOpendcodeMcpAuth(name);
-      for (let i = 0; i < 15; i++) {
+      // The browser flow writes tokens to mcp-auth.json when done; poll that
+      // store (not the opencode server) for up to ~5 minutes.
+      for (let i = 0; i < 150; i++) {
         await new Promise((r) => setTimeout(r, 2000));
         try {
-          const status = await getMcpStatus(config, directory ?? undefined);
-          if (status[name]?.status === "connected") {
+          if (hasToken(await readMcpAuth(), name)) {
             toast.success(`${name} connected`);
             break;
           }
@@ -436,7 +431,8 @@ export function ConnectorsPanel({
             <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
               {filteredCatalog.map((cat) => {
                 const installed = installedIds.has(cat.id);
-                const needsAuth = mcpStatus[cat.id]?.status === "needs_auth";
+                const needsAuth =
+                  cat.auth === "oauth" && !hasToken(mcpAuth, cat.id);
                 const { Icon, tile } = mcpIcon(cat.id);
                 return (
                   <div

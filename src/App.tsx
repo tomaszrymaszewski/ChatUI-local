@@ -14,7 +14,9 @@ function App() {
       ) : (
         <OnboardingWizard onFinish={() => setOnboarded(true)} />
       )}
-      <Toaster />
+      {/* Top-right so error/event notifications never cover the composer
+          buttons at the bottom; offset clears the 40px title bar. */}
+      <Toaster position="top-right" offset={48} />
     </>
   );
 }

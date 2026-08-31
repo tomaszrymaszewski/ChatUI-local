@@ -1,5 +1,7 @@
 import { useMemo, useState } from "react";
-import { ArrowUp, SquarePen } from "lucide-react";
+import { ArrowUp, FolderOpen, SquarePen } from "lucide-react";
+import { toast } from "sonner";
+import { open as openDirectoryPicker } from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -94,6 +96,42 @@ export function StructuredInputForm({
                 onChange={(e) => set(field.name, e.currentTarget.value)}
                 className="min-h-16 text-sm"
               />
+            ) : field.type === "directory" ? (
+              <div className="flex gap-2">
+                <Input
+                  type="text"
+                  placeholder="/absolute/path/to/folder"
+                  value={String(values[field.name] ?? "")}
+                  onChange={(e) => set(field.name, e.currentTarget.value)}
+                  className="font-mono text-xs"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      submit();
+                    }
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={async () => {
+                    try {
+                      const dir = await openDirectoryPicker({
+                        directory: true,
+                        title: field.label,
+                      });
+                      if (typeof dir === "string") set(field.name, dir);
+                    } catch {
+                      toast.error("Folder picker is only available in the desktop app");
+                    }
+                  }}
+                >
+                  <FolderOpen />
+                  Choose…
+                </Button>
+              </div>
             ) : field.type === "select" ? (
               <Select
                 value={String(values[field.name] ?? "")}

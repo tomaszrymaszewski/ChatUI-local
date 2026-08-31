@@ -15,6 +15,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   instructions: "",
   embeddingModel: "Xenova/all-MiniLM-L6-v2",
   backgroundPattern: "dots",
+  terminalApproval: "ask",
 };
 
 function loadSettings(): UserSettings {
@@ -26,6 +27,14 @@ function loadSettings(): UserSettings {
   } catch {
     return DEFAULT_SETTINGS;
   }
+}
+
+/**
+ * Read the current settings outside React (e.g. from agent tools that need the
+ * terminal-approval mode at tool-call time). Always returns a full object.
+ */
+export function loadUserSettings(): UserSettings {
+  return loadSettings();
 }
 
 function saveSettings(settings: UserSettings) {

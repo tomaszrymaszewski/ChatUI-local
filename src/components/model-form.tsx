@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/select";
 import type { Provider, ProviderModel } from "@/types";
 import { fetchModelsFromApi, fetchOllamaModels } from "@/lib/llm";
+import { formatModelName } from "@/lib/model-display";
 
 interface ModelFormProps {
   providers: Provider[];
@@ -37,9 +38,6 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
   const [saving, setSaving] = useState(false);
 
   const selectedProvider = providers.find((p) => p.id === providerId);
-  const isCustom = selectedProvider
-    ? !selectedProvider.builtinKey || selectedProvider.builtinKey === "custom"
-    : false;
   const isOllama = selectedProvider?.builtinKey === "ollama";
 
   const fetchModels = useCallback(async () => {
@@ -73,15 +71,11 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
 
   const handleModelSelect = (value: string) => {
     setModelId(value);
-    if (!isCustom) {
-      setDisplayName(value);
-    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!providerId || !modelId.trim()) return;
-    if (isCustom && !displayName.trim()) return;
 
     setSaving(true);
     try {
@@ -193,25 +187,18 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
 
               {modelId && (
                 <div className="flex flex-col gap-2">
-                  <Label htmlFor="model-display-name">
-                    Display Name
-                    {isCustom && <span className="text-destructive"> *</span>}
-                  </Label>
+                  <Label htmlFor="model-display-name">Display Name</Label>
                   <Input
                     id="model-display-name"
-                    placeholder={
-                      isCustom
-                        ? "Required — e.g. My Custom Model"
-                        : "Optional — defaults to model ID"
-                    }
+                    placeholder="Optional — auto-formatted from model ID"
                     value={displayName}
                     onChange={(e) => setDisplayName(e.target.value)}
-                    required={isCustom}
                   />
                   <p className="text-xs text-muted-foreground">
-                    {isCustom
-                      ? "Required for custom providers"
-                      : "Auto-filled from model ID, but you can customize it"}
+                    Will appear as{" "}
+                    <span className="font-medium text-foreground">
+                      {displayName.trim() || formatModelName(modelId)}
+                    </span>
                   </p>
                 </div>
               )}
@@ -222,7 +209,7 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
           <Button type="button" variant="outline" onClick={onCancel}>
             Cancel
           </Button>
-          <Button type="submit" disabled={saving || !modelId.trim() || (isCustom && !displayName.trim())}>
+          <Button type="submit" disabled={saving || !modelId.trim()}>
             {saving && <Loader2 className="size-4 animate-spin" />}
             Add Model
           </Button>

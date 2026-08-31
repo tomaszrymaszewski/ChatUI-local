@@ -30,6 +30,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/app-sidebar";
+import { ApprovalCard } from "@/components/approval-card";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { MessageStream } from "@/components/message-stream";
 import { SettingsView, type SettingsTab } from "@/pages/settings";
@@ -40,6 +41,7 @@ import { SuggestionCard, installSkillByName } from "@/components/suggestion-card
 import { type Artifact } from "@/lib/artifacts";
 import { checkForUpdate, loadUpdateSettings, isUpdaterAvailable } from "@/lib/updater";
 import { detectModeTrigger } from "@/lib/mode-triggers";
+import { modelLabel } from "@/lib/model-display";
 import { OpenCodeProvider } from "@/lib/opencode-context";
 import {
   Attachment,
@@ -119,11 +121,12 @@ import type {
   Message as ChatMessage,
   MessageAttachment,
 } from "@/types";
-import { useSessions } from "@/hooks/use-sessions";
+import { useSessions, getSessionChatMode } from "@/hooks/use-sessions";
 import { useMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
+import { useAgents } from "@/hooks/use-agents";
 import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController } from "@/hooks/use-deep-agent";
 import type { AgentMode, AgentRunResult } from "@/lib/agent/types";
 import {
@@ -208,6 +211,8 @@ export function ChatView() {
     useProjects();
   const { providers, refetch: refetchProviders } = useProviders();
   const { settings } = useUserSettings();
+  const { agents, deleteAgent } = useAgents();
+  const isAgentTab = activeTab === "agent";
 
   const [activeSessionByTab, setActiveSessionByTab] = useState<
     Record<"chat" | "agent", string | null>
@@ -237,6 +242,10 @@ export function ChatView() {
   const [learnLevel] = useState<LearnLevel>(() => loadLearnPreferences().level);
   const [learnSubject] = useState<LearnSubject>(() => loadLearnPreferences().subject);
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
+  // Agents-tab pending context for the next session created on send: which
+  // saved agent it belongs to, or whether it's an agent-builder setup chat.
+  const [pendingAgentId, setPendingAgentId] = useState<string | null>(null);
+  const [pendingSetup, setPendingSetup] = useState(false);
   const [view, setView] = useState<"chat" | "settings" | "projects" | "history">("chat");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const openSettings = () => setView("settings");
@@ -303,8 +312,9 @@ export function ChatView() {
   // "discuss…" → council, "teach me…"/"i want to learn…" → learn,
   // "research…" → research. Deleting the trigger word reverts the mode.
   // A manual toggle always wins: once the user changes the mode by hand,
-  // the auto-detection stops fighting them.
+  // the auto-detection stops fighting them. Chat modes are chat-tab only.
   useEffect(() => {
+    if (isAgentTab) return;
     const detected = detectModeTrigger(inputText);
     const detectedMode: ChatMode = detected ?? "none";
 
@@ -317,7 +327,7 @@ export function ChatView() {
         if (chatMode === prevAuto || chatMode === "none") setChatMode(detectedMode);
       }
     }
-  }, [inputText, chatMode]);
+  }, [inputText, chatMode, isAgentTab]);
 
   // Settings manages its own provider state; refresh ours when leaving it.
   useEffect(() => {
@@ -357,6 +367,68 @@ export function ChatView() {
   )?.instructions;
   const currentProjectDirectory =
     projects.find((p) => p.id === currentProjectId)?.directory ?? null;
+
+  // Agent-mode context: the saved agent behind the active (or pending) session.
+  const currentAgentDef = activeSession?.agentId
+    ? agents.find((a) => a.id === activeSession?.agentId)
+    : undefined;
+  const pendingAgentName = pendingAgentId
+    ? agents.find((a) => a.id === pendingAgentId)?.name
+    : undefined;
+
+  /**
+   * Agent-mode run context for a session in the Agents tab: standalone tasks
+   * run as full task-manager agents; saved-agent sessions run sandboxed on
+   * the agent's own prompt/skills/connectors; setup chats run the builder.
+   */
+  const agentRunContext = (desc: { agentId?: string; isSetup?: boolean }) => {
+    const agentDef = desc.agentId ? agents.find((a) => a.id === desc.agentId) : undefined;
+    const instructions = agentDef
+      ? [
+          `You are "${agentDef.name}", a personal agent. Purpose: ${agentDef.purpose}`,
+          agentDef.systemPrompt,
+        ]
+        .filter(Boolean)
+        .join("\n\n")
+      : currentProjectInstructions || undefined;
+    return {
+      mode: "task" as AgentMode,
+      webFetch: webFetchEnabled && (agentDef?.capabilities.web ?? true),
+      instructions,
+      taskProfile: {
+        toolProfile: (desc.isSetup ? "setup" : "task") as "task" | "setup",
+        enableCommandTools: agentDef ? agentDef.capabilities.terminal : true,
+        enableFileTools: agentDef ? (agentDef.capabilities.files ?? false) : false,
+        skillNames: agentDef ? agentDef.skills : undefined,
+        mcpNames: agentDef ? agentDef.connectors : undefined,
+      },
+    };
+  };
+
+  // Composer copy per tab/session kind.
+  const chatComposerPlaceholder = isAgentTab
+    ? currentAgentDef
+      ? `Message ${currentAgentDef.name}…`
+      : "Describe the task — the agent works locally on your Mac…"
+    : isTemporary
+      ? "This message and response will be forgotten when you close the chat"
+      : "Ask anything";
+  const emptyComposerPlaceholder = isAgentTab
+    ? pendingSetup
+      ? "Describe what this agent should do…"
+      : pendingAgentName
+        ? `Message ${pendingAgentName}…`
+        : "Describe the task — the agent works locally on your Mac…"
+    : isTemporary
+      ? "This message and response will be forgotten when you close the chat"
+      : "Ask anything";
+  const emptyStateHeading = !isAgentTab
+    ? welcomePrompt
+    : pendingSetup
+      ? "What should this agent do?"
+      : pendingAgentName
+        ? `What can ${pendingAgentName} do for you?`
+        : "What do you want done?";
 
   const displayMessages: ChatMessage[] = activeSessionId
     ? messages
@@ -506,8 +578,28 @@ export function ChatView() {
       return;
     }
 
-    const mode: AgentMode =
-      chatMode === "research" ? "research" : chatMode === "council" ? "council" : "chat";
+    // Pin an auto-detected mode at send time: the message goes out with this
+    // mode, so it becomes the session's mode and survives the composer
+    // clearing (Learn stays on until the user turns it off manually).
+    if (autoModeRef.current !== "none" && chatMode === autoModeRef.current) {
+      autoModeRef.current = "none";
+    }
+
+    // Agent-mode runs (tasks, saved agents, builder setup) never run the
+    // research/council pipelines and never see the chat-tab modes.
+    const arc = isAgentTab
+      ? agentRunContext({
+          agentId: pendingAgentId ?? activeSession?.agentId,
+          isSetup: pendingSetup || activeSession?.isSetup === true,
+        })
+      : null;
+    const mode: AgentMode = arc
+      ? arc.mode
+      : chatMode === "research"
+        ? "research"
+        : chatMode === "council"
+          ? "council"
+          : "chat";
 
     // Vision check: block image attachments for non-vision models
     const hasImages = files.some((f) => f.type.startsWith("image/"));
@@ -515,7 +607,7 @@ export function ChatView() {
       const caps = await getModelCapabilities(provider, selectedModel);
       if (!caps.vision) {
         toast.error(
-          `${selectedModelLabel?.displayName || selectedModelLabel?.name || selectedModel} doesn't support image input. Remove the image or switch to a vision-capable model.`,
+          `${selectedModelLabel ? modelLabel(selectedModelLabel) : selectedModel} doesn't support image input. Remove the image or switch to a vision-capable model.`,
         );
         return;
       }
@@ -533,10 +625,15 @@ export function ChatView() {
       const newSession = createSession(
         (text || "Attachments").slice(0, 30),
         pendingProjectId ?? undefined,
+        isAgentTab
+          ? { agentId: pendingAgentId ?? undefined, isSetup: pendingSetup || undefined }
+          : undefined,
       );
       sessionId = newSession.id;
       setActiveSessionId(newSession.id);
       setPendingProjectId(null);
+      setPendingAgentId(null);
+      setPendingSetup(false);
       sessionPersisted = newSession.persisted;
       isNewSession = true;
     }
@@ -565,20 +662,30 @@ export function ChatView() {
         isTemporary,
       );
 
-      updateSession(sessionId, {});
+      updateSession(sessionId, { chat_mode: chatMode });
 
-      const modelLabel = selectedModelLabel?.displayName || selectedModelLabel?.name || selectedModel;
-      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, selectedModel, modelLabel);
+      const modelLabelStr = selectedModelLabel
+        ? modelLabel(selectedModelLabel)
+        : selectedModel;
+      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, selectedModel, modelLabelStr);
       if (prep.blocked) {
         toast.error(prep.warning ?? "This model doesn't support images.");
         return;
       }
       const userContent: string | ContentPart[] = prep.content;
 
-      const memoryContext = settings.autoMemory ? await buildMemoryContext(currentProjectId ?? null, text) : "";
-      const learnContext = chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
-      const effectiveInstructions = [currentProjectInstructions, learnContext, memoryContext]
-        .filter(Boolean).join("\n\n") || undefined;
+      // Agent-mode sessions are isolated: no universal memory in or out, and
+      // they run on the task/agent prompt instead of the chat-tab mode prompts.
+      const memoryContext =
+        !arc && settings.autoMemory
+          ? await buildMemoryContext(currentProjectId ?? null, text)
+          : "";
+      const learnContext =
+        !arc && chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
+      const effectiveInstructions = arc
+        ? arc.instructions
+        : [currentProjectInstructions, learnContext, memoryContext]
+            .filter(Boolean).join("\n\n") || undefined;
 
       const completionMessages: AgentMessage[] = [
         ...activePath.map((n) => ({
@@ -621,8 +728,9 @@ export function ChatView() {
           messages: completionMessages,
           instructions: effectiveInstructions,
           mode,
-          webFetchEnabled,
+          webFetchEnabled: arc ? arc.webFetch : webFetchEnabled,
           projectDir: currentProjectDirectory,
+          taskProfile: arc?.taskProfile,
           availableModels: allModels.map((m) => ({ name: m.name, providerId: m.providerId, displayName: m.displayName })),
           providers,
         });
@@ -631,7 +739,10 @@ export function ChatView() {
         inProgressMsgIds.current.delete(sessionId);
       }
 
-      if ((mode === "research" || mode === "council") && result.completed) setChatMode("none");
+      if ((mode === "research" || mode === "council") && result.completed) {
+        setChatMode("none");
+        if (sessionId) updateSession(sessionId, { chat_mode: "none" });
+      }
 
       const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0;
       if (hasOutput) {
@@ -656,8 +767,9 @@ export function ChatView() {
           .catch(() => {});
       }
 
-      // Auto-extract durable memories (background, best-effort)
-      if (settings.autoMemory && !isTemporary && result.content) {
+      // Auto-extract durable memories (background, best-effort). Agent-mode
+      // sessions never write to universal memory — they stay sandboxed.
+      if (!arc && settings.autoMemory && !isTemporary && result.content) {
         void extractAndSaveMemory(provider, selectedModel, text, result.content, "global", loadMemory("global"), sessionId).catch(() => {});
         if (currentProjectId) {
           void extractAndSaveMemory(provider, selectedModel, text, result.content, currentProjectId, loadMemory(currentProjectId), sessionId).catch(() => {});
@@ -733,7 +845,7 @@ export function ChatView() {
         isTemporary,
       );
 
-      updateSession(activeSessionId, {});
+      updateSession(activeSessionId, { chat_mode: chatMode });
 
       const completionMessages: AgentMessage[] = [];
       const pathToParent = activePath.slice(
@@ -748,6 +860,12 @@ export function ChatView() {
       }
       completionMessages.push({ role: "user" as const, content: text });
 
+      const arc = isAgentTab
+        ? agentRunContext({
+            agentId: activeSession?.agentId,
+            isSetup: activeSession?.isSetup === true,
+          })
+        : null;
       const ctrl = getAgentController(activeSessionId!);
       const assistantMsg = await addMessage(
         activeSessionId,
@@ -774,9 +892,11 @@ export function ChatView() {
           provider,
           modelName: selectedModel,
           messages: completionMessages,
-          instructions: currentProjectInstructions || undefined,
-          webFetchEnabled,
+          instructions: arc ? arc.instructions : currentProjectInstructions || undefined,
+          mode: arc?.mode,
+          webFetchEnabled: arc ? arc.webFetch : webFetchEnabled,
           projectDir: currentProjectDirectory,
+          taskProfile: arc?.taskProfile,
         });
       } finally {
         clearInterval(saveInterval);
@@ -827,6 +947,12 @@ export function ChatView() {
         });
       }
 
+      const arc = isAgentTab
+        ? agentRunContext({
+            agentId: activeSession?.agentId,
+            isSetup: activeSession?.isSetup === true,
+          })
+        : null;
       const ctrl = getAgentController(activeSessionId);
       const assistantMsg = await addMessage(
         activeSessionId,
@@ -853,9 +979,11 @@ export function ChatView() {
           provider,
           modelName: selectedModel,
           messages: completionMessages,
-          instructions: currentProjectInstructions || undefined,
-          webFetchEnabled,
+          instructions: arc ? arc.instructions : currentProjectInstructions || undefined,
+          mode: arc?.mode,
+          webFetchEnabled: arc ? arc.webFetch : webFetchEnabled,
           projectDir: currentProjectDirectory,
+          taskProfile: arc?.taskProfile,
         });
       } finally {
         clearInterval(saveInterval);
@@ -909,12 +1037,25 @@ export function ChatView() {
     });
   };
 
+  // Restore the per-session composer mode (Learn stays on until turned off).
+  // Called imperatively on navigation — NOT from an effect — so creating a
+  // session inside handleSend can never race the restore.
+  const applySessionChatMode = (sessionId: string | null) => {
+    const stored = getSessionChatMode(sessionId);
+    setChatMode(
+      stored ?? (settings.temporaryByDefault && !sessionId ? "temporary" : "none"),
+    );
+    autoModeRef.current = "none";
+  };
+
   const handleNewChat = () => {
     if (activeSessionId) {
       deleteTemporaryMessages(activeSessionId);
     }
     setActiveSessionId(null);
     setActiveProjectId(null);
+    setPendingProjectId(null);
+    applySessionChatMode(null);
     setView("chat");
     setWelcomePrompt(
       WELCOME_PROMPTS[Math.floor(Math.random() * WELCOME_PROMPTS.length)],
@@ -927,6 +1068,7 @@ export function ChatView() {
     }
     setActiveSessionId(id);
     setActiveProjectId(null);
+    applySessionChatMode(id);
     setView("chat");
   };
 
@@ -936,10 +1078,70 @@ export function ChatView() {
       await deleteSession(id);
       if (activeSessionId === id) {
         setActiveSessionId(null);
+        applySessionChatMode(null);
       }
     } catch (err) {
       toast.error("Failed to delete chat");
     }
+  };
+
+  // ── Agents tab navigation ───────────────────────────────────────────────
+
+  const switchTab = (tab: "chat" | "agent") => {
+    if (tab === activeTab) return;
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setPendingAgentId(null);
+    setPendingSetup(false);
+    setActiveTab(tab);
+    // Each tab keeps its own active session; restore that session's mode.
+    applySessionChatMode(activeSessionByTab[tab] ?? null);
+    setView("chat");
+  };
+
+  const handleNewTask = () => {
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionId(null);
+    setActiveProjectId(null);
+    setPendingProjectId(null);
+    setPendingAgentId(null);
+    setPendingSetup(false);
+    applySessionChatMode(null);
+    setView("chat");
+  };
+
+  const handleNewAgentSetup = () => {
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionId(null);
+    setActiveProjectId(null);
+    setPendingProjectId(null);
+    setPendingAgentId(null);
+    setPendingSetup(true);
+    applySessionChatMode(null);
+    setView("chat");
+  };
+
+  const handleStartAgentSession = (agentId: string) => {
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionId(null);
+    setActiveProjectId(null);
+    setPendingProjectId(null);
+    setPendingAgentId(agentId);
+    setPendingSetup(false);
+    applySessionChatMode(null);
+    setView("chat");
+  };
+
+  const handleDeleteAgent = (id: string) => {
+    deleteAgent(id);
+    toast("Agent deleted — its sessions stay as task sessions");
   };
 
   const assignProject = (projectId: string | undefined) => {
@@ -983,7 +1185,7 @@ export function ChatView() {
       ) : (
         allModels.map((m) => (
           <SelectItem key={m.id} value={m.name}>
-            {m.displayName || m.name} ({m.providerName})
+            {modelLabel(m)} ({m.providerName})
           </SelectItem>
         ))
       )}
@@ -1000,7 +1202,7 @@ export function ChatView() {
       >
         <SelectValue placeholder="Select model">
           {selectedModelLabel
-            ? `${selectedModelLabel.displayName || selectedModelLabel.name}`
+            ? modelLabel(selectedModelLabel)
             : "Select model"}
         </SelectValue>
       </SelectTrigger>
@@ -1023,7 +1225,14 @@ export function ChatView() {
         variant="ghost"
         aria-label={`Toggle ${label} mode`}
         title={title}
-        onClick={() => setChatMode((prev) => (prev === mode ? "none" : mode))}
+        onClick={() => {
+          // Manual toggle: wins over auto-detection and persists to the
+          // session so the mode survives reloads (learn stays on until off).
+          const next: ChatMode = chatMode === mode ? "none" : mode;
+          setChatMode(next);
+          autoModeRef.current = "none";
+          if (activeSessionId) updateSession(activeSessionId, { chat_mode: next });
+        }}
         className={`group ${active ? activeClass : ""}`}
       >
         {icon}
@@ -1032,7 +1241,7 @@ export function ChatView() {
     );
   };
 
-  const modeToggles = (
+  const modeToggles = !isAgentTab && (
     <>
       {modeToggle(
         "temporary",
@@ -1263,7 +1472,10 @@ export function ChatView() {
                 </Button>
                 {msg.model && (
                   <Badge variant="secondary" className="text-[10px] py-0">
-                    {allModels.find((m) => m.name === msg.model)?.displayName || msg.model}
+                    {(() => {
+                      const m = allModels.find((x) => x.name === msg.model);
+                      return m ? modelLabel(m) : msg.model;
+                    })()}
                   </Badge>
                 )}
                 <Button
@@ -1303,6 +1515,7 @@ export function ChatView() {
         activeSessionId={activeSessionId}
         view={view}
         settingsTab={settingsTab}
+        activeTab={activeTab}
         onSelectSession={selectSession}
         onNewChat={handleNewChat}
         onDeleteChat={handleDeleteSession}
@@ -1313,6 +1526,12 @@ export function ChatView() {
         onProjects={() => setView("projects")}
         onHistory={() => setView("history")}
         onComingSoon={comingSoon}
+        onTabChange={switchTab}
+        onNewTask={handleNewTask}
+        onNewAgent={handleNewAgentSetup}
+        agents={agents}
+        onStartAgentSession={handleStartAgentSession}
+        onDeleteAgent={handleDeleteAgent}
         projects={projects}
         runningIds={runningIds}
       />
@@ -1804,6 +2023,12 @@ export function ChatView() {
                     onSubmit={(values) => agent?.submitInput(values)}
                     onSwitchToText={() => agent?.skipInput()}
                   />
+                ) : agent?.pendingApproval ? (
+                  <ApprovalCard
+                    request={agent.pendingApproval}
+                    onApprove={() => agent?.approveCommand()}
+                    onDeny={() => agent?.rejectCommand()}
+                  />
                 ) : agent?.pendingSuggestion ? (
                   <SuggestionCard
                     suggestion={agent.pendingSuggestion}
@@ -1813,7 +2038,11 @@ export function ChatView() {
                       setSettingsTab("connectors");
                       setView("settings");
                     }}
-                    onEnableMode={(mode) => setChatMode(mode)}
+                    onEnableMode={(mode) => {
+                      setChatMode(mode);
+                      autoModeRef.current = "none";
+                      if (activeSessionId) updateSession(activeSessionId, { chat_mode: mode });
+                    }}
                   />
                 ) : (
                 <InputGroup className={isTemporary ? "border-dashed" : undefined}>
@@ -1826,7 +2055,7 @@ export function ChatView() {
                         handleModeSend();
                       }
                     }}
-                    placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything"}
+                    placeholder={chatComposerPlaceholder}
                     className="max-h-40 min-h-12"
                   />
                   <InputGroupAddon align="block-end">
@@ -2259,7 +2488,7 @@ export function ChatView() {
         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-4 pb-8">
             <h1 className="select-none cursor-default relative z-10 mb-12 text-center text-4xl font-semibold tracking-tight welcome-fade-in">
-              {welcomePrompt}
+              {emptyStateHeading}
             </h1>
             <div className="relative z-10 w-full max-w-3xl">
               {files.length > 0 && (
@@ -2300,6 +2529,12 @@ export function ChatView() {
                   onSubmit={(values) => agent?.submitInput(values)}
                   onSwitchToText={() => agent?.skipInput()}
                 />
+              ) : agent?.pendingApproval ? (
+                <ApprovalCard
+                  request={agent.pendingApproval}
+                  onApprove={() => agent?.approveCommand()}
+                  onDeny={() => agent?.rejectCommand()}
+                />
               ) : agent?.pendingSuggestion ? (
                 <SuggestionCard
                   suggestion={agent.pendingSuggestion}
@@ -2309,7 +2544,11 @@ export function ChatView() {
                     setSettingsTab("connectors");
                     setView("settings");
                   }}
-                  onEnableMode={(mode) => setChatMode(mode)}
+                  onEnableMode={(mode) => {
+                    setChatMode(mode);
+                    autoModeRef.current = "none";
+                    if (activeSessionId) updateSession(activeSessionId, { chat_mode: mode });
+                  }}
                 />
               ) : (
               <InputGroup className={`bg-card/60 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
@@ -2322,7 +2561,7 @@ export function ChatView() {
                       handleModeSend();
                     }
                   }}
-                  placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything"}
+                  placeholder={emptyComposerPlaceholder}
                   className="max-h-40 min-h-12 placeholder:text-muted-foreground/60"
                 />
                 <InputGroupAddon align="block-end">
@@ -2499,6 +2738,11 @@ export function ChatView() {
       return;
     }
 
+    // Pin an auto-detected mode at send time (see handleSend).
+    if (autoModeRef.current !== "none" && chatMode === autoModeRef.current) {
+      autoModeRef.current = "none";
+    }
+
     const mode: AgentMode =
       chatMode === "research" ? "research" : chatMode === "council" ? "council" : "chat";
 
@@ -2509,6 +2753,8 @@ export function ChatView() {
 
       await newSession.persisted;
       const userMsg = await addMessage(newSession.id, "user", text, undefined, undefined, undefined, isTemporary);
+
+      updateSession(newSession.id, { chat_mode: chatMode });
 
       const memoryContext = settings.autoMemory ? await buildMemoryContext(activeProject?.id ?? null, text) : "";
       const learnContext = chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
@@ -2555,7 +2801,10 @@ export function ChatView() {
         inProgressMsgIds.current.delete(newSession.id);
       }
 
-      if ((mode === "research" || mode === "council") && result.completed) setChatMode("none");
+      if ((mode === "research" || mode === "council") && result.completed) {
+        setChatMode("none");
+        updateSession(newSession.id, { chat_mode: "none" });
+      }
 
       const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0;
       if (hasOutput) {

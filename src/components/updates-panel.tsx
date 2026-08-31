@@ -215,7 +215,7 @@ export function UpdatesPanel() {
                 {installed && (
                   <Button size="sm" onClick={() => void relaunchApp()}>
                     <RotateCcw />
-                    Restart to finish
+                    Relaunch
                   </Button>
                 )}
                 <Button variant="ghost" size="sm" onClick={skipVersion}>

@@ -6,8 +6,6 @@ import { ThemeStep } from "@/components/onboarding/theme-step";
 import { ProvidersStep } from "@/components/onboarding/providers-step";
 import { ProviderKeyStep } from "@/components/onboarding/provider-key-step";
 import { ProviderModelsStep } from "@/components/onboarding/provider-models-step";
-import { SkillsStep } from "@/components/onboarding/skills-step";
-import { ConnectorsStep } from "@/components/onboarding/connectors-step";
 import { StepFooter } from "@/components/onboarding/step-chrome";
 import { PatternBackground } from "@/components/background-pattern";
 import { useProviders } from "@/hooks/use-providers";
@@ -29,8 +27,6 @@ type Step =
   | "providers"
   | "provider-key"
   | "provider-models"
-  | "skills"
-  | "connectors"
   | "done";
 
 const ALL_STEPS: Step[] = [
@@ -39,8 +35,6 @@ const ALL_STEPS: Step[] = [
   "providers",
   "provider-key",
   "provider-models",
-  "skills",
-  "connectors",
   "done",
 ];
 
@@ -48,8 +42,6 @@ const TOP_STEPS: Array<{ label: string; steps: Step[] }> = [
   { label: "Welcome", steps: ["welcome"] },
   { label: "Theme", steps: ["theme"] },
   { label: "Providers", steps: ["providers", "provider-key", "provider-models"] },
-  { label: "Skills", steps: ["skills"] },
-  { label: "Connectors", steps: ["connectors"] },
   { label: "Done", steps: ["done"] },
 ];
 
@@ -123,7 +115,11 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
       await addModel(setupProviderId, { id: crypto.randomUUID(), name });
     }
     if (!settings.defaultModel && names.length > 0) {
-      await updateSettings({ defaultModel: names[0] });
+      // Prefer the provider's recommended default (first matching entry in
+      // defaultModels order) over whichever model the API list returned first.
+      const preferred =
+        setupMeta?.defaultModels.find((d) => names.includes(d)) ?? names[0];
+      await updateSettings({ defaultModel: preferred });
     }
   };
 
@@ -214,7 +210,7 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
                 headerBox={headerBox}
                 footerBox={footerBox}
                 onSelect={handleSelectProvider}
-                onContinue={() => gotoStep("skills")}
+                onContinue={() => gotoStep("done")}
                 onBack={() => gotoStep("theme")}
               />
             )}
@@ -242,24 +238,6 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
               />
             )}
 
-            {step === "skills" && (
-              <SkillsStep
-                headerBox={headerBox}
-                footerBox={footerBox}
-                onBack={() => gotoStep("providers")}
-                onNext={() => gotoStep("connectors")}
-              />
-            )}
-
-            {step === "connectors" && (
-              <ConnectorsStep
-                headerBox={headerBox}
-                footerBox={footerBox}
-                onBack={() => gotoStep("skills")}
-                onNext={() => gotoStep("done")}
-              />
-            )}
-
             {step === "done" && (
               <div className="flex flex-col items-center gap-4 py-10 text-center">
                 <PartyPopper className="size-12 text-primary" />
@@ -269,7 +247,7 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
                 <p className="max-w-md text-sm text-muted-foreground">
                   {`${
                     settings.nickname ? `Nice to meet you, ${settings.nickname}. ` : ""
-                  }Your providers, skills, and connectors are ready. You can fine-tune everything anytime in Settings.`}
+                  }Your providers are ready. You can fine-tune everything anytime in Settings.`}
                 </p>
                 <StepFooter target={footerBox}>
                   <div className="flex w-full items-center justify-end">

@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import type { ChatSession } from "@/types";
+import type { ChatSession, SessionChatMode } from "@/types";
 
 const STORAGE_KEY = "chatui:sessions";
 
@@ -14,6 +14,9 @@ function loadSessions(): ChatSession[] {
       projectId?: string;
       type: "chat" | "agent";
       isTemporary?: boolean;
+      chatMode?: SessionChatMode;
+      agentId?: string;
+      isSetup?: boolean;
     }>;
     return data.map((s) => ({
       id: s.id,
@@ -22,6 +25,9 @@ function loadSessions(): ChatSession[] {
       projectId: s.projectId,
       type: s.type,
       isTemporary: s.isTemporary,
+      chatMode: s.chatMode,
+      agentId: s.agentId,
+      isSetup: s.isSetup,
     }));
   } catch {
     return [];
@@ -39,6 +45,9 @@ function saveSessions(sessions: ChatSession[]) {
         projectId: s.projectId,
         type: s.type,
         isTemporary: s.isTemporary,
+        chatMode: s.chatMode,
+        agentId: s.agentId,
+        isSetup: s.isSetup,
       })),
     ),
   );
@@ -71,7 +80,7 @@ export function useSessions(type: "chat" | "agent") {
   );
 
   const createSession = useCallback(
-    (title = "New Chat", projectId?: string) => {
+    (title = "New Chat", projectId?: string, opts?: { chatMode?: SessionChatMode; agentId?: string; isSetup?: boolean }) => {
       const id = crypto.randomUUID();
       const session: ChatSession = {
         id,
@@ -80,11 +89,14 @@ export function useSessions(type: "chat" | "agent") {
         projectId,
         type,
         isTemporary: false,
+        chatMode: opts?.chatMode,
+        agentId: opts?.agentId,
+        isSetup: opts?.isSetup,
       };
       persistSessions((prev) => [session, ...prev]);
       return { ...session, persisted: Promise.resolve() };
     },
-    [persistSessions],
+    [persistSessions, type],
   );
 
   const deleteSession = useCallback(
@@ -95,7 +107,15 @@ export function useSessions(type: "chat" | "agent") {
   );
 
   const updateSession = useCallback(
-    async (id: string, updates: { title?: string; project_id?: string | null }) => {
+    async (
+      id: string,
+      updates: {
+        title?: string;
+        project_id?: string | null;
+        chat_mode?: SessionChatMode;
+        agent_id?: string | null;
+      },
+    ) => {
       persistSessions((prev) =>
         prev.map((s) =>
           s.id === id
@@ -106,6 +126,12 @@ export function useSessions(type: "chat" | "agent") {
                   updates.project_id !== undefined
                     ? updates.project_id ?? undefined
                     : s.projectId,
+                chatMode:
+                  updates.chat_mode !== undefined ? updates.chat_mode : s.chatMode,
+                agentId:
+                  updates.agent_id !== undefined
+                    ? updates.agent_id ?? undefined
+                    : s.agentId,
                 updatedAt: new Date(),
               }
             : s,
@@ -123,4 +149,17 @@ export function useSessions(type: "chat" | "agent") {
   }, [type]);
 
   return { sessions, loading, createSession, deleteSession, updateSession, refetch };
+}
+
+/**
+ * Read one session's stored composer mode straight from storage — works for
+ * sessions of the other tab (the hook's `sessions` array is filtered by type).
+ */
+export function getSessionChatMode(id: string | null): SessionChatMode | undefined {
+  if (!id) return undefined;
+  try {
+    return loadSessions().find((s) => s.id === id)?.chatMode;
+  } catch {
+    return undefined;
+  }
 }

@@ -1,4 +1,4 @@
-import type { AgentEvent, StructuredInputRequest } from "@/lib/agent/types";
+import type { AgentEvent, ApprovalRequest, StructuredInputRequest } from "@/lib/agent/types";
 
 /**
  * Single active agent run context. The app only ever runs one generation at a
@@ -11,6 +11,8 @@ export interface RunContext {
   requestInput?: (
     request: StructuredInputRequest,
   ) => Promise<{ cancelled: true } | { values: Record<string, unknown> }>;
+  /** Pause the tool until the user approves (or denies) a local action. */
+  requestApproval?: (request: ApprovalRequest) => Promise<{ approved: boolean }>;
 }
 
 let current: RunContext | null = null;

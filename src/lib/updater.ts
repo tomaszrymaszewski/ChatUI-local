@@ -8,7 +8,7 @@
  */
 
 import { check, type Update } from "@tauri-apps/plugin-updater";
-import { relaunch } from "@tauri-apps/plugin-process";
+import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -108,9 +108,15 @@ export async function downloadAndInstallUpdate(
   });
 }
 
+/**
+ * Quit the app and reopen it (used after installing an update). Delegates to
+ * the Rust `relaunch_app` command, which relaunches via LaunchServices so the
+ * new instance activates properly — the plugin's built-in restart spawns the
+ * binary directly and leaves the app looking frozen.
+ */
 export async function relaunchApp(): Promise<void> {
   if (!isTauri) return;
-  await relaunch();
+  await invoke("relaunch_app");
 }
 
 export function isUpdaterAvailable(): boolean {

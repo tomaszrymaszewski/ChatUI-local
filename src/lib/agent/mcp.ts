@@ -4,15 +4,15 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { readOpencodeConfig, getMcpEntries, type McpEntry } from "@/lib/opencode-config";
+import { getAccessToken } from "@/lib/mcp-auth";
 
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60);
 }
 
-async function connectClient(entry: McpEntry): Promise<Client> {
+async function connectClient(entry: McpEntry, headers: Record<string, string>): Promise<Client> {
   const client = new Client({ name: "chatui", version: "0.1.0" });
   const url = new URL(entry.url!);
-  const headers = entry.headers ?? {};
   try {
     await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }));
     return client;
@@ -39,6 +39,8 @@ export interface McpToolsResult {
 
 export async function loadMcpTools(
   projectDir?: string | null,
+  /** Restrict to these opencode.json config keys (sandboxed agents). undefined = all enabled; [] = none. */
+  allowedServers?: string[],
 ): Promise<McpToolsResult> {
   const tools: StructuredTool[] = [];
   const clients: Client[] = [];
@@ -52,10 +54,22 @@ export async function loadMcpTools(
 
   for (const [serverName, entry] of entries) {
     if (entry.enabled === false) continue;
+    if (allowedServers && !allowedServers.includes(serverName)) continue;
     if (!entry.url || !/^https?:\/\//.test(entry.url)) continue;
     try {
+      // OAuth-enabled servers: attach the Bearer token from the shared
+      // mcp-auth.json store (written by the `opencode mcp auth` browser
+      // flow) unless the config already carries an explicit auth header.
+      const headers: Record<string, string> = { ...(entry.headers ?? {}) };
+      const hasAuthHeader = Object.keys(headers).some(
+        (k) => k.toLowerCase() === "authorization",
+      );
+      if (!hasAuthHeader) {
+        const token = await getAccessToken(serverName);
+        if (token) headers.Authorization = `Bearer ${token}`;
+      }
       const client = await Promise.race([
-        connectClient(entry),
+        connectClient(entry, headers),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("MCP connect timeout")), 10000),
         ),

@@ -4,11 +4,13 @@ import type { Artifact } from "@/lib/artifacts";
 import { DeepAgentSession, type AgentMessage } from "@/lib/agent/runtime";
 import { runDeepResearch } from "@/lib/agent/deep-research";
 import { runDiscuss } from "@/lib/agent/discuss";
+import { loadUserSettings } from "@/hooks/use-user-settings";
 import type {
   ActivityItem,
   AgentEvent,
   AgentMode,
   AgentRunResult,
+  ApprovalRequest,
   ReasoningStream,
   SuggestionRequest,
   StructuredInputRequest,
@@ -27,11 +29,25 @@ export interface DeepAgentRunOptions {
   availableModels?: Array<{ name: string; providerId: string; displayName?: string }>;
   /** All providers, used by discuss mode to resolve per-role model → ChatOpenAI. */
   providers?: Provider[];
+  /** Agent-mode ("task") runs: which extra tools the run gets. */
+  taskProfile?: {
+    toolProfile: "task" | "setup";
+    /** false withholds run_command/run_coding_task (sandboxed agents without terminal). */
+    enableCommandTools?: boolean;
+    /** true adds read_file/write_file (agents with the local-files capability). */
+    enableFileTools?: boolean;
+    /** Restrict skills to these names (sandboxed agents). */
+    skillNames?: string[];
+    /** Restrict MCP connectors to these opencode.json keys (sandboxed agents). */
+    mcpNames?: string[];
+  };
 }
 
 type InputResolution =
   | { cancelled: true }
   | { values: Record<string, unknown> };
+
+type ApprovalResolution = { approved: boolean };
 
 export interface AgentControllerApi {
   isRunning: boolean;
@@ -42,11 +58,14 @@ export interface AgentControllerApi {
   artifacts: Artifact[];
   pendingInput: StructuredInputRequest | null;
   pendingSuggestion: SuggestionRequest | null;
+  pendingApproval: ApprovalRequest | null;
   reasoningStreams: ReasoningStream[];
   run: (opts: DeepAgentRunOptions) => Promise<AgentRunResult>;
   submitInput: (values: Record<string, unknown>) => void;
   skipInput: () => void;
   dismissSuggestion: () => void;
+  approveCommand: () => void;
+  rejectCommand: () => void;
   stop: () => void;
 }
 
@@ -61,6 +80,7 @@ class AgentController implements AgentControllerApi {
   artifacts: Artifact[] = [];
   pendingInput: StructuredInputRequest | null = null;
   pendingSuggestion: SuggestionRequest | null = null;
+  pendingApproval: ApprovalRequest | null = null;
   reasoningStreams: ReasoningStream[] = [];
 
   private version = 0;
@@ -74,6 +94,9 @@ class AgentController implements AgentControllerApi {
   private artifactsRef: Artifact[] = [];
   private abortRef: AbortController | null = null;
   private inputResolverRef: ((r: InputResolution) => void) | null = null;
+  private approvalResolverRef: ((approved: boolean) => void) | null = null;
+  /** Session-level: the user approved one command in "task" approval mode. */
+  private commandsApprovedForTask = false;
   private reasoningStartRef: number | null = null;
   private reasoningMsRef = 0;
   private reasoningStreamsRef = new Map<string, { text: string; label: string; startTime: number; endTime?: number; seq: number }>();
@@ -231,6 +254,7 @@ class AgentController implements AgentControllerApi {
     this.artifacts = [];
     this.pendingInput = null;
     this.pendingSuggestion = null;
+    this.pendingApproval = null;
     this.reasoningStreams = [];
     this.notify();
   }
@@ -271,6 +295,49 @@ class AgentController implements AgentControllerApi {
     this.notify();
     return new Promise((resolve) => {
       this.inputResolverRef = resolve;
+    });
+  };
+
+  /**
+   * Approval gate for local shell commands (run_command / run_coding_task
+   * permissions). Applies the user's terminal-approval setting:
+   * - "auto": approve immediately.
+   * - "task": approve after the first approval in this session.
+   * - "ask": show an approve/deny card every time.
+   */
+  private promptForApproval = (request: ApprovalRequest): Promise<ApprovalResolution> => {
+    const mode = loadUserSettings().terminalApproval;
+    if (mode === "auto" || (mode === "task" && this.commandsApprovedForTask)) {
+      return Promise.resolve({ approved: true });
+    }
+    const label = request.command.split("\n")[0].slice(0, 60);
+    this.emit({
+      type: "activity",
+      activity: {
+        id: "command-approval",
+        kind: "input",
+        name: label,
+        status: "running",
+        label: "Waiting for your approval",
+      },
+    });
+    this.pendingApproval = request;
+    this.notify();
+    return new Promise((resolve) => {
+      this.approvalResolverRef = (approved: boolean) => {
+        if (approved && mode === "task") this.commandsApprovedForTask = true;
+        this.emit({
+          type: "activity",
+          activity: {
+            id: "command-approval",
+            kind: "input",
+            name: label,
+            status: "done",
+            label: approved ? "Approved" : "Denied",
+          },
+        });
+        resolve({ approved });
+      };
     });
   };
 
@@ -324,9 +391,14 @@ class AgentController implements AgentControllerApi {
           provider: opts.provider,
           modelName: opts.modelName,
           instructions: opts.instructions,
-          mode: "chat",
+          mode: mode === "task" ? "task" : "chat",
           webFetchEnabled: opts.webFetchEnabled,
           projectDir: opts.projectDir,
+          toolProfile: opts.taskProfile?.toolProfile,
+          enableCommandTools: opts.taskProfile?.enableCommandTools,
+          enableFileTools: opts.taskProfile?.enableFileTools,
+          skillNames: opts.taskProfile?.skillNames,
+          mcpNames: opts.taskProfile?.mcpNames,
         });
 
         await session.stream(
@@ -334,6 +406,7 @@ class AgentController implements AgentControllerApi {
           this.emit,
           controller.signal,
           this.promptForInput,
+          this.promptForApproval,
         );
       }
     } catch (err) {
@@ -348,10 +421,12 @@ class AgentController implements AgentControllerApi {
         try { await session.dispose(); } catch { /* best-effort */ }
       }
       this.inputResolverRef = null;
+      this.approvalResolverRef = null;
       this.abortRef = null;
       this.isRunning = false;
       this.pendingInput = null;
       this.pendingSuggestion = null;
+      this.pendingApproval = null;
       this.notify();
       registryNotify();
     }
@@ -406,10 +481,29 @@ class AgentController implements AgentControllerApi {
     this.notify();
   };
 
+  approveCommand = () => {
+    this.approvalResolverRef?.(true);
+    this.approvalResolverRef = null;
+    this.pendingApproval = null;
+    this.notify();
+  };
+
+  rejectCommand = () => {
+    this.approvalResolverRef?.(false);
+    this.approvalResolverRef = null;
+    this.pendingApproval = null;
+    this.notify();
+  };
+
   stop = () => {
     if (this.inputResolverRef) {
       this.inputResolverRef({ cancelled: true });
       this.inputResolverRef = null;
+    }
+    if (this.approvalResolverRef) {
+      this.approvalResolverRef(false);
+      this.approvalResolverRef = null;
+      this.pendingApproval = null;
     }
     this.abortRef?.abort();
   };

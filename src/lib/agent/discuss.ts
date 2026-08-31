@@ -36,6 +36,7 @@ import { createChatModel } from "@/lib/agent/models";
 import { resolveHistoryBudget, truncateMessagesToBudget } from "@/lib/agent/history";
 import type { AgentEvent, StructuredInputRequest } from "@/lib/agent/types";
 import type { AgentMessage } from "@/lib/agent/runtime";
+import { modelLabel } from "@/lib/model-display";
 import { defaultCouncilRoster } from "@/lib/council-roster";
 
 export interface DiscussOptions {
@@ -518,7 +519,7 @@ export async function runDiscuss(
 
   // ─── Stage 0: Alignment ─────────────────────────────────────────────────
   const modelList = opts.availableModels
-    .map((m) => `- ${m.name} (${m.displayName ?? m.name})`)
+    .map((m) => `- ${modelLabel(m)}`)
     .join("\n");
 
   const chairmanAlignmentPrompt = `You are the CHAIRMAN of a deliberation panel (Contrarian, First-Principles Thinker, Expansionist, Outsider). Decide whether the user's question is clear enough to proceed or needs clarifying questions.
@@ -590,7 +591,7 @@ Rules:
         // Build a structured setup form: textareas for each clarifying question
         // (if any) plus per-role model selects. Always shown so the user can
         // pick models even when the chairman deems the question clear.
-        const modelOptions = opts.availableModels.map((m) => m.displayName ?? m.name);
+        const modelOptions = opts.availableModels.map((m) => modelLabel(m));
         const setupReq: StructuredInputRequest = {
           title: "Panel Setup",
           description: questions.length > 0
@@ -664,7 +665,7 @@ Rules:
         // Map selected model display names to model names.
         const resolveModelName = (val: unknown): string | undefined => {
           if (typeof val !== "string" || !val) return undefined;
-          const match = opts.availableModels.find((m) => (m.displayName ?? m.name) === val);
+          const match = opts.availableModels.find((m) => modelLabel(m) === val);
           return match?.name ?? (opts.availableModels.some((m) => m.name === val) ? val : undefined);
         };
         modelAssignments = {

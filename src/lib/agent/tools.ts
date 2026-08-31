@@ -2,6 +2,10 @@ import { z } from "zod";
 import { tool, type StructuredTool } from "langchain";
 import { executeTool } from "@/lib/tools";
 import { runPython } from "@/lib/run-python";
+import { runCommand } from "@/lib/run-command";
+import { runCodingTask } from "@/lib/coding-delegate";
+import { readLocalFile, writeLocalFile } from "@/lib/local-file";
+import { saveAgentDefinition } from "@/lib/agents";
 import { getRunContext, type RunContext } from "@/lib/agent/run-context";
 import { webSearch } from "@/lib/agent/web-search";
 import { CURATED_SKILLS, listBundledSkills, listInstalledSkills } from "@/lib/skills-library";
@@ -9,6 +13,9 @@ import { MCP_CATALOG } from "@/lib/mcp-catalog";
 import { getMcpEntries } from "@/lib/opencode-config";
 
 let artifactCounter = 0;
+
+/** Which extra tools a run gets: plain chat, an agent-mode task, or the agent builder. */
+export type ToolProfile = "chat" | "task" | "setup";
 
 async function runLegacyTool(name: string, args: Record<string, unknown>): Promise<string> {
   const result = await executeTool({
@@ -22,6 +29,9 @@ async function runLegacyTool(name: string, args: Record<string, unknown>): Promi
 export function buildAgentTools(
   webFetchEnabled: boolean,
   getContext?: () => RunContext | null,
+  profile: ToolProfile = "chat",
+  /** Task profile: add read_file/write_file (sandboxed agents with the local-files capability). */
+  enableFiles = false,
 ): StructuredTool[] {
   const ctxFn = getContext ?? getRunContext;
   const tools: StructuredTool[] = [
@@ -120,7 +130,7 @@ export function buildAgentTools(
         fields: Array<{
           name: string;
           label: string;
-          type: "text" | "textarea" | "number" | "select" | "checkbox";
+          type: "text" | "textarea" | "number" | "select" | "checkbox" | "directory";
           description?: string;
           options?: string[];
           required?: boolean;
@@ -154,7 +164,8 @@ export function buildAgentTools(
         name: "request_structured_input",
         description:
           "Ask the user to fill a short structured form instead of typing free text. Use when a task " +
-          "needs specific parameters (e.g. research topic + depth, code task spec, document outline). " +
+          "needs specific parameters (e.g. research topic + depth, code task spec, document outline, " +
+          "or a project folder — use a 'directory' field so the user gets a folder picker). " +
           "The composer transforms into the form; the user can always switch back to free text.",
         schema: z.object({
           title: z.string().describe("Form title, e.g. 'Deep research setup'."),
@@ -164,7 +175,7 @@ export function buildAgentTools(
             z.object({
               name: z.string(),
               label: z.string(),
-              type: z.enum(["text", "textarea", "number", "select", "checkbox"]),
+              type: z.enum(["text", "textarea", "number", "select", "checkbox", "directory"]),
               description: z.string().optional(),
               options: z.array(z.string()).optional().describe("Choices for select fields."),
               required: z.boolean().optional(),
@@ -335,6 +346,244 @@ export function buildAgentTools(
       },
     ),
   ];
+
+  if (profile === "task") {
+    tools.push(
+      tool(
+        async ({ command, cwd, reason }: { command: string; cwd?: string; reason?: string }) => {
+          const ctx = ctxFn();
+          if (!ctx?.requestApproval) {
+            return "Error: command approval is not available in this context. Tell the user what you wanted to run instead.";
+          }
+          // The controller applies the terminal-approval setting here: it may
+          // resolve immediately (auto / already-approved-this-task) or show an
+          // approve/deny card to the user.
+          const { approved } = await ctx.requestApproval({
+            command,
+            cwd,
+            source: "run_command",
+            reason,
+          });
+          if (!approved) {
+            return "The user denied this command. Do not retry it — ask what to do differently or continue without it.";
+          }
+          const result = await runCommand(command, cwd);
+          const parts: string[] = [];
+          if (result.stdout) parts.push(`stdout:\n${result.stdout.slice(0, 8000)}`);
+          if (result.stderr) parts.push(`stderr:\n${result.stderr.slice(0, 4000)}`);
+          if (result.timedOut) parts.push("(command timed out and was killed)");
+          parts.push(`exit code: ${result.exitCode}`);
+          return parts.join("\n\n");
+        },
+        {
+          name: "run_command",
+          description:
+            "Run a shell command on the user's Mac (login shell, so their PATH is available) and return " +
+            "stdout/stderr. Use for file operations, git, builds, tests, inspecting the system — anything " +
+            "a terminal can do. Prefer short, safe, targeted commands. The user approves commands " +
+            "depending on their settings.",
+          schema: z.object({
+            command: z.string().describe("The shell command to execute."),
+            cwd: z.string().optional().describe("Working directory (absolute path)."),
+            reason: z.string().optional().describe("One line: why this command is needed."),
+          }),
+        },
+      ),
+      tool(
+        async ({ prompt, directory }: { prompt: string; directory: string }) => {
+          let result;
+          try {
+            const ctx = ctxFn();
+            result = await runCodingTask({ prompt, directory, requestApproval: ctx?.requestApproval });
+          } catch (err) {
+            return `Coding task failed: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          const lines: string[] = [
+            result.timedOut
+              ? "The coding agent timed out and was stopped. Partial results:"
+              : "The coding agent finished.",
+          ];
+          lines.push(`Its final reply:\n${result.summary.slice(0, 6000)}`);
+          if (result.filesChanged.length > 0) {
+            lines.push(
+              "Files changed:\n" +
+                result.filesChanged
+                  .map((f) => `- ${f.file} (+${f.additions}/-${f.deletions})`)
+                  .join("\n"),
+            );
+          } else {
+            lines.push("No files were changed.");
+          }
+          return lines.join("\n\n");
+        },
+        {
+          name: "run_coding_task",
+          description:
+            "Delegate a coding task to the local coding agent (opencode), which edits files, runs " +
+            "commands, and returns a summary + diff. Use this for real coding work instead of writing " +
+            "code files yourself. ALWAYS confirm the project folder with the user first " +
+            "(request_structured_input with a 'directory' field) and reuse that folder for the " +
+            "rest of the task.",
+          schema: z.object({
+            prompt: z
+              .string()
+              .describe("Full task description for the coding agent: what to build/fix, constraints, where to look."),
+            directory: z.string().describe("Absolute path of the project folder to work in."),
+          }),
+        },
+      ),
+    );
+
+    if (enableFiles) {
+      tools.push(
+        tool(
+          async ({ path, reason }: { path: string; reason?: string }) => {
+            const ctx = ctxFn();
+            if (!ctx?.requestApproval) {
+              return "Error: file access approval is not available in this context. Tell the user which file you wanted to read.";
+            }
+            const { approved } = await ctx.requestApproval({
+              command: path,
+              action: "read",
+              source: "local_file",
+              reason,
+            });
+            if (!approved) {
+              return "The user denied reading this file. Do not retry it — ask what to do differently or continue without it.";
+            }
+            let result;
+            try {
+              result = await readLocalFile(path);
+            } catch (err) {
+              return `Could not read ${path}: ${err instanceof Error ? err.message : String(err)}`;
+            }
+            if (result.kind === "binary") {
+              return `${result.path} — binary file, ${result.size} bytes.\n${result.note ?? ""}`;
+            }
+            const header =
+              result.kind === "pdf-text"
+                ? `${result.path} (PDF, text extracted)`
+                : result.kind === "directory"
+                  ? `${result.path} (folder listing)`
+                  : `${result.path} (${result.size} bytes)`;
+            const parts = [header, result.content];
+            if (result.truncated) {
+              parts.push(
+                `(truncated — the file is ${result.size} bytes; ask the user if you need a specific later section)`,
+              );
+            }
+            if (result.note) parts.push(result.note);
+            return parts.join("\n\n");
+          },
+          {
+            name: "read_file",
+            description:
+              "Read a file from the user's Mac: text files return their content, PDFs return extracted text, " +
+              "and a folder path returns its listing. Use it whenever the user points you at a local document " +
+              "or folder (e.g. \"look at ~/Documents/…/report.pdf\"). The user approves each access.",
+            schema: z.object({
+              path: z
+                .string()
+                .describe("Absolute path of the file or folder on the user's Mac (~ works too)."),
+              reason: z.string().optional().describe("One line: why you need this file."),
+            }),
+          },
+        ),
+        tool(
+          async ({ path, content, reason }: { path: string; content: string; reason?: string }) => {
+            const ctx = ctxFn();
+            if (!ctx?.requestApproval) {
+              return "Error: file access approval is not available in this context. Tell the user which file you wanted to write.";
+            }
+            const { approved } = await ctx.requestApproval({
+              command: path,
+              action: "write",
+              source: "local_file",
+              reason,
+            });
+            if (!approved) {
+              return "The user denied writing this file. Do not retry it — ask what to do differently or continue without it.";
+            }
+            try {
+              const result = await writeLocalFile(path, content);
+              return result.created
+                ? `Created ${result.path} (${result.bytes} bytes).`
+                : `Overwrote ${result.path} with the new content (${result.bytes} bytes).`;
+            } catch (err) {
+              return `Could not write ${path}: ${err instanceof Error ? err.message : String(err)}`;
+            }
+          },
+          {
+            name: "write_file",
+            description:
+              "Create or overwrite a file on the user's Mac with the given full content. The parent folder must " +
+              "already exist. When editing an existing file, read it first, then write the complete new content. " +
+              "The user approves each write.",
+            schema: z.object({
+              path: z
+                .string()
+                .describe("Absolute path of the file to create or overwrite (~ works too)."),
+              content: z.string().describe("The complete new content of the file."),
+              reason: z.string().optional().describe("One line: why you are writing this file."),
+            }),
+          },
+        ),
+      );
+    }
+  }
+
+  if (profile === "setup") {
+    tools.push(
+      tool(
+        async (input: {
+          name: string;
+          purpose: string;
+          system_prompt: string;
+          skills?: string[];
+          connectors?: string[];
+          terminal?: boolean;
+          web?: boolean;
+          files?: boolean;
+        }) => {
+          const def = saveAgentDefinition({
+            name: input.name.trim(),
+            purpose: input.purpose.trim(),
+            systemPrompt: input.system_prompt.trim(),
+            skills: input.skills ?? [],
+            connectors: input.connectors ?? [],
+            capabilities: {
+              terminal: input.terminal ?? false,
+              web: input.web ?? true,
+              files: input.files ?? false,
+              computerUse: false,
+            },
+          });
+          return (
+            `Agent "${def.name}" has been created and now appears in the sidebar under Agents. ` +
+            `Confirm this to the user in one short sentence and recap what the agent does.`
+          );
+        },
+        {
+          name: "create_agent",
+          description:
+            "Create the new agent from the agreed setup. Call exactly once, after the user confirmed " +
+            "the name, purpose, skills, connectors, and capabilities.",
+          schema: z.object({
+            name: z.string().describe("Short agent name, e.g. 'Invoice Wrangler'."),
+            purpose: z.string().describe("One-line description shown in the sidebar."),
+            system_prompt: z
+              .string()
+              .describe("The agent's complete system prompt: identity, how it works, its limits."),
+            skills: z.array(z.string()).optional().describe("Installed skill names to include."),
+            connectors: z.array(z.string()).optional().describe("Connector catalog ids (e.g. 'zapier') to include."),
+            terminal: z.boolean().optional().describe("Whether it may run shell commands / delegate coding (default false)."),
+            web: z.boolean().optional().describe("Whether it may search/fetch the web (default true)."),
+            files: z.boolean().optional().describe("Whether it may read/write local files on the user's Mac via read_file/write_file, each access user-approved (default false)."),
+          }),
+        },
+      ),
+    );
+  }
 
   if (webFetchEnabled) {
     tools.push(

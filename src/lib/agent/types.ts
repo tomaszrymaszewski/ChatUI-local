@@ -34,7 +34,7 @@ export interface TodoItem {
 export interface StructuredInputField {
   name: string;
   label: string;
-  type: "text" | "textarea" | "number" | "select" | "checkbox";
+  type: "text" | "textarea" | "number" | "select" | "checkbox" | "directory";
   description?: string;
   options?: string[];
   required?: boolean;
@@ -58,7 +58,21 @@ export interface SuggestionRequest {
   reason: string;
 }
 
-export type AgentMode = "chat" | "council" | "research";
+/** A local action (shell command / file access / coding-agent permission) awaiting user approval. */
+export interface ApprovalRequest {
+  /** What wants to run: the shell command, the file path, or a human-readable description. */
+  command: string;
+  /** Working directory, when the action is scoped to one. */
+  cwd?: string;
+  /** Where the request came from: "run_command", "local_file", or "opencode". */
+  source: string;
+  /** For local_file requests: whether the agent wants to read or write. */
+  action?: "read" | "write";
+  /** Why the agent wants to run it (its own one-liner). */
+  reason?: string;
+}
+
+export type AgentMode = "chat" | "council" | "research" | "task";
 
 export type AgentEvent =
   | { type: "token"; text: string }

@@ -57,7 +57,8 @@ import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync } from "
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
 import { EMBEDDING_MODELS, setEmbeddingModel } from "@/lib/embeddings";
 import { resetOnboarding } from "@/lib/onboarding";
-import type { Provider, ProviderModel } from "@/types";
+import { modelLabel } from "@/lib/model-display";
+import type { Provider, ProviderModel, UserSettings } from "@/types";
 
 export type SettingsTab = "general" | "memory" | "models" | "skills" | "connectors" | "updates";
 
@@ -306,6 +307,41 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                       updateSettings({ temporaryByDefault: v })
                     }
                   />
+                </div>
+              </div>
+
+              <Separator />
+
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm font-semibold">Terminal commands</span>
+                  <span className="text-xs text-muted-foreground">
+                    How agent-mode tasks may run commands on your Mac
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-sm">Approval</span>
+                    <span className="text-xs text-muted-foreground">
+                      Applies to the agent's run_command and file tools and to
+                      coding-agent permissions
+                    </span>
+                  </div>
+                  <Select
+                    value={settings.terminalApproval}
+                    onValueChange={(v) =>
+                      updateSettings({ terminalApproval: v as UserSettings["terminalApproval"] })
+                    }
+                  >
+                    <SelectTrigger size="sm" className="w-44 shrink-0">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="ask">Ask every time</SelectItem>
+                      <SelectItem value="task">Ask once per task</SelectItem>
+                      <SelectItem value="auto">Run automatically</SelectItem>
+                    </SelectContent>
+                  </Select>
                 </div>
               </div>
 
@@ -662,7 +698,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                                 key={model.id}
                                 className="rounded-md bg-muted px-2 py-1 text-xs font-medium"
                               >
-                                {model.displayName || model.name}
+                                {modelLabel(model)}
                               </span>
                             ))}
                             {provider.models.length === 0 && (
@@ -739,7 +775,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                     ) : (
                       allModels.map((m) => (
                         <SelectItem key={m.id} value={m.name}>
-                          {m.displayName || m.name} ({m.providerName})
+                          {modelLabel(m)} ({m.providerName})
                         </SelectItem>
                       ))
                     )}
@@ -768,7 +804,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                     >
                       <div className="flex flex-col gap-0.5">
                         <span className="text-sm font-medium">
-                          {m.displayName || m.name}
+                          {modelLabel(m)}
                         </span>
                         <span className="text-xs text-muted-foreground">
                           {m.name} · {m.providerName}
@@ -886,7 +922,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
           <DialogHeader>
             <DialogTitle>Remove Model</DialogTitle>
             <DialogDescription>
-              Remove "{deleteModelTarget?.model.displayName || deleteModelTarget?.model.name}" from this provider?
+              Remove "{deleteModelTarget ? modelLabel(deleteModelTarget.model) : ""}" from this provider?
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -909,7 +945,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
           <DialogHeader>
             <DialogTitle>Edit Model Name</DialogTitle>
             <DialogDescription>
-              Change the display name for "{editingModel?.model.name}"
+              Change the display name for "{editingModel ? modelLabel(editingModel.model) : ""}" (id: {editingModel?.model.name})
             </DialogDescription>
           </DialogHeader>
           <EditModelNameForm

@@ -7,6 +7,7 @@ import { Switch } from "@/components/ui/switch";
 import { ProviderLogo } from "@/components/provider-logos";
 import { StepHeader, StepFooter } from "@/components/onboarding/step-chrome";
 import { fetchModelsFromApi, fetchOllamaModels } from "@/lib/llm";
+import { formatModelName } from "@/lib/model-display";
 import type { ProviderMeta } from "@/lib/provider-meta";
 import type { Provider } from "@/types";
 import { cn } from "@/lib/utils";
@@ -151,7 +152,10 @@ export function ProviderModelsStep({
                       : "hover:bg-muted/50",
                   )}
                 >
-                  <span className="truncate font-mono text-xs">{name}</span>
+                  <span className="flex min-w-0 flex-col gap-0.5">
+                    <span className="truncate text-sm font-medium">{formatModelName(name)}</span>
+                    <span className="truncate font-mono text-[10px] text-muted-foreground">{name}</span>
+                  </span>
                   <span className="flex items-center gap-2" onClick={(e) => e.preventDefault()}>
                     {meta.defaultModels.includes(name) && (
                       <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">

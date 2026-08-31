@@ -5,7 +5,7 @@ import type { Provider } from "@/types";
 import type { ContentPart } from "@/lib/llm";
 import { buildSystemPrompt } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
-import { buildAgentTools } from "@/lib/agent/tools";
+import { buildAgentTools, type ToolProfile } from "@/lib/agent/tools";
 import { loadMcpTools, type McpToolsResult } from "@/lib/agent/mcp";
 import { loadSkillFiles, type SkillFile } from "@/lib/agent/skills";
 import type { RunContext } from "@/lib/agent/run-context";
@@ -32,6 +32,16 @@ export interface AgentSessionOptions {
   mode: AgentMode;
   webFetchEnabled: boolean;
   projectDir?: string | null;
+  /** "chat" (default) = chat tools; "task" = + run_command/run_coding_task (+ read_file/write_file with enableFileTools); "setup" = + create_agent. */
+  toolProfile?: ToolProfile;
+  /** Task profile: set false to withhold run_command/run_coding_task (sandboxed agents without terminal). */
+  enableCommandTools?: boolean;
+  /** Task profile: set true to add read_file/write_file (agents with the local-files capability). */
+  enableFileTools?: boolean;
+  /** Restrict loaded skills to these names (sandboxed agents). undefined = all installed. */
+  skillNames?: string[];
+  /** Restrict MCP connectors to these opencode.json config keys. undefined = all enabled; [] = none. */
+  mcpNames?: string[];
 }
 
 const RICH_FORMAT_PROMPT = `
@@ -63,7 +73,7 @@ Side panel artifacts:
 
 const SUGGESTIONS_PROMPT = `
 Chat modes — the user can activate special modes by starting their message with a keyword:
-- "discuss …"  → Discuss mode (a panel of agents deliberates, chairman synthesizes the answer)
+- "discuss …"  → Discuss mode (a panel of agents deliberating, chairman synthesizes the answer)
 - "teach me …" or "i want to learn …" → Learn mode (structured tutoring with a comprehension check)
 - "research …" → Research mode (multi-round, search-driven cited report)
 You can also suggest a mode to the user via the suggest tool when their request would clearly benefit from one.
@@ -83,12 +93,94 @@ Skills and connectors — proactive discovery:
 - After calling suggest, continue your reply naturally — the card is shown to the user automatically.
 `.trim();
 
+const TASK_MANAGER_PROMPT = `
+You are a task manager agent running locally on the user's Mac. You plan and execute tasks
+end-to-end with your tools, and you have access to the user's computer.
+
+Working style:
+- Plan first with write_todos, then execute step by step, keeping the list updated.
+- Spawn subagents with the task tool for independent research or verification work — in parallel
+  when the steps don't depend on each other — and synthesize their reports.
+- Use web_search / web_fetch for anything current or external. Read installed skills under
+  /skills/ when a task matches one.
+- When a task would benefit from a skill or connector the user doesn't have yet, find it with
+  search_skills / search_connectors and propose it with the suggest tool.
+- Connected external apps are available as mcp__… tools.
+- Be transparent: say what you are about to do, and report what you did.
+`.trim();
+
+const TASK_COMMAND_TOOLS_PROMPT = `
+Local execution:
+- run_command executes shell commands on the user's machine (login shell, their PATH). Use it for
+  file operations, git, builds, tests, system inspection — anything a terminal can do. Prefer
+  short, safe, targeted commands, and explain why each is needed. The user approves commands
+  depending on their settings; if one is denied, don't retry it.
+- run_python runs Python for calculations and data processing.
+
+Coding tasks:
+- NEVER write application code files yourself for real coding work. Delegate to the coding agent
+  with run_coding_task: it runs opencode (a local coding agent) inside a project folder and
+  returns its summary and diff.
+- ALWAYS confirm the project folder with the user via request_structured_input (use a 'directory'
+  field so they get a folder picker) before the first run_coding_task in a task, then reuse that
+  folder.
+- Quick explanations or tiny snippets are fine to answer directly.
+`.trim();
+
+const TASK_FILE_TOOLS_PROMPT = `
+Local files:
+- read_file reads a file from the user's Mac — text files directly, PDFs as extracted text, and a
+  folder path as a listing. Use it whenever the user points you at a local document or folder
+  (e.g. a report, paper, or project directory).
+- write_file creates or overwrites a file with the full content. When editing an existing file,
+  read it first, then write the complete new content.
+- The user approves every file access with an approve/deny card; if one is denied, don't retry —
+  ask what to do instead.
+`.trim();
+
+const AGENT_BUILDER_PROMPT = `
+You are the agent builder. The user just clicked "New agent" and this chat sets up a new
+persistent, sandboxed agent.
+
+Your job — interview the user, then create the agent:
+1. Find out what the user wants the agent to do. Ask short follow-up questions with
+   request_structured_input forms (2-4 fields, simple language). If their first message is
+   already specific, confirm the scope in one form instead of interrogating them.
+2. Suggest add-ons: call search_skills and search_connectors for capabilities that match the
+   purpose, and show the best matches with suggest cards. Never suggest anything already
+   installed or connected.
+3. Final form: confirm the agent's name (suggest 2-3 good names), the skills/connectors to
+   include, and whether it needs local file access (read_file/write_file on the user's Mac,
+   each access user-approved) and terminal/command access.
+4. Call create_agent exactly once with the agreed definition, then confirm to the user that the
+   agent is ready and that they can start sessions with it from the sidebar (Agents).
+
+The created agent is focused and self-contained: it runs only on its own system prompt, the
+skills and connectors chosen here, and the tools it needs. It does not share the user's
+universal memory.
+`.trim();
+
 function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
   const parts: string[] = [];
-  const base = buildSystemPrompt(opts.instructions);
-  if (base) parts.push(base);
+  if (opts.toolProfile === "task") {
+    // Agent-mode runs are deliberately isolated from the user's global
+    // settings/memory: they run on the task/agent prompt below plus whatever
+    // instructions the caller passes (the saved agent's own system prompt).
+    parts.push(TASK_MANAGER_PROMPT);
+    if (opts.enableCommandTools !== false) {
+      parts.push(TASK_COMMAND_TOOLS_PROMPT);
+    }
+    if (opts.enableFileTools) {
+      parts.push(TASK_FILE_TOOLS_PROMPT);
+    }
+    if (opts.instructions) parts.push(opts.instructions);
+  } else {
+    if (opts.toolProfile === "setup") parts.push(AGENT_BUILDER_PROMPT);
+    const base = buildSystemPrompt(opts.instructions);
+    if (base) parts.push(base);
+  }
   parts.push(RICH_FORMAT_PROMPT);
-  parts.push(SUGGESTIONS_PROMPT);
+  if (opts.toolProfile !== "task") parts.push(SUGGESTIONS_PROMPT);
   return parts.join("\n\n");
 }
 
@@ -206,12 +298,32 @@ export class DeepAgentSession {
 
   static async create(opts: AgentSessionOptions): Promise<DeepAgentSession> {
     const model = await createChatModel(opts.provider, opts.modelName);
-    const mcp = await loadMcpTools(opts.projectDir);
-    const skillFiles = withBuiltinSkill(await loadSkillFiles(opts.projectDir));
+    const mcp = await loadMcpTools(opts.projectDir, opts.mcpNames);
+    let skillFiles = await loadSkillFiles(opts.projectDir);
+    if (opts.skillNames) {
+      // Sandboxed agents only see the skills chosen at setup time.
+      const allowed = new Set(opts.skillNames);
+      skillFiles = Object.fromEntries(
+        Object.entries(skillFiles).filter(([path]) => {
+          const m = path.match(/^\/skills\/([^/]+)\/SKILL\.md$/);
+          return !m || allowed.has(m[1]);
+        }),
+      );
+    }
+    skillFiles = withBuiltinSkill(skillFiles);
     const historyBudget = await resolveHistoryBudget(opts.provider, opts.modelName);
 
     const runCtx: { current: RunContext | null } = { current: null };
-    const tools = buildAgentTools(opts.webFetchEnabled, () => runCtx.current);
+    const profile = opts.toolProfile ?? "chat";
+    let tools = buildAgentTools(
+      opts.webFetchEnabled,
+      () => runCtx.current,
+      profile,
+      opts.enableFileTools ?? false,
+    );
+    if (profile === "task" && opts.enableCommandTools === false) {
+      tools = tools.filter((t) => t.name !== "run_command" && t.name !== "run_coding_task");
+    }
 
     const agent = await createDeepAgent({
       model,
@@ -220,7 +332,7 @@ export class DeepAgentSession {
       middleware: [todoListMiddleware()],
       skills: ["/skills/"],
       checkpointer: new MemorySaver(),
-      name: "chatui-assistant",
+      name: profile === "chat" ? "chatui-assistant" : `chatui-${profile}`,
     });
 
     return new DeepAgentSession(agent, crypto.randomUUID(), skillFiles, historyBudget, mcp, runCtx);
@@ -245,8 +357,9 @@ export class DeepAgentSession {
     emit: (event: AgentEvent) => void,
     signal?: AbortSignal,
     requestInput?: RunContext["requestInput"],
+    requestApproval?: RunContext["requestApproval"],
   ): Promise<StreamOutcome> {
-    this.runCtx.current = { emit, requestInput };
+    this.runCtx.current = { emit, requestInput, requestApproval };
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const run = await (this.agent as any).streamEvents(input, {

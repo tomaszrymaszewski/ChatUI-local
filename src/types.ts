@@ -50,6 +50,14 @@ export interface Project {
   directory?: string | null;
 }
 
+/** Composer mode for a chat session; "none" is the plain chat (see ChatView). */
+export type SessionChatMode =
+  | "none"
+  | "temporary"
+  | "learn"
+  | "research"
+  | "council";
+
 export interface ChatSession {
   id: string;
   title: string;
@@ -57,6 +65,39 @@ export interface ChatSession {
   projectId?: string;
   type: "chat" | "agent";
   isTemporary?: boolean;
+  /** Composer mode persisted per chat — learn mode stays on until turned off. */
+  chatMode?: SessionChatMode;
+  /** The saved agent this session belongs to (type "agent" only; undefined = standalone task). */
+  agentId?: string;
+  /** True while this session is an agent-builder setup interview. */
+  isSetup?: boolean;
+}
+
+export interface AgentCapabilities {
+  /** May run shell commands and delegate coding tasks (run_command / run_coding_task). */
+  terminal: boolean;
+  /** May read/write local files via read_file/write_file (each access user-approved). */
+  files: boolean;
+  /** May use web search/fetch. */
+  web: boolean;
+  /** Reserved for the computer-use phase (not implemented yet). */
+  computerUse: boolean;
+}
+
+/** A user-defined sandboxed agent created via the agent builder. */
+export interface AgentDefinition {
+  id: string;
+  name: string;
+  /** One-line purpose shown in the sidebar. */
+  purpose: string;
+  /** The agent's own system prompt — besides skills/connectors, all it knows. */
+  systemPrompt: string;
+  /** Installed skill names this agent may use. */
+  skills: string[];
+  /** Connector config keys (opencode.json mcp.<id>) this agent may use. */
+  connectors: string[];
+  capabilities: AgentCapabilities;
+  createdAt: string;
 }
 
 export interface ProviderModel {
@@ -76,6 +117,9 @@ export interface Provider {
 
 export type BackgroundPattern = "none" | "lines" | "plus" | "dots";
 
+/** How agent-mode tasks may run terminal commands on the user's machine. */
+export type TerminalApproval = "ask" | "task" | "auto";
+
 export interface UserSettings {
   defaultModel: string | null;
   sendOnEnter: boolean;
@@ -87,4 +131,5 @@ export interface UserSettings {
   instructions: string;
   embeddingModel: string;
   backgroundPattern: BackgroundPattern;
+  terminalApproval: TerminalApproval;
 }

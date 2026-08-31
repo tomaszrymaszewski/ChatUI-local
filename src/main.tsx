@@ -6,6 +6,21 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import App from "./App";
 import "./index.css";
 
+// Wake detector: after a long system sleep the webview can wake up with dead
+// connections and stalled timers (or macOS may have killed and reloaded the
+// web content process). A 5s heartbeat that jumps by more than 2 minutes
+// means the machine slept — reload so the app always wakes into fresh,
+// working state. localStorage persists all data across the reload.
+let lastHeartbeat = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  if (now - lastHeartbeat > 120_000) {
+    window.location.reload();
+    return;
+  }
+  lastHeartbeat = now;
+}, 5_000);
+
 class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
   { error: Error | null }

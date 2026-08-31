@@ -42,7 +42,7 @@ export const PROVIDER_META: ProviderMeta[] = [
       "Open Settings → Keys",
       "Click \"Create key\", copy it, and paste it here",
     ],
-    defaultModels: ["gpt-oss:20b", "llama3.2:3b"],
+    defaultModels: ["deepseek-v4-flash", "gpt-oss:20b"],
   },
   {
     key: "openrouter",
@@ -56,11 +56,7 @@ export const PROVIDER_META: ProviderMeta[] = [
       "Click \"Create key\", copy it, and paste it here",
       "Connect card and add funds to start using"
     ],
-    defaultModels: [
-      "openrouter/auto",
-      "meta-llama/llama-3.3-70b-instruct",
-      "google/gemini-2.5-flash",
-    ],
+    defaultModels: ["deepseek/deepseek-v4-flash"],
   },
   {
     key: "fireworks",
@@ -74,10 +70,7 @@ export const PROVIDER_META: ProviderMeta[] = [
       "Click \"Create API key\", copy it, and paste it here",
       "Connect card and add funds to start using"
     ],
-    defaultModels: [
-      "accounts/fireworks/models/llama-v3p1-70b-instruct",
-      "accounts/fireworks/models/deepseek-v3",
-    ],
+    defaultModels: ["accounts/fireworks/models/deepseek-v4-flash-0731"],
   },
   {
     key: "deepinfra",
@@ -91,10 +84,7 @@ export const PROVIDER_META: ProviderMeta[] = [
       "Create a new key, copy it, and paste it here",
       "Connect card and add funds to start using"
     ],
-    defaultModels: [
-      "meta-llama/Llama-3.3-70B-Instruct",
-      "Qwen/Qwen2.5-72B-Instruct",
-    ],
+    defaultModels: ["deepseek-ai/DeepSeek-V4-Flash"],
   },
   {
     key: "chatgpt",
@@ -108,7 +98,7 @@ export const PROVIDER_META: ProviderMeta[] = [
       "Click \"Create new secret key\", copy it, and paste it here",
       "Connect card and add funds to start using"
     ],
-    defaultModels: ["gpt-4o-mini", "gpt-4o"],
+    defaultModels: ["gpt-5-mini"],
   },
   {
     key: "claude",
@@ -122,7 +112,7 @@ export const PROVIDER_META: ProviderMeta[] = [
       "Click \"Create key\", copy it, and paste it here",
       "Connect card and add funds to start using"
     ],
-    defaultModels: ["claude-sonnet-4-5", "claude-haiku-4-5"],
+    defaultModels: ["claude-haiku-4-5"],
   },
   {
     key: "gemini",
@@ -135,7 +125,7 @@ export const PROVIDER_META: ProviderMeta[] = [
       "Click \"Create API key\" and pick a project",
       "Copy the key and paste it here",
     ],
-    defaultModels: ["gemini-2.5-flash", "gemini-2.5-pro"],
+    defaultModels: ["gemini-flash-lite-latest"],
   },
   {
     key: "custom",

@@ -1,11 +1,11 @@
-// Learn mode — turns the chat into a structured tutor. The level + subject
-// picked in the UI select a pedagogy block that is injected into the existing
+// Learn mode — turns the chat into a bite-sized tutor. The level + subject
+// preferences select pedagogy guidance that is injected into the existing
 // instructions path (ChatView builds it into `effectiveInstructions`), so no
 // changes to the completion layer were needed.
 //
-// The pedagogy is deliberately assembled from small named pieces (a tutor
-// scaffold plus per-level and per-subject guidance) rather than one big
-// string, so future tools/artifacts (worked-example renderer, quiz panel,
+// The pedagogy is deliberately assembled from small named pieces (intake +
+// assessment flow, per-level and per-subject guidance, bite-sized teaching
+// rules) rather than one big string, so future tools/artifacts (quiz panel,
 // spaced-repetition cards) can hook into a specific piece without rewriting
 // the whole prompt.
 
@@ -73,13 +73,21 @@ export function saveLearnPreferences(prefs: LearnPreferences): void {
 
 // --- Pedagogy pieces ---
 
-/** The fixed tutor scaffold every Learn-mode explanation walks through. */
-export const TUTOR_STRUCTURE = `Structure every explanation with this scaffold, using these exact labeled parts:
-1. **Intuition** — first build the mental model: what this is, why it matters, and an analogy or picture that makes it click, before any technical detail.
-2. **Step-by-step** — then walk through the mechanics in small, ordered steps. One idea per step; never skip a step the learner hasn't earned yet.
-3. **Worked example** — apply it to one concrete, realistic example, shown in full.
-4. **Common pitfalls** — name the mistakes and misconceptions people most often hit here, and how to avoid each.
-5. **Comprehension check** — end with 1-2 short questions (or a tiny exercise) that test whether the learner actually got it. Wait for their answer; then confirm or correct it gently.`;
+/** Intake + assessment flow for the start of a new learning topic. */
+export const INTAKE_AND_ASSESSMENT = `Starting a new topic — when the learner first says what they want to learn or get better at (e.g. "I want to learn Italian" or "get better at calculus"):
+1. Pin down exactly what they want with the request_structured_input tool: a short form (2-4 fields) asking what exactly to learn, their current level, and their goal. Simple language only.
+2. Then run a short assessment (3-5 questions) to find their real level: call request_structured_input again with ONE question per form, spread over several steps — never the whole assessment in a single form. Use select options or a short text field. Wait for each answer before asking the next.
+3. After the assessment, restate what you learned in your visible reply: their level, what they already know, and the plan in a few bullets. Form answers are NOT saved to the chat — your visible reply is the only place they persist, so always summarize them yourself.
+Skip the assessment if the learner already stated their level clearly, or if they choose to skip it.`;
+
+/** Bite-sized teaching rules for every Learn-mode reply. */
+export const BITE_SIZED_TEACHING = `Teaching style — bite-sized:
+- One small piece per message: a single concept, one question, or a tiny task. Never a full lecture.
+- Very simple language: short sentences, everyday words, no jargon. Define a new word the first time you use it.
+- End every message with ONE small question or task for the learner, then STOP and wait for their answer. Never answer your own question.
+- When they answer: confirm warmly or correct gently (explain why, don't just give the solution), then give the next small step.
+- Adapt the pace: if they struggle, go smaller and slower; if it's easy for them, speed up.
+- Wrong answers are normal and useful — treat them as clues for what to revisit, never as failures.`;
 
 export const LEVEL_GUIDANCE: Record<LearnLevel, string> = {
   beginner: `The learner is a beginner. Assume no prior knowledge: define every term the first time you use it, prefer plain everyday words over jargon, keep sentences short, and move slowly. Check understanding often and never rush ahead of them. Celebrate progress.`,
@@ -102,13 +110,15 @@ export const SUBJECT_GUIDANCE: Record<LearnSubject, string> = {
  * Builds the Learn-mode system prompt for the given level + subject. Returned
  * text is a self-contained instruction block meant to be appended to the
  * chat's existing instructions (project instructions, memory, skills).
+ * The level + subject act as defaults until the intake form pins them down.
  */
 export function buildLearnSystemPrompt(level: LearnLevel, subject: LearnSubject): string {
   return [
     "You are in Learn mode: your role is a patient, encouraging tutor, not just an answer engine. Prioritize the learner's understanding over speed or brevity, and adapt pacing to their responses.",
-    `Unless the learner has already stated their level and subject in this conversation, begin by asking them what level they are (beginner, intermediate, or advanced) and what subject they are exploring. Use their answer to guide your teaching for the rest of the conversation. If they have already stated it, proceed directly.`,
+    `The default level is "${level}" and the default subject area is "${subject}" — treat these as starting points and refine them from the intake form and the learner's replies.`,
+    INTAKE_AND_ASSESSMENT,
     LEVEL_GUIDANCE[level],
     SUBJECT_GUIDANCE[subject],
-    TUTOR_STRUCTURE,
+    BITE_SIZED_TEACHING,
   ].join("\n\n");
 }

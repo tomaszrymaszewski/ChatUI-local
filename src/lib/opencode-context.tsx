@@ -216,7 +216,11 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
     }
   }, [startServe]);
 
-  // One-time init
+  // One-time init. NOTE: no auto-start — the app migrated to langchain deep
+  // agents, so the opencode server only connects when something actually
+  // needs it (coding delegation starts it on demand, or the user starts it
+  // explicitly). Auto-starting it here used to attach to every MCP server on
+  // launch, which is what surfaced the MCP OAuth errors in the UI.
   useEffect(() => {
     if (initAttemptedRef.current) return;
     initAttemptedRef.current = true;
@@ -230,14 +234,12 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
           await loadAgents();
           await refreshProviders();
           await refreshSessions();
-        } else if (status.installed) {
-          await startServe().catch(() => {});
         }
       } catch {
         // ignore
       }
     })();
-  }, [startServe, loadAgents, refreshProviders, refreshSessions]);
+  }, [loadAgents, refreshProviders, refreshSessions]);
 
   const selectSession = useCallback(
     async (id: string | null) => {

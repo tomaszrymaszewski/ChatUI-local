@@ -10,8 +10,26 @@ use tauri::{Emitter, Manager};
 
 const OPENCODE_PORT: &str = "2138";
 const OPENCODE_URL: &str = "http://localhost:2138";
+/// opencode's hard-coded MCP OAuth callback listener (see opencode
+/// mcp/oauth-provider.ts OAUTH_CALLBACK_PORT). The process that owns this
+/// port is the one that receives the browser redirect and validates `state`.
+const MCP_OAUTH_CALLBACK_PORT: &str = "19876";
 
 static SERVER_PID: Mutex<Option<u32>> = Mutex::new(None);
+
+/// PID of the currently running scaffold child (run_scaffold). Tracked so the
+/// app can kill it on exit — a hung `npx`/`npm` child would otherwise keep the
+/// scaffold command's blocking thread alive and stall shutdown.
+static SCAFFOLD_PID: Mutex<Option<u32>> = Mutex::new(None);
+
+/// PID of the detached `opencode mcp auth` child. Only ONE OAuth flow may own
+/// the callback listener (127.0.0.1:19876) at a time: opencode validates the
+/// redirect's `state` against the in-memory map of the process that holds the
+/// port, so if a stale flow is still listening when a new one starts, the
+/// browser redirect lands on the wrong process and fails with "Invalid or
+/// expired state parameter - potential CSRF attack". Tracked so a new flow
+/// kills the previous one first, and so exit kills any in-flight flow.
+static AUTH_PID: Mutex<Option<u32>> = Mutex::new(None);
 
 // ─── Structs ──────────────────────────────────────────────────────────────
 
@@ -349,6 +367,20 @@ fn kill_tracked_server() {
     }
 }
 
+fn kill_scaffold_child() {
+    if let Some(pid) = *SCAFFOLD_PID.lock().unwrap() {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+        *SCAFFOLD_PID.lock().unwrap() = None;
+    }
+}
+
+fn kill_tracked_auth() {
+    if let Some(pid) = *AUTH_PID.lock().unwrap() {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+        *AUTH_PID.lock().unwrap() = None;
+    }
+}
+
 /// Find the PID of the process listening on `port` (if any).
 fn pid_listening_on(port: &str) -> Option<u32> {
     let out = Command::new("lsof")
@@ -567,15 +599,295 @@ fn wait_for_health_blocking() -> Result<(), String> {
 
 #[tauri::command]
 async fn opencode_mcp_auth(name: String) -> Result<(), String> {
-    let bin = opencode_bin();
-    // Spawn detached — opencode opens a browser for the OAuth flow.
-    Command::new(&bin)
-        .args(["mcp", "auth", &name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("Failed to run opencode mcp auth: {}", e))?;
-    Ok(())
+    tauri::async_runtime::spawn_blocking(move || {
+        let bin = opencode_bin();
+        // Kill any previous auth flow first (see AUTH_PID). Also evict ANY
+        // listener on the OAuth callback port — a stale process there (from a
+        // crashed session or a manual run) would otherwise receive the browser
+        // redirect, fail to find the new flow's in-memory `state`, and reject
+        // it with "Invalid or expired state parameter - potential CSRF attack".
+        kill_tracked_auth();
+        if let Some(pid) = pid_listening_on(MCP_OAUTH_CALLBACK_PORT) {
+            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+        }
+        // Give the OS a moment to release the port before the new flow binds it.
+        std::thread::sleep(Duration::from_millis(300));
+        // Spawn detached — opencode opens a browser for the OAuth flow.
+        let child = Command::new(&bin)
+            .args(["mcp", "auth", &name])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to run opencode mcp auth: {}", e))?;
+        *AUTH_PID.lock().unwrap() = Some(child.id());
+        // Detach: dropping the Child does not kill it in std.
+        drop(child);
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ─── MCP OAuth tokens (shared store used by opencode) ─────────────────────
+
+fn mcp_auth_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "Could not find home directory".to_string())?;
+    Ok(home
+        .join(".local")
+        .join("share")
+        .join("opencode")
+        .join("mcp-auth.json"))
+}
+
+/// Read opencode's MCP OAuth token store (~/.local/share/opencode/mcp-auth.json).
+/// Returns the raw JSON ("" when the file doesn't exist yet). The frontend
+/// uses it to attach Bearer tokens to its own MCP connections and to show
+/// sign-in status — no running opencode server required.
+#[tauri::command]
+fn read_mcp_auth() -> Result<String, String> {
+    match fs::read_to_string(mcp_auth_path()?) {
+        Ok(content) => Ok(content),
+        Err(_) => Ok(String::new()),
+    }
+}
+
+/// RFC 8615 / MCP-spec well-known URL: for a resource at `origin` + `path`,
+/// metadata lives at `{origin}/.well-known/{suffix}{path}` (the resource path
+/// is appended after the well-known segment; query strings are stripped by
+/// the caller).
+fn well_known_url(origin: &str, path: &str, suffix: &str) -> String {
+    if path.is_empty() || path == "/" {
+        format!("{}/.well-known/{}", origin, suffix)
+    } else {
+        format!("{}/.well-known/{}{}", origin, suffix, path)
+    }
+}
+
+/// Discover the OAuth token endpoint for an MCP server URL: protected-resource
+/// metadata → authorization-server metadata (MCP authorization spec), falling
+/// back to authorization-server metadata on the MCP origin itself.
+fn discover_token_endpoint(
+    client: &reqwest::blocking::Client,
+    server_url: &str,
+) -> Result<String, String> {
+    let url = reqwest::Url::parse(server_url)
+        .map_err(|_| format!("Bad MCP server URL: {}", server_url))?;
+    let origin = url.origin().ascii_serialization();
+    let path = url.path().trim_end_matches('/').to_string();
+
+    let mut auth_server: Option<String> = None;
+    if let Ok(resp) = client
+        .get(well_known_url(&origin, &path, "oauth-protected-resource"))
+        .send()
+    {
+        if resp.status().is_success() {
+            if let Ok(meta) = resp.json::<serde_json::Value>() {
+                auth_server = meta
+                    .pointer("/authorization_servers/0")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+        }
+    }
+
+    let issuer = auth_server.unwrap_or(origin);
+    if let Ok(issuer_url) = reqwest::Url::parse(&issuer) {
+        let meta_url = format!(
+            "{}/.well-known/oauth-authorization-server",
+            issuer_url.origin().ascii_serialization()
+        );
+        if let Ok(resp) = client.get(&meta_url).send() {
+            if resp.status().is_success() {
+                if let Ok(meta) = resp.json::<serde_json::Value>() {
+                    if let Some(te) = meta.get("token_endpoint").and_then(|v| v.as_str()) {
+                        return Ok(te.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Err("Could not discover OAuth token endpoint for this MCP server".to_string())
+}
+
+fn write_mcp_auth(path: &std::path::Path, data: &serde_json::Value) -> Result<(), String> {
+    let content = serde_json::to_string_pretty(data).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, content.as_bytes()))
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, content).map_err(|e| e.to_string())
+    }
+}
+
+/// Refresh an expired MCP OAuth access token using the stored refresh token
+/// (standard OAuth2 refresh grant against the server's discovered token
+/// endpoint), then write the fresh tokens back to mcp-auth.json so both this
+/// app and opencode keep using them. Runs in Rust because the token endpoint
+/// rarely sends CORS headers, so the webview couldn't call it directly.
+#[tauri::command]
+async fn refresh_mcp_token(name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let path = mcp_auth_path()?;
+        let content = fs::read_to_string(&path)
+            .map_err(|_| "No MCP auth data — sign in first".to_string())?;
+        let mut data: serde_json::Value = serde_json::from_str(&content)
+            .map_err(|e| format!("Bad mcp-auth.json: {}", e))?;
+        let entry = data
+            .get(&name)
+            .ok_or_else(|| format!("No auth entry for MCP server: {}", name))?;
+        let refresh_token = entry
+            .pointer("/tokens/refreshToken")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "No refresh token — sign in again".to_string())?
+            .to_string();
+        let client_id = entry
+            .pointer("/clientInfo/clientId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "No OAuth client info — sign in again".to_string())?
+            .to_string();
+        let client_secret = entry
+            .pointer("/clientInfo/clientSecret")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let server_url = entry
+            .get("serverUrl")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "No server URL stored — sign in again".to_string())?
+            .to_string();
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let token_endpoint = discover_token_endpoint(&client, &server_url)?;
+
+        let mut form = vec![
+            ("grant_type", "refresh_token".to_string()),
+            ("refresh_token", refresh_token.clone()),
+            ("client_id", client_id),
+        ];
+        if let Some(secret) = client_secret {
+            form.push(("client_secret", secret));
+        }
+        let resp = client
+            .post(&token_endpoint)
+            .header("Accept", "application/json")
+            .form(&form)
+            .send()
+            .map_err(|e| format!("Token refresh request failed: {}", e))?;
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .map_err(|e| format!("Bad token response: {}", e))?;
+        if !status.is_success() {
+            let msg = body
+                .get("error_description")
+                .or_else(|| body.get("error"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(format!("Token refresh rejected ({}): {}", status, msg));
+        }
+        let access_token = body
+            .get("access_token")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "Token response missing access_token".to_string())?
+            .to_string();
+
+        // Write the fresh tokens back — only touch this server's `tokens`.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut tokens = serde_json::Map::new();
+        tokens.insert(
+            "accessToken".into(),
+            serde_json::Value::String(access_token.clone()),
+        );
+        let new_refresh = body
+            .get("refresh_token")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or(refresh_token);
+        tokens.insert("refreshToken".into(), serde_json::Value::String(new_refresh));
+        if let Some(expires_in) = body.get("expires_in").and_then(|v| v.as_f64()) {
+            tokens.insert("expiresAt".into(), serde_json::json!(now + expires_in));
+        }
+        if let Some(scope) = entry.pointer("/tokens/scope").and_then(|v| v.as_str()) {
+            tokens.insert("scope".into(), serde_json::Value::String(scope.to_string()));
+        }
+        if let Some(e) = data.get_mut(&name).and_then(|e| e.as_object_mut()) {
+            e.insert("tokens".into(), serde_json::Value::Object(tokens));
+        }
+        write_mcp_auth(&path, &data)?;
+
+        Ok(access_token)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ─── Relaunch (update flow) ────────────────────────────────────────────────
+
+/// Quit the app and reopen it. Used after an update is installed, where the
+/// plugin-process `restart` relaunches the binary directly — which bypasses
+/// LaunchServices and leaves the new instance without proper activation.
+/// On macOS we instead spawn a detached shell that waits for this process to
+/// exit (bounded), then `open`s the .app bundle so the new instance is
+/// activated normally. Falls back to a direct binary spawn in dev.
+#[tauri::command]
+fn relaunch_app(app: tauri::AppHandle) {
+    let pid = std::process::id();
+
+    #[cfg(target_os = "macos")]
+    {
+        // current_exe: <bundle>.app/Contents/MacOS/<binary>
+        let bundle_path = std::env::current_exe().ok().and_then(|exe| {
+            let mut dir = exe;
+            dir.pop(); // MacOS
+            dir.pop(); // Contents
+            dir.pop(); // <bundle>.app
+            if dir
+                .extension()
+                .map(|e| e == "app")
+                .unwrap_or(false)
+            {
+                Some(dir)
+            } else {
+                None
+            }
+        });
+
+        if let Some(bundle) = bundle_path {
+            let app_path = bundle.to_string_lossy().to_string();
+            let script = format!(
+                "for i in $(seq 1 50); do kill -0 {pid} 2>/dev/null || break; sleep 0.2; done; open \"{app_path}\""
+            );
+            let _ = Command::new("sh")
+                .arg("-c")
+                .arg(&script)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            app.exit(0);
+            return;
+        }
+    }
+
+    // Fallback (dev / non-bundle): launch the current binary, then exit.
+    if let Ok(exe) = std::env::current_exe() {
+        let _ = Command::new(exe).spawn();
+    }
+    app.exit(0);
 }
 
 // ─── Web fetch (CORS-free) ─────────────────────────────────────────────────
@@ -722,6 +1034,354 @@ async fn run_python(code: String, timeout_ms: Option<u64>) -> Result<PythonRunRe
     .map_err(|e| e.to_string())?
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CommandRunResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub timed_out: bool,
+}
+
+/// Run a shell command for agent-mode tasks (the run_command tool). Same
+/// safety pattern as run_python: pipes drained on separate threads, try_wait
+/// polling, kill on timeout so a runaway command cannot hang the IPC call.
+/// The command runs through a login shell (`sh -lc`) so the user's PATH
+/// (homebrew, nvm, …) is available, optionally in a working directory.
+#[tauri::command]
+async fn run_command(
+    command: String,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+) -> Result<CommandRunResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(120_000));
+
+        if let Some(dir) = cwd.as_deref() {
+            let meta = fs::metadata(dir).map_err(|e| format!("Working directory {}: {}", dir, e))?;
+            if !meta.is_dir() {
+                return Err(format!("Working directory is not a folder: {}", dir));
+            }
+        }
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc").arg(&command);
+        if let Some(dir) = cwd.as_deref() {
+            cmd.current_dir(dir);
+        }
+
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start command: {}", e))?;
+
+        let stdout_handle = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = out.read_to_string(&mut s);
+                s
+            })
+        });
+        let stderr_handle = child.stderr.take().map(|mut err| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = err.read_to_string(&mut s);
+                s
+            })
+        });
+
+        let start = std::time::Instant::now();
+        let mut timed_out = false;
+        let mut final_status: Option<std::process::ExitStatus> = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    final_status = Some(status);
+                    break;
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        timed_out = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => return Err(format!("Failed to wait on command: {}", e)),
+            }
+        }
+
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+
+        let exit_code = final_status.and_then(|s| s.code()).unwrap_or(-1);
+
+        // Bound the payloads crossing IPC.
+        let stdout: String = stdout.chars().take(200_000).collect();
+        let stderr: String = stderr.chars().take(200_000).collect();
+
+        Ok(CommandRunResult { stdout, stderr, exit_code, timed_out })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ─── Local file access (sandboxed agents' read_file / write_file) ──────────
+
+/// How much of a file is read from disk before byte truncation kicks in.
+const LOCAL_FILE_MAX_BYTES: usize = 1024 * 1024;
+/// Char cap for text crossing IPC to the model (same bound as run_python).
+const LOCAL_FILE_MAX_CHARS: usize = 200_000;
+/// Directory listings are capped at this many entries.
+const LOCAL_FILE_MAX_ENTRIES: usize = 500;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFileRead {
+    pub path: String,
+    /// "text" | "pdf-text" | "binary" | "directory"
+    pub kind: String,
+    pub size: u64,
+    pub truncated: bool,
+    pub content: String,
+    pub note: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFileWrite {
+    pub path: String,
+    pub bytes: usize,
+    pub created: bool,
+}
+
+/// Expand a leading `~` to the user's home directory; anything else is used
+/// as-is. The agent tools accept both `~/…` and absolute paths.
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(path)
+}
+
+/// Locate pdftotext (poppler). GUI apps launched from Finder/Dock do not
+/// inherit the shell PATH, so probe the usual Homebrew locations first.
+fn pdftotext_bin() -> Option<PathBuf> {
+    for candidate in [
+        "/opt/homebrew/bin/pdftotext",
+        "/usr/local/bin/pdftotext",
+        "/usr/bin/pdftotext",
+    ] {
+        let p = PathBuf::from(candidate);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    if let Ok(path_env) = std::env::var("PATH") {
+        for dir in path_env.split(':') {
+            let p = PathBuf::from(dir).join("pdftotext");
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// True when the file starts with the `%PDF-` magic bytes.
+fn starts_with_pdf_magic(path: &PathBuf) -> bool {
+    use std::io::Read;
+    let mut header = [0u8; 5];
+    match fs::File::open(path) {
+        Ok(mut f) => f.read_exact(&mut header).is_ok() && &header == b"%PDF-",
+        Err(_) => false,
+    }
+}
+
+/// NUL-byte sniff over the first 8 KiB — the standard "is this binary" check.
+fn sniff_binary(buf: &[u8]) -> bool {
+    buf.iter().take(8192).any(|&b| b == 0)
+}
+
+fn cap_chars(s: &str) -> (String, bool) {
+    if s.chars().count() <= LOCAL_FILE_MAX_CHARS {
+        return (s.to_string(), false);
+    }
+    (s.chars().take(LOCAL_FILE_MAX_CHARS).collect(), true)
+}
+
+/// Plain-text directory listing (folders marked with a trailing `/`),
+/// capped at LOCAL_FILE_MAX_ENTRIES entries.
+fn directory_listing(path: &PathBuf) -> String {
+    let mut names: Vec<String> = Vec::new();
+    if let Ok(read) = fs::read_dir(path) {
+        for entry in read.flatten() {
+            let is_dir = entry.path().is_dir();
+            names.push(format!(
+                "{}{}",
+                entry.file_name().to_string_lossy(),
+                if is_dir { "/" } else { "" }
+            ));
+            if names.len() >= LOCAL_FILE_MAX_ENTRIES {
+                names.push("…".into());
+                break;
+            }
+        }
+    }
+    names.sort_by_key(|n| n.to_lowercase());
+    names.join("\n")
+}
+
+fn read_local_file_impl(raw_path: String) -> Result<LocalFileRead, String> {
+    let p = expand_tilde(&raw_path);
+    if !p.is_absolute() {
+        return Err(format!("Path must be absolute (start with / or ~): {}", raw_path));
+    }
+    let meta = fs::metadata(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
+    let display = p.display().to_string();
+
+    if meta.is_dir() {
+        return Ok(LocalFileRead {
+            path: display,
+            kind: "directory".into(),
+            size: 0,
+            truncated: false,
+            content: directory_listing(&p),
+            note: None,
+        });
+    }
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file or folder", display));
+    }
+    let size = meta.len();
+
+    // PDFs: extract the text with pdftotext (argv only — no shell involved).
+    if starts_with_pdf_magic(&p) {
+        let bin = pdftotext_bin().ok_or_else(|| {
+            "This is a PDF, but pdftotext (poppler) is not installed. Ask the user to run: brew install poppler"
+                .to_string()
+        })?;
+        let out = Command::new(bin)
+            .arg("-layout")
+            .arg(&p)
+            .arg("-")
+            .output()
+            .map_err(|e| format!("Failed to run pdftotext: {}", e))?;
+        if !out.status.success() {
+            return Err(format!(
+                "pdftotext failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let full = String::from_utf8_lossy(&out.stdout);
+        let (content, truncated) = cap_chars(&full);
+        return Ok(LocalFileRead {
+            path: display,
+            kind: "pdf-text".into(),
+            size,
+            truncated,
+            content,
+            note: Some("Text extracted from the PDF with pdftotext — layout is preserved, but images and complex tables may be lost.".into()),
+        });
+    }
+
+    // Regular files: read up to the byte cap (one extra byte detects truncation).
+    use std::io::Read;
+    let mut buf = Vec::new();
+    fs::File::open(&p)
+        .map_err(|e| format!("{}: {}", display, e))?
+        .take(LOCAL_FILE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{}: {}", display, e))?;
+    let truncated = buf.len() > LOCAL_FILE_MAX_BYTES;
+    if truncated {
+        buf.truncate(LOCAL_FILE_MAX_BYTES);
+    }
+    if sniff_binary(&buf) {
+        return Ok(LocalFileRead {
+            path: display,
+            kind: "binary".into(),
+            size,
+            truncated: false,
+            content: String::new(),
+            note: Some("Binary file — contents are not returned as text. Ask the user what to do with it (convert it, open it in an app, or describe what you need).".into()),
+        });
+    }
+    let full = String::from_utf8_lossy(&buf);
+    let (content, char_truncated) = cap_chars(&full);
+    Ok(LocalFileRead {
+        path: display,
+        kind: "text".into(),
+        size,
+        truncated: truncated || char_truncated,
+        content,
+        note: None,
+    })
+}
+
+fn write_local_file_impl(raw_path: String, content: String) -> Result<LocalFileWrite, String> {
+    let p = expand_tilde(&raw_path);
+    if !p.is_absolute() {
+        return Err(format!("Path must be absolute (start with / or ~): {}", raw_path));
+    }
+    if p.is_dir() {
+        return Err(format!("{} is a folder — cannot write to it", p.display()));
+    }
+    let parent = p
+        .parent()
+        .ok_or_else(|| format!("Invalid path: {}", p.display()))?;
+    if !parent.is_dir() {
+        return Err(format!(
+            "Parent folder does not exist: {} (create it first)",
+            parent.display()
+        ));
+    }
+    let existed = p.exists();
+    fs::write(&p, content.as_bytes())
+        .map_err(|e| format!("Cannot write {}: {}", p.display(), e))?;
+    Ok(LocalFileWrite {
+        path: p.display().to_string(),
+        bytes: content.len(),
+        created: !existed,
+    })
+}
+
+/// Read a local file for the sandboxed agents' read_file tool: text files
+/// come back as text, PDFs are converted with pdftotext, folders come back
+/// as a listing, binaries are refused with a note. The user approves every
+/// call in the frontend before this runs (same approval card as run_command).
+#[tauri::command]
+async fn read_local_file(path: String) -> Result<LocalFileRead, String> {
+    tauri::async_runtime::spawn_blocking(move || read_local_file_impl(path))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Create or overwrite a local file for the sandboxed agents' write_file
+/// tool. The parent folder must already exist; the user approves every call
+/// in the frontend before this runs.
+#[tauri::command]
+async fn write_local_file(path: String, content: String) -> Result<LocalFileWrite, String> {
+    tauri::async_runtime::spawn_blocking(move || write_local_file_impl(path, content))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 // ─── Scaffolding ───────────────────────────────────────────────────────────
 
 fn scaffold_command(template: &str) -> Result<(String, Vec<String>), String> {
@@ -770,6 +1430,14 @@ async fn run_scaffold(app: tauri::AppHandle, directory: String, template: String
             .spawn()
             .map_err(|e| format!("Failed to run scaffold: {}", e))?;
 
+        // Track the child so RunEvent::Exit can kill it — without this a hung
+        // scaffold process would keep this blocking thread (and the app's
+        // shutdown) alive indefinitely.
+        {
+            let mut guard = SCAFFOLD_PID.lock().unwrap();
+            *guard = Some(child.id());
+        }
+
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
 
@@ -801,6 +1469,7 @@ async fn run_scaffold(app: tauri::AppHandle, directory: String, template: String
         }
 
         let status = child.wait().map_err(|e| e.to_string())?;
+        *SCAFFOLD_PID.lock().unwrap() = None;
         if status.success() {
             let _ = app.emit("scaffold-event", ScaffoldPayload { kind: "done".into(), data: String::new() });
             Ok(())
@@ -945,6 +1614,159 @@ mod tests {
         assert!(!obj.contains_key("timed_out"));
     }
 
+    // The frontend reads result.exitCode / result.timedOut (src/lib/run-command.ts);
+    // a snake_case payload would silently break the run_command tool.
+    #[test]
+    fn command_run_result_serializes_to_camel_case() {
+        let value = serde_json::to_value(CommandRunResult {
+            stdout: "hi".into(),
+            stderr: "".into(),
+            exit_code: 0,
+            timed_out: false,
+        })
+        .unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("stdout"));
+        assert!(obj.contains_key("stderr"));
+        assert!(obj.contains_key("exitCode"));
+        assert!(obj.contains_key("timedOut"));
+        assert!(!obj.contains_key("exit_code"));
+        assert!(!obj.contains_key("timed_out"));
+    }
+
+    // MCP OAuth metadata discovery follows RFC 8615 well-known URLs with the
+    // resource path appended (query stripped): Supabase serves its protected-
+    // resource metadata at /.well-known/oauth-protected-resource/mcp, Vulx at
+    // the bare /.well-known/oauth-protected-resource. Getting this wrong
+    // silently breaks token refresh.
+    #[test]
+    fn well_known_url_handles_root_and_path_resources() {
+        assert_eq!(
+            super::well_known_url("https://mcp.vulx.ai", "/", "oauth-protected-resource"),
+            "https://mcp.vulx.ai/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            super::well_known_url("https://mcp.vulx.ai", "", "oauth-protected-resource"),
+            "https://mcp.vulx.ai/.well-known/oauth-protected-resource"
+        );
+        assert_eq!(
+            super::well_known_url("https://mcp.supabase.com", "/mcp", "oauth-protected-resource"),
+            "https://mcp.supabase.com/.well-known/oauth-protected-resource/mcp"
+        );
+    }
+
+    // The frontend reads result.kind / result.truncated / result.note
+    // (src/lib/local-file.ts); a snake_case payload would silently break the
+    // read_file tool.
+    #[test]
+    fn local_file_read_serializes_to_camel_case() {
+        let value = serde_json::to_value(LocalFileRead {
+            path: "/tmp/x".into(),
+            kind: "text".into(),
+            size: 2,
+            truncated: false,
+            content: "hi".into(),
+            note: None,
+        })
+        .unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("path"));
+        assert!(obj.contains_key("kind"));
+        assert!(obj.contains_key("size"));
+        assert!(obj.contains_key("truncated"));
+        assert!(obj.contains_key("content"));
+        assert!(obj.contains_key("note"));
+    }
+
+    // The frontend reads result.bytes / result.created (src/lib/local-file.ts).
+    #[test]
+    fn local_file_write_serializes_to_camel_case() {
+        let value = serde_json::to_value(LocalFileWrite {
+            path: "/tmp/x".into(),
+            bytes: 2,
+            created: true,
+        })
+        .unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("path"));
+        assert!(obj.contains_key("bytes"));
+        assert!(obj.contains_key("created"));
+    }
+
+    #[test]
+    fn expand_tilde_resolves_home_and_leaves_other_paths() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_tilde("~"), home);
+        assert_eq!(expand_tilde("~/Documents"), home.join("Documents"));
+        assert_eq!(expand_tilde("/tmp/x"), PathBuf::from("/tmp/x"));
+        assert_eq!(expand_tilde("relative"), PathBuf::from("relative"));
+    }
+
+    #[test]
+    fn sniff_binary_detects_nul_bytes() {
+        assert!(sniff_binary(b"abc\x00def"));
+        assert!(!sniff_binary(b"abc\ndef\n"));
+        // A NUL past the sniff window does not mark the file binary.
+        let far = vec![b'a'; 9000];
+        assert!(!sniff_binary(&far));
+    }
+
+    #[test]
+    fn pdf_magic_detection() {
+        let dir = std::env::temp_dir().join(format!("chatui-pdf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("fake.pdf");
+        fs::write(&pdf, b"%PDF-1.7 fake").unwrap();
+        assert!(starts_with_pdf_magic(&pdf));
+        let txt = dir.join("t.txt");
+        fs::write(&txt, b"plain text").unwrap();
+        assert!(!starts_with_pdf_magic(&txt));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // End-to-end behavior of the read/write helpers on real files: text
+    // roundtrip, created vs overwrite, binary refusal, directory listing,
+    // missing-parent refusal, and relative-path refusal.
+    #[test]
+    fn local_file_roundtrip_and_kinds() {
+        let dir = std::env::temp_dir().join(format!("chatui-lf-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("note.txt");
+        let txt_s = txt.to_string_lossy().to_string();
+
+        let w = write_local_file_impl(txt_s.clone(), "hello".into()).unwrap();
+        assert!(w.created);
+        assert_eq!(w.bytes, 5);
+
+        let r = read_local_file_impl(txt_s.clone()).unwrap();
+        assert_eq!(r.kind, "text");
+        assert_eq!(r.content, "hello");
+        assert!(!r.truncated);
+
+        let w2 = write_local_file_impl(txt_s.clone(), "hello again".into()).unwrap();
+        assert!(!w2.created);
+
+        let bin = dir.join("blob.bin");
+        fs::write(&bin, [0x01, 0x00, 0x02]).unwrap();
+        let rb = read_local_file_impl(bin.to_string_lossy().to_string()).unwrap();
+        assert_eq!(rb.kind, "binary");
+        assert!(rb.note.is_some());
+        assert!(rb.content.is_empty());
+
+        let rd = read_local_file_impl(dir.to_string_lossy().to_string()).unwrap();
+        assert_eq!(rd.kind, "directory");
+        assert!(rd.content.contains("note.txt"));
+        assert!(rd.content.contains("blob.bin"));
+
+        let bad = dir.join("nope").join("x.txt");
+        assert!(write_local_file_impl(bad.to_string_lossy().to_string(), "x".into()).is_err());
+        assert!(read_local_file_impl(dir.join("missing.txt").to_string_lossy().to_string()).is_err());
+        assert!(read_local_file_impl("relative.txt".into()).is_err());
+        assert!(write_local_file_impl("relative.txt".into(), "x".into()).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     // Live smoke test (network) — run explicitly: cargo test -- --ignored.
     // Uses Bing's RSS endpoint (the keyless-search primary) because DuckDuckGo
     // intermittently answers plain clients with a 202 anomaly challenge.
@@ -990,8 +1812,14 @@ pub fn run() {
             opencode_server_log,
             opencode_serve_in_dir,
             opencode_mcp_auth,
+            read_mcp_auth,
+            refresh_mcp_token,
             http_fetch,
+            relaunch_app,
             run_python,
+            run_command,
+            read_local_file,
+            write_local_file,
             run_scaffold,
             list_local_sessions,
             save_local_session,
@@ -1006,9 +1834,41 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 
-    app.run(|_app_handle, event| {
-        if let tauri::RunEvent::Exit = event {
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::Exit => {
             kill_tracked_server();
+            kill_scaffold_child();
+            kill_tracked_auth();
         }
+        // macOS: the Dock icon was clicked. If the process is alive but the
+        // window was lost (e.g. after a sleep/wake cycle or a stalled quit),
+        // the default behavior is a no-op — show (or recreate) the window so
+        // clicking the Dock always opens the app (tauri#12570).
+        #[cfg(target_os = "macos")]
+        tauri::RunEvent::Reopen {
+            has_visible_windows,
+            ..
+        } => {
+            if !has_visible_windows {
+                if let Some(win) = app_handle.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.unminimize();
+                    let _ = win.set_focus();
+                } else {
+                    let _ = tauri::WebviewWindowBuilder::new(
+                        app_handle,
+                        "main",
+                        tauri::WebviewUrl::default(),
+                    )
+                    .title("chatui")
+                    .inner_size(1280.0, 800.0)
+                    .min_inner_size(800.0, 600.0)
+                    .hidden_title(true)
+                    .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .build();
+                }
+            }
+        }
+        _ => {}
     });
 }
