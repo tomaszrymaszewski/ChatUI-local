@@ -122,9 +122,12 @@ export function AppSidebar({
   onTabChange,
   onNewTask,
   onNewAgent,
+  onSwitchToAgent,
   agents = [],
+  onOpenAgentConsole,
   onStartAgentSession,
   onDeleteAgent,
+  onOpenAgentSettings,
   projects,
   runningIds,
   ...props
@@ -147,9 +150,12 @@ export function AppSidebar({
   onTabChange?: (tab: "chat" | "agent") => void
   onNewTask?: () => void
   onNewAgent?: () => void
+  onSwitchToAgent?: (id: string) => void
   agents?: AgentDefinition[]
+  onOpenAgentConsole?: (agentId: string) => void
   onStartAgentSession?: (agentId: string) => void
   onDeleteAgent?: (id: string) => void
+  onOpenAgentSettings?: (id: string) => void
   projects?: Project[]
   runningIds?: Set<string>
 }) {
@@ -194,11 +200,13 @@ export function AppSidebar({
                 agents={agents}
                 sessions={sessions}
                 activeSessionId={activeSessionId}
+                onOpenAgentConsole={(agentId) => onOpenAgentConsole?.(agentId)}
                 onStartAgentSession={(agentId) => onStartAgentSession?.(agentId)}
                 onSelectSession={onSelectSession}
                 onDeleteSession={onDeleteChat}
                 onRenameSession={onRenameChat}
                 onDeleteAgent={(id) => onDeleteAgent?.(id)}
+                onOpenAgentSettings={(id) => onOpenAgentSettings?.(id)}
                 runningIds={runningIds}
               />
             </SidebarContent>
@@ -235,6 +243,7 @@ export function AppSidebar({
               onSelect={onSelectSession}
               onDelete={onDeleteChat}
               onRename={onRenameChat}
+              onSwitchToAgent={onSwitchToAgent}
               projects={projects}
               label="Recent"
               runningIds={runningIds}

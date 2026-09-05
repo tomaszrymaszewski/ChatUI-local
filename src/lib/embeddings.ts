@@ -18,6 +18,8 @@ export const EMBEDDING_MODELS: EmbeddingModelOption[] = [
 ];
 
 const DEFAULT_MODEL = "Xenova/all-MiniLM-L6-v2";
+/** Preselected as "Recommended" during onboarding (see onboarding wizard). */
+export const RECOMMENDED_EMBEDDING_MODEL = "Xenova/bge-small-en-v1.5";
 const MODEL_DIMS: Record<string, number> = Object.fromEntries(
   EMBEDDING_MODELS.map((m) => [m.id, m.dims]),
 );
@@ -92,6 +94,38 @@ export async function embed(texts: string[]): Promise<number[][]> {
 export async function embedQuery(text: string): Promise<number[]> {
   const [vec] = await embed([text]);
   return vec ?? hashEmbed(text);
+}
+
+export interface EmbeddingProgressInfo {
+  status: string;
+  file?: string;
+  progress?: number;
+  loaded?: number;
+  total?: number;
+}
+
+/**
+ * Eagerly download + warm up an embedding model (used right after the
+ * onboarding step so the first file attachment doesn't pay the download
+ * cost). Reports per-file download progress; throws on failure (the caller
+ * can fall back to the lazy first-use download).
+ */
+export async function preloadEmbeddingModel(
+  modelId: string,
+  onProgress?: (info: EmbeddingProgressInfo) => void,
+): Promise<void> {
+  const mod = await import("@huggingface/transformers");
+  mod.env.allowLocalModels = false;
+  const options: Record<string, unknown> = onProgress
+    ? { progress_callback: (data: EmbeddingProgressInfo) => onProgress(data) }
+    : {};
+  const extractor = await mod.pipeline("feature-extraction", modelId, options);
+  // Warm-up inference so the first real embed is instant.
+  await extractor(["warm-up"], { pooling: "mean", normalize: true });
+  // Make the loaded pipeline the live one for this model.
+  currentModelId = modelId;
+  pipelinePromise = Promise.resolve(extractor);
+  useFallback = false;
 }
 
 export function cosineSimilarity(a: number[], b: number[]): number {

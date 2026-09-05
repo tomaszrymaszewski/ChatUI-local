@@ -3,6 +3,8 @@ import type { AgentDefinition } from "@/types";
 import {
   loadAgentDefinitions,
   deleteAgentDefinition,
+  updateAgentDefinition,
+  type AgentUpdatePatch,
   subscribeToAgents,
 } from "@/lib/agents";
 
@@ -19,5 +21,9 @@ export function useAgents() {
     deleteAgentDefinition(id);
   }, []);
 
-  return { agents, deleteAgent };
+  const updateAgent = useCallback((id: string, patch: AgentUpdatePatch) => {
+    updateAgentDefinition(id, patch);
+  }, []);
+
+  return { agents, deleteAgent, updateAgent };
 }

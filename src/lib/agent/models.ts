@@ -1,6 +1,15 @@
 import { ChatOpenAI } from "@langchain/openai";
 import type { Provider } from "@/types";
 import { getProviderApiKey } from "@/lib/llm";
+import { getModelOutputLimit } from "@/lib/model-capabilities";
+
+/**
+ * Fallback max_tokens when the models.dev catalog doesn't know the model.
+ * Without an explicit value the provider default applies, which can be
+ * surprisingly small (e.g. DeepSeek defaults to 4096 output tokens) and
+ * truncates long agent answers mid-stream.
+ */
+const FALLBACK_MAX_TOKENS = 8192;
 
 /**
  * The OpenAI JS client (under ChatOpenAI) attaches X-Stainless-* telemetry
@@ -33,6 +42,7 @@ export async function createChatModel(
   modelName: string,
 ): Promise<ChatOpenAI> {
   const apiKey = await getProviderApiKey(provider.id);
+  const outputLimit = await getModelOutputLimit(provider, modelName).catch(() => null);
   return new ChatOpenAI({
     model: modelName,
     apiKey: apiKey || "no-key",
@@ -40,6 +50,7 @@ export async function createChatModel(
       baseURL: provider.baseUrl.replace(/\/$/, ""),
       fetch: corsSafeFetch,
     },
+    maxTokens: outputLimit ?? FALLBACK_MAX_TOKENS,
     maxRetries: 1,
     timeout: 300_000,
   });

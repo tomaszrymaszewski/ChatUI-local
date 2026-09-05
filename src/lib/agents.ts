@@ -43,6 +43,39 @@ export function deleteAgentDefinition(id: string) {
   persistAgents(loadAgentDefinitions().filter((a) => a.id !== id));
 }
 
+/** Fields callers may patch on a saved agent (identity/config only). */
+export type AgentUpdatePatch = Partial<
+  Omit<AgentDefinition, "id" | "createdAt" | "capabilities">
+> & {
+  /** Merged into the existing capabilities (partial allowed). */
+  capabilities?: Partial<AgentDefinition["capabilities"]>;
+};
+
+/**
+ * Update a saved agent in place. Returns the updated definition, or null when
+ * the id is unknown. Fires the change event so sidebars/dialogs re-render.
+ */
+export function updateAgentDefinition(
+  id: string,
+  patch: AgentUpdatePatch,
+): AgentDefinition | null {
+  const agents = loadAgentDefinitions();
+  const idx = agents.findIndex((a) => a.id === id);
+  if (idx === -1) return null;
+  const prev = agents[idx];
+  const next: AgentDefinition = {
+    ...prev,
+    ...patch,
+    // Never let a patch move or recreate the record.
+    id: prev.id,
+    createdAt: prev.createdAt,
+    capabilities: { ...prev.capabilities, ...(patch.capabilities ?? {}) },
+  };
+  agents[idx] = next;
+  persistAgents(agents);
+  return next;
+}
+
 export function subscribeToAgents(fn: () => void): () => void {
   window.addEventListener(AGENTS_EVENT, fn);
   return () => window.removeEventListener(AGENTS_EVENT, fn);

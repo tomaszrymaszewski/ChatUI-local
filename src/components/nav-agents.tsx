@@ -1,11 +1,12 @@
 import { useState } from "react";
 import {
-  Bot,
   MoreHorizontal,
   Pencil,
   Plus,
+  Settings2,
   Trash2,
 } from "lucide-react"
+import { AgentAvatar } from "@/components/agent-avatar"
 
 import {
   DropdownMenu,
@@ -29,7 +30,6 @@ import {
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar"
-import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import type { AgentDefinition, ChatSession } from "@/types"
@@ -43,21 +43,25 @@ export function NavAgents({
   agents,
   sessions,
   activeSessionId,
+  onOpenAgentConsole,
   onStartAgentSession,
   onSelectSession,
   onDeleteSession,
   onRenameSession,
   onDeleteAgent,
+  onOpenAgentSettings,
   runningIds,
 }: {
   agents: AgentDefinition[]
   sessions: ChatSession[]
   activeSessionId: string | null
+  onOpenAgentConsole: (agentId: string) => void
   onStartAgentSession: (agentId: string) => void
   onSelectSession: (id: string) => void
   onDeleteSession: (id: string) => void
   onRenameSession?: (id: string, title: string) => void
   onDeleteAgent: (id: string) => void
+  onOpenAgentSettings?: (id: string) => void
   runningIds?: Set<string>
 }) {
   const { isMobile } = useSidebar()
@@ -92,10 +96,10 @@ export function NavAgents({
           {agents.map((agent) => (
             <SidebarMenuItem key={agent.id}>
               <SidebarMenuButton
-                onClick={() => onStartAgentSession(agent.id)}
-                tooltip={agent.purpose}
+                onClick={() => onOpenAgentConsole(agent.id)}
+                tooltip={agent.purpose || agent.name}
               >
-                <Bot />
+                <AgentAvatar seed={agent.id} className="size-4" />
                 <span className="truncate">{agent.name}</span>
               </SidebarMenuButton>
               <DropdownMenu>
@@ -114,6 +118,12 @@ export function NavAgents({
                     <Plus className="text-muted-foreground" />
                     <span>New session</span>
                   </DropdownMenuItem>
+                  {onOpenAgentSettings && (
+                    <DropdownMenuItem onClick={() => onOpenAgentSettings(agent.id)}>
+                      <Settings2 className="text-muted-foreground" />
+                      <span>Settings…</span>
+                    </DropdownMenuItem>
+                  )}
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     variant="destructive"
@@ -149,11 +159,12 @@ export function NavAgents({
                   {runningIds?.has(session.id) && (
                     <Spinner className="ml-auto size-3" />
                   )}
-                  {agentName && !runningIds?.has(session.id) && (
-                    <Badge variant="secondary" className="ml-auto gap-1 text-[10px]">
-                      <Bot className="size-2.5" />
-                      <span className="max-w-24 truncate">{agentName}</span>
-                    </Badge>
+                  {session.agentId && !runningIds?.has(session.id) && (
+                    <AgentAvatar
+                      seed={session.agentId}
+                      className="ml-auto -mr-7 size-4 max-md:opacity-0 md:group-hover/menu-item:opacity-0 md:group-focus-within/menu-item:opacity-0 md:group-has-data-[state=open]/menu-item:opacity-0"
+                      title={agentName}
+                    />
                   )}
                 </SidebarMenuButton>
                 <DropdownMenu>

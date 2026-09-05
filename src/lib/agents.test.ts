@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   loadAgentDefinitions,
   saveAgentDefinition,
+  updateAgentDefinition,
   deleteAgentDefinition,
   subscribeToAgents,
 } from "@/lib/agents";
@@ -62,6 +63,56 @@ describe("agent definitions storage", () => {
     const saved = saveAgentDefinition(sampleDef);
     deleteAgentDefinition(saved.id);
     expect(loadAgentDefinitions()).toHaveLength(0);
+  });
+
+  it("updates a definition in place, keeping id and createdAt", () => {
+    const saved = saveAgentDefinition(sampleDef);
+    const updated = updateAgentDefinition(saved.id, {
+      name: "Invoice Boss",
+      systemPrompt: "You chase invoices aggressively.",
+      model: "gpt-5",
+      readChats: true,
+      allowedFolders: ["/Users/tester/Projects/invoices"],
+      capabilities: { terminal: true },
+    });
+    expect(updated?.id).toBe(saved.id);
+    expect(updated?.createdAt).toBe(saved.createdAt);
+    expect(updated?.name).toBe("Invoice Boss");
+    expect(updated?.model).toBe("gpt-5");
+    expect(updated?.readChats).toBe(true);
+    expect(updated?.allowedFolders).toEqual(["/Users/tester/Projects/invoices"]);
+    // capabilities patch merges into the existing object, not replaces it.
+    expect(updated?.capabilities).toEqual({
+      terminal: true,
+      web: true,
+      files: false,
+      computerUse: false,
+    });
+    // Still exactly one record, updated in place.
+    const all = loadAgentDefinitions();
+    expect(all).toHaveLength(1);
+    expect(all[0].name).toBe("Invoice Boss");
+  });
+
+  it("clears a patchable field back to undefined (e.g. model)", () => {
+    const saved = saveAgentDefinition({ ...sampleDef, model: "gpt-5" });
+    const updated = updateAgentDefinition(saved.id, { model: undefined });
+    expect(updated?.model).toBeUndefined();
+  });
+
+  it("returns null when updating an unknown id and changes nothing", () => {
+    saveAgentDefinition(sampleDef);
+    expect(updateAgentDefinition("nope", { name: "X" })).toBeNull();
+    expect(loadAgentDefinitions()[0].name).toBe("Invoice Wrangler");
+  });
+
+  it("notifies subscribers when a definition is updated", () => {
+    const saved = saveAgentDefinition(sampleDef);
+    const fn = vi.fn();
+    const unsubscribe = subscribeToAgents(fn);
+    updateAgentDefinition(saved.id, { purpose: "New purpose" });
+    expect(fn).toHaveBeenCalledTimes(1);
+    unsubscribe();
   });
 
   it("drops malformed entries instead of throwing", () => {

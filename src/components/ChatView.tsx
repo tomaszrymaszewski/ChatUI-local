@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ArrowUp,
   ArrowLeft,
+  Bot,
   Paperclip,
   Check,
   ClockFading,
@@ -31,6 +32,9 @@ import {
 import { toast } from "sonner";
 import { AppSidebar } from "@/components/app-sidebar";
 import { ApprovalCard } from "@/components/approval-card";
+import { AgentAvatar } from "@/components/agent-avatar";
+import { AgentConsole } from "@/components/agent-console";
+import { AgentSettingsDialog } from "@/components/agent-settings-dialog";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { MessageStream } from "@/components/message-stream";
 import { SettingsView, type SettingsTab } from "@/pages/settings";
@@ -56,6 +60,7 @@ import {
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Card,
   CardContent,
@@ -120,29 +125,36 @@ import { Textarea } from "@/components/ui/textarea";
 import type {
   Message as ChatMessage,
   MessageAttachment,
+  AgentConfigPatch,
+  AgentDefinition,
 } from "@/types";
 import { useSessions, getSessionChatMode } from "@/hooks/use-sessions";
-import { useMessages } from "@/hooks/use-messages";
+import { useMessages, loadMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { useAgents } from "@/hooks/use-agents";
 import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController } from "@/hooks/use-deep-agent";
 import type { AgentMode, AgentRunResult } from "@/lib/agent/types";
+import type { AgentSandbox } from "@/lib/agent/sandbox";
+import { ensureAgentWorkspace, removeAgentWorkspace } from "@/lib/agent/sandbox";
+import { applyAgentConfigPatch } from "@/lib/agent/tools";
 import {
   buildLearnSystemPrompt,
   loadLearnPreferences,
   type LearnLevel,
   type LearnSubject,
 } from "@/lib/learn-mode";
-import { generateChatTitle, type ContentPart } from "@/lib/llm";
+import { generateChatTitle, instantChatTitle, type ContentPart } from "@/lib/llm";
 import type { AgentMessage } from "@/lib/agent/runtime";
 import {
   buildMessageTree,
   getActivePath,
   getSiblings,
 } from "@/lib/message-tree";
-import { prepareAttachmentContext } from "@/lib/attachment-context";
+import { prepareAttachmentContext, rebuildAttachmentContent, buildProjectFilesContext } from "@/lib/attachment-context";
+import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store";
+import { extractFileText } from "@/lib/files";
 import { getModelCapabilities } from "@/lib/model-capabilities";
 import { buildMemoryContext, extractAndSaveMemory, loadMemory } from "@/lib/memory";
 
@@ -205,13 +217,13 @@ const CONTAINER_PADDING_PX = 16;
 
 export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
-  const { sessions, createSession, deleteSession, updateSession } =
+  const { sessions, createSession, deleteSession, updateSession, moveToAgentTab } =
     useSessions(activeTab);
   const { projects, createProject, updateProject, deleteProject, addProjectFile, deleteProjectFile, addProjectImage, deleteProjectImage, refetch: refetchProjects } =
     useProjects();
   const { providers, refetch: refetchProviders } = useProviders();
   const { settings } = useUserSettings();
-  const { agents, deleteAgent } = useAgents();
+  const { agents, deleteAgent, updateAgent } = useAgents();
   const isAgentTab = activeTab === "agent";
 
   const [activeSessionByTab, setActiveSessionByTab] = useState<
@@ -246,14 +258,21 @@ export function ChatView() {
   // saved agent it belongs to, or whether it's an agent-builder setup chat.
   const [pendingAgentId, setPendingAgentId] = useState<string | null>(null);
   const [pendingSetup, setPendingSetup] = useState(false);
+  // Agent whose settings dialog is open (gear menu in the sidebar).
+  const [agentSettingsId, setAgentSettingsId] = useState<string | null>(null);
+  // Agent whose console is open (clicking the agent in the sidebar).
+  const [activeAgentConsoleId, setActiveAgentConsoleId] = useState<string | null>(null);
   const [view, setView] = useState<"chat" | "settings" | "projects" | "history">("chat");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const openSettings = () => setView("settings");
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [projectSearch, setProjectSearch] = useState("");
   const [historySearch, setHistorySearch] = useState("");
+  const [historySelectedIds, setHistorySelectedIds] = useState<Set<string>>(new Set());
   const [renamingHistory, setRenamingHistory] = useState<{ id: string; title: string } | null>(null);
   const [historyRenameDraft, setHistoryRenameDraft] = useState("");
+  // Session id for the "this conversation moved to the Agents tab" notice.
+  const [movedNoticeId, setMovedNoticeId] = useState<string | null>(null);
   const [projectInputText, setProjectInputText] = useState("");
   const [selectedModel, setSelectedModel] = useState<string>("");
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -375,13 +394,39 @@ export function ChatView() {
   const pendingAgentName = pendingAgentId
     ? agents.find((a) => a.id === pendingAgentId)?.name
     : undefined;
+  // The console only lives on the Agents tab; sessions and projects win over
+  // it in the render chain below.
+  const activeAgentConsole = isAgentTab
+    ? agents.find((a) => a.id === activeAgentConsoleId)
+    : undefined;
 
   /**
    * Agent-mode run context for a session in the Agents tab: standalone tasks
    * run as full task-manager agents; saved-agent sessions run sandboxed on
-   * the agent's own prompt/skills/connectors; setup chats run the builder.
+   * the agent's own prompt/skills/connectors, restricted to its workspace +
+   * user-granted folders/projects; setup chats run the builder.
+   *
+   * Async because resolving the sandbox touches the filesystem (workspace).
    */
-  const agentRunContext = (desc: { agentId?: string; isSetup?: boolean }) => {
+  const agentRunContext = async (desc: {
+    agentId?: string;
+    isSetup?: boolean;
+  }): Promise<{
+    mode: AgentMode;
+    webFetch: boolean;
+    instructions?: string;
+    taskProfile: {
+      toolProfile: "task" | "setup";
+      enableCommandTools: boolean;
+      enableFileTools: boolean;
+      skillNames?: string[];
+      mcpNames?: string[];
+      sandbox?: AgentSandbox;
+    };
+    agent?: AgentDefinition;
+    /** The agent's own model, or undefined to use the composer's model. */
+    model?: string;
+  }> => {
     const agentDef = desc.agentId ? agents.find((a) => a.id === desc.agentId) : undefined;
     const instructions = agentDef
       ? [
@@ -391,6 +436,28 @@ export function ChatView() {
         .filter(Boolean)
         .join("\n\n")
       : currentProjectInstructions || undefined;
+
+    // Filesystem sandbox for saved agents: private workspace + granted
+    // folders + granted projects' codebase folders. Standalone tasks and
+    // builder chats run unrestricted (approval-gated as before).
+    let sandbox: AgentSandbox | undefined;
+    if (agentDef) {
+      const workspace = await ensureAgentWorkspace(agentDef.id).catch(() => undefined);
+      const projectDirs = (agentDef.allowedProjects ?? [])
+        .map((pid) => projects.find((p) => p.id === pid)?.directory)
+        .filter((d): d is string => !!d);
+      sandbox = {
+        agentId: agentDef.id,
+        workspace,
+        allowedDirectories: [
+          ...(workspace ? [workspace] : []),
+          ...(agentDef.allowedFolders ?? []),
+          ...projectDirs,
+        ],
+        readChats: agentDef.readChats ?? false,
+      };
+    }
+
     return {
       mode: "task" as AgentMode,
       webFetch: webFetchEnabled && (agentDef?.capabilities.web ?? true),
@@ -401,7 +468,10 @@ export function ChatView() {
         enableFileTools: agentDef ? (agentDef.capabilities.files ?? false) : false,
         skillNames: agentDef ? agentDef.skills : undefined,
         mcpNames: agentDef ? agentDef.connectors : undefined,
+        sandbox,
       },
+      agent: agentDef,
+      model: agentDef?.model,
     };
   };
 
@@ -466,6 +536,36 @@ export function ChatView() {
     setArtifactWindowMode("open");
     setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
   }, [agent?.artifacts]);
+
+  // Rehydrated image previews for persisted message attachments. Blob URLs
+  // die on reload, so previews are rebuilt from the IndexedDB file store.
+  const [attachmentPreviews, setAttachmentPreviews] = useState<Map<string, string>>(new Map());
+
+  useEffect(() => {
+    const pending = displayMessages.flatMap((m) =>
+      (m.attachments ?? []).filter(
+        (a) =>
+          a.storageId &&
+          a.type.startsWith("image/") &&
+          !a.previewUrl &&
+          !attachmentPreviews.has(a.id),
+      ),
+    );
+    if (pending.length === 0) return;
+    let cancelled = false;
+    void (async () => {
+      for (const a of pending) {
+        const blob = await getFileBlob(a.storageId!);
+        if (cancelled) return;
+        if (!blob) continue;
+        const url = URL.createObjectURL(blob);
+        setAttachmentPreviews((prev) => new Map(prev).set(a.id, url));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [displayMessages, attachmentPreviews]);
 
   const comingSoon = (feature: string) => toast(`${feature} is coming soon`);
 
@@ -538,16 +638,28 @@ export function ChatView() {
     if (selected.length > 0) {
       setFiles((prev) => [
         ...prev,
-        ...selected.map((file) => ({
-          id: generateId(),
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          previewUrl: file.type.startsWith("image/")
-            ? URL.createObjectURL(file)
-            : undefined,
-          file,
-        })),
+        ...selected.map((file) => {
+          const id = generateId();
+          // Persist the bytes (plus eagerly extracted text for documents) so
+          // the attachment survives restarts and stays in context on replay.
+          if (file.type.startsWith("image/")) {
+            void putFileBlob(id, file);
+          } else {
+            void extractFileText(file)
+              .then((text) => putFileBlob(id, file, { extractedText: text }))
+              .catch(() => {});
+          }
+          return {
+            id,
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            previewUrl: file.type.startsWith("image/")
+              ? URL.createObjectURL(file)
+              : undefined,
+            file,
+          };
+        }),
       ]);
     }
     e.target.value = "";
@@ -559,6 +671,7 @@ export function ChatView() {
       if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
       return prev.filter((file) => file.id !== id);
     });
+    void deleteFileBlob(id);
   };
 
   const findProviderForModel = (modelName: string) => {
@@ -567,11 +680,21 @@ export function ChatView() {
     return providers.find((p) => p.id === model.providerId) ?? null;
   };
 
-  const handleSend = async () => {
-    const text = inputText.trim();
+  const handleSend = async (overrideText?: string) => {
+    const text = (overrideText ?? inputText).trim();
     if ((!text && files.length === 0) || agent?.isRunning) return;
 
-    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    // Agent-mode runs (tasks, saved agents, builder setup) never run the
+    // research/council pipelines and never see the chat-tab modes.
+    const arc = isAgentTab
+      ? await agentRunContext({
+          agentId: pendingAgentId ?? activeSession?.agentId,
+          isSetup: pendingSetup || activeSession?.isSetup === true,
+        })
+      : null;
+    // Saved agents may pin their own model; otherwise the composer's model.
+    const runModelName = arc?.model ?? selectedModel;
+    const provider = runModelName ? findProviderForModel(runModelName) : null;
     if (!provider) {
       toast.error("No provider configured. Add one in Settings.");
       openSettings();
@@ -585,14 +708,6 @@ export function ChatView() {
       autoModeRef.current = "none";
     }
 
-    // Agent-mode runs (tasks, saved agents, builder setup) never run the
-    // research/council pipelines and never see the chat-tab modes.
-    const arc = isAgentTab
-      ? agentRunContext({
-          agentId: pendingAgentId ?? activeSession?.agentId,
-          isSetup: pendingSetup || activeSession?.isSetup === true,
-        })
-      : null;
     const mode: AgentMode = arc
       ? arc.mode
       : chatMode === "research"
@@ -604,10 +719,10 @@ export function ChatView() {
     // Vision check: block image attachments for non-vision models
     const hasImages = files.some((f) => f.type.startsWith("image/"));
     if (hasImages) {
-      const caps = await getModelCapabilities(provider, selectedModel);
+      const caps = await getModelCapabilities(provider, runModelName);
       if (!caps.vision) {
         toast.error(
-          `${selectedModelLabel ? modelLabel(selectedModelLabel) : selectedModel} doesn't support image input. Remove the image or switch to a vision-capable model.`,
+          `${selectedModelLabel ? modelLabel(selectedModelLabel) : runModelName} doesn't support image input. Remove the image or switch to a vision-capable model.`,
         );
         return;
       }
@@ -623,7 +738,7 @@ export function ChatView() {
 
     if (!sessionId) {
       const newSession = createSession(
-        (text || "Attachments").slice(0, 30),
+        instantChatTitle(text || "Attachments"),
         pendingProjectId ?? undefined,
         isAgentTab
           ? { agentId: pendingAgentId ?? undefined, isSetup: pendingSetup || undefined }
@@ -645,6 +760,7 @@ export function ChatView() {
       name: a.name,
       size: a.size,
       type: a.type,
+      storageId: a.id,
     }));
 
     try {
@@ -666,8 +782,8 @@ export function ChatView() {
 
       const modelLabelStr = selectedModelLabel
         ? modelLabel(selectedModelLabel)
-        : selectedModel;
-      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, selectedModel, modelLabelStr);
+        : runModelName;
+      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, runModelName, modelLabelStr);
       if (prep.blocked) {
         toast.error(prep.warning ?? "This model doesn't support images.");
         return;
@@ -682,17 +798,84 @@ export function ChatView() {
           : "";
       const learnContext =
         !arc && chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
+
+      // Project uploads (persisted files/images) are part of the context of
+      // EVERY conversation in that project.
+      let projectFilesText = "";
+      let projectImageUrls: string[] = [];
+      if (currentProjectId) {
+        const project = projects.find((p) => p.id === currentProjectId);
+        if (project && (project.files.length > 0 || project.images.length > 0)) {
+          const filesCtx = await buildProjectFilesContext(
+            project.files,
+            project.images,
+            text,
+            provider,
+            runModelName,
+          );
+          projectFilesText = filesCtx.text;
+          if (filesCtx.skippedImages.length > 0) {
+            projectFilesText += `\n\n[Project images not attached — ${modelLabelStr} has no vision: ${filesCtx.skippedImages.join(", ")}]`;
+          }
+          projectImageUrls = filesCtx.imageDataUrls;
+        }
+      }
+
+      // Saved-agent knowledge files/images ride with EVERY run of the agent
+      // (same mechanism as project files).
+      let agentFilesText = "";
+      let agentImageUrls: string[] = [];
+      if (arc?.agent?.attachments?.length) {
+        const agentAttachments = arc.agent.attachments;
+        const filesCtx = await buildProjectFilesContext(
+          agentAttachments.filter((a) => !a.type.startsWith("image/")),
+          agentAttachments.filter((a) => a.type.startsWith("image/")),
+          text,
+          provider,
+          runModelName,
+        );
+        agentFilesText = filesCtx.text;
+        if (filesCtx.skippedImages.length > 0) {
+          agentFilesText += `\n\n[Agent images not attached — ${modelLabelStr} has no vision: ${filesCtx.skippedImages.join(", ")}]`;
+        }
+        agentImageUrls = filesCtx.imageDataUrls;
+      }
+
       const effectiveInstructions = arc
-        ? arc.instructions
-        : [currentProjectInstructions, learnContext, memoryContext]
+        ? [arc.instructions, projectFilesText, agentFilesText].filter(Boolean).join("\n\n") || undefined
+        : [currentProjectInstructions, projectFilesText, learnContext, memoryContext]
             .filter(Boolean).join("\n\n") || undefined;
 
+      // Rebuild attachment context for replayed history so files keep working
+      // across the whole chat, not just the send they arrived on.
+      const historyMessages: AgentMessage[] = [];
+      for (const n of activePath) {
+        if (n.message.role === "user" && (n.message.attachments?.length ?? 0) > 0) {
+          const rebuilt = await rebuildAttachmentContent(n.message, provider, runModelName);
+          historyMessages.push({ role: "user", content: rebuilt ?? n.message.content });
+        } else {
+          historyMessages.push({ role: n.message.role, content: n.message.content });
+        }
+      }
+
+      // Project/agent images ride along on the outgoing user message (vision models).
+      let outgoingContent: string | ContentPart[] = userContent;
+      const extraImageUrls = [...projectImageUrls, ...agentImageUrls];
+      if (extraImageUrls.length > 0) {
+        outgoingContent = [
+          ...(typeof userContent === "string"
+            ? [{ type: "text" as const, text: userContent }]
+            : userContent),
+          ...extraImageUrls.map((url) => ({
+            type: "image_url" as const,
+            image_url: { url, detail: "high" as const },
+          })),
+        ];
+      }
+
       const completionMessages: AgentMessage[] = [
-        ...activePath.map((n) => ({
-          role: n.message.role,
-          content: n.message.content,
-        })),
-        { role: "user" as const, content: userContent },
+        ...historyMessages,
+        { role: "user" as const, content: outgoingContent },
       ];
 
       const ctrl = getAgentController(sessionId);
@@ -704,7 +887,7 @@ export function ChatView() {
         sessionId,
         "assistant",
         "",
-        selectedModel,
+        runModelName,
         undefined,
         userMsg.id,
         isTemporary,
@@ -724,7 +907,7 @@ export function ChatView() {
       try {
         result = await ctrl.run({
           provider,
-          modelName: selectedModel,
+          modelName: runModelName,
           messages: completionMessages,
           instructions: effectiveInstructions,
           mode,
@@ -758,7 +941,7 @@ export function ChatView() {
       }
 
       if (isNewSession && result.content) {
-        generateChatTitle(provider, selectedModel, text, result.content)
+        generateChatTitle(provider, runModelName, text, result.content)
           .then((title) => {
             if (title && sessionId) {
               updateSession(sessionId, { title });
@@ -826,7 +1009,14 @@ export function ChatView() {
     setEditingMessageId(null);
     setEditText("");
 
-    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    const arc = isAgentTab
+      ? await agentRunContext({
+          agentId: activeSession?.agentId,
+          isSetup: activeSession?.isSetup === true,
+        })
+      : null;
+    const runModelName = arc?.model ?? selectedModel;
+    const provider = runModelName ? findProviderForModel(runModelName) : null;
     if (!provider) {
       toast.error("No provider configured. Add one in Settings.");
       openSettings();
@@ -853,25 +1043,21 @@ export function ChatView() {
         activePath.findIndex((n) => n.message.id === msg.id),
       );
       for (const n of pathToParent) {
-        completionMessages.push({
-          role: n.message.role,
-          content: n.message.content,
-        });
+        if (n.message.role === "user" && (n.message.attachments?.length ?? 0) > 0) {
+          const rebuilt = await rebuildAttachmentContent(n.message, provider, runModelName);
+          completionMessages.push({ role: "user", content: rebuilt ?? n.message.content });
+        } else {
+          completionMessages.push({ role: n.message.role, content: n.message.content });
+        }
       }
       completionMessages.push({ role: "user" as const, content: text });
 
-      const arc = isAgentTab
-        ? agentRunContext({
-            agentId: activeSession?.agentId,
-            isSetup: activeSession?.isSetup === true,
-          })
-        : null;
       const ctrl = getAgentController(activeSessionId!);
       const assistantMsg = await addMessage(
         activeSessionId,
         "assistant",
         "",
-        selectedModel,
+        runModelName,
         undefined,
         userMsg.id,
         isTemporary,
@@ -890,7 +1076,7 @@ export function ChatView() {
       try {
         result = await ctrl.run({
           provider,
-          modelName: selectedModel,
+          modelName: runModelName,
           messages: completionMessages,
           instructions: arc ? arc.instructions : currentProjectInstructions || undefined,
           mode: arc?.mode,
@@ -924,7 +1110,14 @@ export function ChatView() {
   const handleRegenerate = async (msg: ChatMessage) => {
     if (!activeSessionId || agent?.isRunning) return;
 
-    const provider = selectedModel ? findProviderForModel(selectedModel) : null;
+    const arc = isAgentTab
+      ? await agentRunContext({
+          agentId: activeSession?.agentId,
+          isSetup: activeSession?.isSetup === true,
+        })
+      : null;
+    const runModelName = arc?.model ?? selectedModel;
+    const provider = runModelName ? findProviderForModel(runModelName) : null;
     if (!provider) {
       toast.error("No provider configured. Add one in Settings.");
       openSettings();
@@ -941,24 +1134,20 @@ export function ChatView() {
         activePath.findIndex((n) => n.message.id === msg.id),
       );
       for (const n of pathToParent) {
-        completionMessages.push({
-          role: n.message.role,
-          content: n.message.content,
-        });
+        if (n.message.role === "user" && (n.message.attachments?.length ?? 0) > 0) {
+          const rebuilt = await rebuildAttachmentContent(n.message, provider, runModelName);
+          completionMessages.push({ role: "user", content: rebuilt ?? n.message.content });
+        } else {
+          completionMessages.push({ role: n.message.role, content: n.message.content });
+        }
       }
 
-      const arc = isAgentTab
-        ? agentRunContext({
-            agentId: activeSession?.agentId,
-            isSetup: activeSession?.isSetup === true,
-          })
-        : null;
       const ctrl = getAgentController(activeSessionId);
       const assistantMsg = await addMessage(
         activeSessionId,
         "assistant",
         "",
-        selectedModel,
+        runModelName,
         undefined,
         parentId,
         msgIsTemporary,
@@ -977,7 +1166,7 @@ export function ChatView() {
       try {
         result = await ctrl.run({
           provider,
-          modelName: selectedModel,
+          modelName: runModelName,
           messages: completionMessages,
           instructions: arc ? arc.instructions : currentProjectInstructions || undefined,
           mode: arc?.mode,
@@ -1063,17 +1252,36 @@ export function ChatView() {
   };
 
   const selectSession = (id: string) => {
+    // Sessions moved to the Agents tab stay listed in the chat sidebar
+    // (grayed out); clicking one shows the redirect notice instead.
+    if (!isAgentTab) {
+      const target = sessions.find((s) => s.id === id);
+      if (target?.movedToAgent) {
+        setMovedNoticeId(id);
+        return;
+      }
+    }
     if (activeSessionId && activeSessionId !== id) {
       deleteTemporaryMessages(activeSessionId);
     }
     setActiveSessionId(id);
     setActiveProjectId(null);
+    // A selected session defines its own agent context — drop any pending
+    // one (e.g. from an open agent console or "New session").
+    setPendingAgentId(null);
+    setPendingSetup(false);
     applySessionChatMode(id);
     setView("chat");
   };
 
   const handleDeleteSession = async (id: string) => {
     try {
+      // Clean up the session's stored attachment bytes along with it.
+      for (const m of loadMessages(id)) {
+        for (const a of m.attachments ?? []) {
+          if (a.storageId) void deleteFileBlob(a.storageId);
+        }
+      }
       disposeAgentController(id);
       await deleteSession(id);
       if (activeSessionId === id) {
@@ -1085,7 +1293,62 @@ export function ChatView() {
     }
   };
 
+  const handleDeleteSelectedSessions = async () => {
+    for (const id of historySelectedIds) {
+      await handleDeleteSession(id);
+    }
+    setHistorySelectedIds(new Set());
+  };
+
   // ── Agents tab navigation ───────────────────────────────────────────────
+
+  /**
+   * Move a chat-tab session to the Agents tab as a task. The message store is
+   * keyed by session id, so the entire conversation carries over; the session
+   * keeps appearing in the chat sidebar grayed out with a redirect notice.
+   */
+  const switchToAgentMode = async (id: string) => {
+    const target = sessions.find((s) => s.id === id);
+    if (!target || target.type !== "chat" || target.movedToAgent) return;
+    if (runningIds.has(id)) {
+      toast.error("Wait for the current run to finish before switching.");
+      return;
+    }
+    await moveToAgentTab(id);
+    if (activeSessionId === id) {
+      // The moved session becomes the agent tab's active session; the chat
+      // tab drops it. Chat modes never apply on the agent tab.
+      setActiveSessionByTab((prev) => ({ ...prev, chat: null, agent: id }));
+      setChatMode("none");
+      autoModeRef.current = "none";
+    } else {
+      setActiveSessionByTab((prev) => ({ ...prev, agent: id }));
+    }
+    setPendingProjectId(null);
+    setPendingAgentId(null);
+    setPendingSetup(false);
+    setActiveTab("agent");
+    setView("chat");
+    toast.success("Conversation moved to the Agents tab");
+  };
+
+  /** Open a moved session from the chat-tab redirect notice. */
+  const openMovedSession = (id: string) => {
+    if (activeSessionId && activeSessionId !== id) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionByTab((prev) => ({
+      chat: prev.chat === id ? null : prev.chat,
+      agent: id,
+    }));
+    setPendingProjectId(null);
+    setPendingAgentId(null);
+    setPendingSetup(false);
+    setActiveTab("agent");
+    setChatMode("none");
+    autoModeRef.current = "none";
+    setView("chat");
+  };
 
   const switchTab = (tab: "chat" | "agent") => {
     if (tab === activeTab) return;
@@ -1109,6 +1372,7 @@ export function ChatView() {
     setPendingProjectId(null);
     setPendingAgentId(null);
     setPendingSetup(false);
+    setActiveAgentConsoleId(null);
     applySessionChatMode(null);
     setView("chat");
   };
@@ -1122,6 +1386,7 @@ export function ChatView() {
     setPendingProjectId(null);
     setPendingAgentId(null);
     setPendingSetup(true);
+    setActiveAgentConsoleId(null);
     applySessionChatMode(null);
     setView("chat");
   };
@@ -1135,13 +1400,70 @@ export function ChatView() {
     setPendingProjectId(null);
     setPendingAgentId(agentId);
     setPendingSetup(false);
+    setActiveAgentConsoleId(null);
     applySessionChatMode(null);
     setView("chat");
   };
 
+  /**
+   * Open an agent's console (clicking the agent in the sidebar): sessions and
+   * the composer in the middle, instructions/preferences/access on the right.
+   * The composer sends with this agent, so the first send opens a session.
+   */
+  const handleOpenAgentConsole = (agentId: string) => {
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionId(null);
+    setActiveProjectId(null);
+    setPendingProjectId(null);
+    setPendingAgentId(agentId);
+    setPendingSetup(false);
+    setActiveAgentConsoleId(agentId);
+    applySessionChatMode(null);
+    setView("chat");
+  };
+
+  /** Leave the agent console back to the Agents-tab empty state. */
+  const closeAgentConsole = () => {
+    setActiveAgentConsoleId(null);
+    setPendingAgentId(null);
+  };
+
   const handleDeleteAgent = (id: string) => {
+    const def = agents.find((a) => a.id === id);
+    // Clean up the agent's knowledge-file blobs and on-disk workspace.
+    if (def) {
+      for (const att of def.attachments ?? []) {
+        void deleteFileBlob(att.storageId ?? att.id);
+      }
+      void removeAgentWorkspace(id);
+    }
     deleteAgent(id);
+    if (agentSettingsId === id) setAgentSettingsId(null);
+    if (activeAgentConsoleId === id) setActiveAgentConsoleId(null);
     toast("Agent deleted — its sessions stay as task sessions");
+  };
+
+  /**
+   * Apply an agent_config suggestion card: the agent proposed a settings
+   * change mid-chat and the user clicked "Apply changes".
+   */
+  const handleApplyAgentConfig = (agentId: string, patch: AgentConfigPatch) => {
+    let applied = applyAgentConfigPatch(agentId, patch);
+    if (!applied) {
+      // The model may have passed the agent's name instead of its id —
+      // resolve via the active/pending session's agent.
+      const fallbackId = currentAgentDef?.id ?? pendingAgentId;
+      if (fallbackId && fallbackId !== agentId) {
+        applied = applyAgentConfigPatch(fallbackId, patch);
+      }
+    }
+    if (applied) {
+      toast.success(`Updated ${applied.name}`);
+    } else {
+      toast.error("Agent not found — it may have been deleted");
+    }
   };
 
   const assignProject = (projectId: string | undefined) => {
@@ -1177,7 +1499,7 @@ export function ChatView() {
   }, []);
 
   const modelSelectContent = (
-    <SelectContent>
+    <SelectContent className="min-w-56">
       {allModels.length === 0 ? (
         <SelectItem value="__no_models__" disabled>
           No models — add a provider in Settings
@@ -1292,10 +1614,17 @@ export function ChatView() {
               {msg.attachments?.map((attachment) => (
                 <Attachment key={attachment.id} size="sm">
                   <AttachmentMedia
-                    variant={attachment.previewUrl ? "image" : "icon"}
+                    variant={
+                      attachment.previewUrl || attachmentPreviews.get(attachment.id)
+                        ? "image"
+                        : "icon"
+                    }
                   >
-                    {attachment.previewUrl ? (
-                      <img src={attachment.previewUrl} alt={attachment.name} />
+                    {attachment.previewUrl || attachmentPreviews.get(attachment.id) ? (
+                      <img
+                        src={attachment.previewUrl ?? attachmentPreviews.get(attachment.id)}
+                        alt={attachment.name}
+                      />
                     ) : (
                       <FileText />
                     )}
@@ -1529,9 +1858,12 @@ export function ChatView() {
         onTabChange={switchTab}
         onNewTask={handleNewTask}
         onNewAgent={handleNewAgentSetup}
+        onSwitchToAgent={switchToAgentMode}
         agents={agents}
+        onOpenAgentConsole={handleOpenAgentConsole}
         onStartAgentSession={handleStartAgentSession}
         onDeleteAgent={handleDeleteAgent}
+        onOpenAgentSettings={setAgentSettingsId}
         projects={projects}
         runningIds={runningIds}
       />
@@ -1755,6 +2087,28 @@ export function ChatView() {
             <div className="relative min-h-0 flex-1 overflow-y-auto px-4 pt-4 sm:px-8">
               <div className="mx-auto flex w-full max-w-4xl flex-col gap-4 pb-8">
                 <div className="flex items-center justify-end gap-2">
+                  {historySelectedIds.size > 0 && (
+                    <>
+                      <span className="text-xs text-muted-foreground">
+                        {historySelectedIds.size} selected
+                      </span>
+                      <Button
+                        variant="destructive"
+                        size="sm"
+                        onClick={() => { void handleDeleteSelectedSessions(); }}
+                      >
+                        <Trash2 />
+                        Delete
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setHistorySelectedIds(new Set())}
+                      >
+                        Clear
+                      </Button>
+                    </>
+                  )}
                   <div className="relative">
                     <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                     <Input
@@ -1782,11 +2136,28 @@ export function ChatView() {
                       s.title.toLowerCase().includes(historySearch.toLowerCase())
                     )
                     .map((session) => (
-                      <Card key={session.id} className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent" onClick={() => {
+                      <Card key={session.id} className={`gap-0 py-0 cursor-pointer transition-colors hover:bg-accent ${session.movedToAgent ? "opacity-50" : ""}`} onClick={() => {
                         selectSession(session.id);
                       }}>
                         <CardHeader className="flex items-center justify-between py-3.5">
-                          <span className="truncate text-sm font-medium">
+                          <span className="flex min-w-0 items-center gap-2 truncate text-sm font-medium">
+                            <Checkbox
+                              checked={historySelectedIds.has(session.id)}
+                              onCheckedChange={(checked) => {
+                                setHistorySelectedIds((prev) => {
+                                  const next = new Set(prev);
+                                  if (checked) next.add(session.id);
+                                  else next.delete(session.id);
+                                  return next;
+                                });
+                              }}
+                              onClick={(e) => e.stopPropagation()}
+                              className="shrink-0"
+                              aria-label={`Select chat: ${session.title}`}
+                            />
+                            {session.movedToAgent && (
+                              <Bot className="size-4 shrink-0 text-muted-foreground" />
+                            )}
                             {session.title}
                           </span>
                           <div className="ml-4 flex shrink-0 items-center gap-2">
@@ -1845,17 +2216,24 @@ export function ChatView() {
           </div>
         ) : (
         <div className="relative flex min-h-0 flex-1 flex-col">
-        {!activeSession && <PatternBackground pattern={settings.backgroundPattern} />}
+        {/* The pattern belongs to the chat/session area only: the project and
+            agent consoles render it inside their chat column, and the options
+            panel stays plain. Here it covers just the composer empty state. */}
+        {!activeSession && !activeProject && !activeAgentConsole && (
+          <PatternBackground pattern={settings.backgroundPattern} />
+        )}
         <header
           data-tauri-drag-region
           onMouseDown={startDrag}
           className="relative flex h-10 shrink-0 select-none items-center px-4"
         >
-          {activeProject && (
+          {(activeProject || (activeAgentConsole && !activeSession)) && (
             <Button
               variant="ghost"
               size="icon-sm"
-              onClick={() => setActiveProjectId(null)}
+              onClick={() =>
+                activeProject ? setActiveProjectId(null) : closeAgentConsole()
+              }
               onMouseDown={(e) => e.stopPropagation()}
               aria-label="Back to chat"
               className="shrink-0"
@@ -1863,7 +2241,7 @@ export function ChatView() {
               <ArrowLeft />
             </Button>
           )}
-          {(activeSession || activeProject) && (
+          {(activeSession || activeProject || (activeAgentConsole && !activeSession)) && (
             <div className="absolute left-1/2 -translate-x-1/2">
               {activeProject ? (
                 editingProjectField === "name" ? (
@@ -1899,6 +2277,13 @@ export function ChatView() {
                     {activeProject.name}
                   </button>
                 )
+              ) : activeAgentConsole && !activeSession ? (
+                <span className="flex max-w-xs items-center gap-2 px-1 py-0.5">
+                  <AgentAvatar seed={activeAgentConsole.id} className="size-4.5" />
+                  <span className="truncate text-sm font-medium">
+                    {activeAgentConsole.name}
+                  </span>
+                </span>
               ) : isEditingTitle ? (
                 <input
                   autoFocus
@@ -1916,9 +2301,16 @@ export function ChatView() {
                 <button
                   onClick={startEditingTitle}
                   onMouseDown={(e) => e.stopPropagation()}
-                  className="max-w-xs truncate rounded-md px-3 py-1 text-sm font-medium transition-colors hover:bg-accent"
+                  className="flex max-w-xs items-center gap-1.5 truncate rounded-md px-2 py-1 text-sm font-medium transition-colors hover:bg-accent"
                 >
-                  {activeSession!.title}
+                  {activeSession!.agentId && (
+                    <AgentAvatar
+                      seed={activeSession!.agentId}
+                      className="size-4"
+                      title={agents.find((a) => a.id === activeSession!.agentId)?.name}
+                    />
+                  )}
+                  <span className="truncate">{activeSession!.title}</span>
                 </button>
               )}
             </div>
@@ -1985,38 +2377,6 @@ export function ChatView() {
 
             <div className="shrink-0 px-4 pb-4">
               <div className="mx-auto w-full max-w-3xl">
-                {files.length > 0 && (
-                  <AttachmentGroup className="mb-2">
-                    {files.map((file) => (
-                      <Attachment key={file.id}>
-                        <AttachmentMedia
-                          variant={file.previewUrl ? "image" : "icon"}
-                        >
-                          {file.previewUrl ? (
-                            <img src={file.previewUrl} alt={file.name} />
-                          ) : (
-                            <FileText />
-                          )}
-                        </AttachmentMedia>
-                        <AttachmentContent>
-                          <AttachmentTitle>{file.name}</AttachmentTitle>
-                          <AttachmentDescription>
-                            {formatBytes(file.size)}
-                          </AttachmentDescription>
-                        </AttachmentContent>
-                        <AttachmentActions>
-                          <AttachmentAction
-                            aria-label={`Remove ${file.name}`}
-                            onClick={() => removeFile(file.id)}
-                          >
-                            <X />
-                          </AttachmentAction>
-                        </AttachmentActions>
-                      </Attachment>
-                    ))}
-                  </AttachmentGroup>
-                )}
-
                 {agent?.pendingInput ? (
                   <StructuredInputForm
                     request={agent?.pendingInput}
@@ -2029,23 +2389,62 @@ export function ChatView() {
                     onApprove={() => agent?.approveCommand()}
                     onDeny={() => agent?.rejectCommand()}
                   />
-                ) : agent?.pendingSuggestion ? (
-                  <SuggestionCard
-                    suggestion={agent.pendingSuggestion}
-                    onDismiss={() => agent?.dismissSuggestion()}
-                    onInstallSkill={installSkillByName}
-                    onOpenConnectors={() => {
-                      setSettingsTab("connectors");
-                      setView("settings");
-                    }}
-                    onEnableMode={(mode) => {
-                      setChatMode(mode);
-                      autoModeRef.current = "none";
-                      if (activeSessionId) updateSession(activeSessionId, { chat_mode: mode });
-                    }}
-                  />
-                ) : (
-                <InputGroup className={isTemporary ? "border-dashed" : undefined}>
+                 ) : agent?.pendingSuggestion ? (
+                   <SuggestionCard
+                     suggestion={agent.pendingSuggestion}
+                     onDismiss={() => agent?.dismissSuggestion()}
+                     onInstallSkill={installSkillByName}
+                     onOpenConnectors={() => {
+                       setSettingsTab("connectors");
+                       setView("settings");
+                     }}
+                      onEnableMode={(mode) => {
+                        setChatMode(mode);
+                        autoModeRef.current = "none";
+                        if (activeSessionId) updateSession(activeSessionId, { chat_mode: mode });
+                      }}
+                      onSwitchToAgent={
+                        !isAgentTab && activeSessionId
+                          ? () => void switchToAgentMode(activeSessionId)
+                          : undefined
+                      }
+                      onApplyAgentConfig={handleApplyAgentConfig}
+                    />
+                 ) : (
+                 <InputGroup className={isTemporary ? "border-dashed" : undefined}>
+                  {files.length > 0 && (
+                    <InputGroupAddon align="block-start">
+                      <AttachmentGroup className="w-full">
+                        {files.map((file) => (
+                          <Attachment key={file.id} size="xs">
+                            <AttachmentMedia
+                              variant={file.previewUrl ? "image" : "icon"}
+                            >
+                              {file.previewUrl ? (
+                                <img src={file.previewUrl} alt={file.name} />
+                              ) : (
+                                <FileText />
+                              )}
+                            </AttachmentMedia>
+                            <AttachmentContent>
+                              <AttachmentTitle>{file.name}</AttachmentTitle>
+                              <AttachmentDescription>
+                                {formatBytes(file.size)}
+                              </AttachmentDescription>
+                            </AttachmentContent>
+                            <AttachmentActions>
+                              <AttachmentAction
+                                aria-label={`Remove ${file.name}`}
+                                onClick={() => removeFile(file.id)}
+                              >
+                                <X />
+                              </AttachmentAction>
+                            </AttachmentActions>
+                          </Attachment>
+                        ))}
+                      </AttachmentGroup>
+                    </InputGroupAddon>
+                  )}
                   <InputGroupTextarea
                     value={inputText}
                     onChange={(e) => setInputText(e.currentTarget.value)}
@@ -2103,6 +2502,12 @@ export function ChatView() {
                           Add files
                           <DropdownMenuShortcut>⌘U</DropdownMenuShortcut>
                         </DropdownMenuItem>
+                        {!isAgentTab && activeSession && !activeSession.movedToAgent && (
+                          <DropdownMenuItem onClick={() => void switchToAgentMode(activeSession.id)}>
+                            <Bot />
+                            Switch to Agent Mode
+                          </DropdownMenuItem>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                     {currentProjectName && (
@@ -2223,8 +2628,9 @@ export function ChatView() {
         ) : activeProject ? (
         <div className="relative flex min-h-0 flex-1 flex-col">
             <div className="flex min-h-0 flex-1">
-              <div className="flex flex-col w-2/3 min-h-0 border-r">
-                <div className="shrink-0 p-4">
+              <div className="relative flex min-h-0 min-w-0 flex-1 flex-col border-r">
+                <PatternBackground pattern={settings.backgroundPattern} />
+                <div className="relative shrink-0 p-4">
                   <InputGroup className={isTemporary ? "border-dashed" : undefined}>
                     <InputGroupTextarea
                       value={projectInputText}
@@ -2263,7 +2669,7 @@ export function ChatView() {
                     </InputGroupAddon>
                   </InputGroup>
                 </div>
-                <ScrollArea className="flex-1">
+                <ScrollArea className="min-h-0 flex-1">
                   <div className="px-4 pb-4">
                     <div className="mb-3 flex items-center gap-2">
                       <span className="text-sm font-medium">Chats</span>
@@ -2275,14 +2681,17 @@ export function ChatView() {
                         .map((session) => (
                           <Card
                             key={session.id}
-                            className="gap-0 py-0 cursor-pointer transition-colors hover:bg-accent"
+                            className={`gap-0 py-0 cursor-pointer transition-colors hover:bg-accent ${session.movedToAgent ? "opacity-50" : ""}`}
                             onClick={() => {
                               selectSession(session.id);
                               setActiveProjectId(null);
                             }}
                           >
                             <CardHeader className="flex items-center justify-between py-3.5">
-                              <span className="truncate text-sm font-medium">
+                              <span className="flex min-w-0 items-center gap-2 truncate text-sm font-medium">
+                                {session.movedToAgent && (
+                                  <Bot className="size-4 shrink-0 text-muted-foreground" />
+                                )}
                                 {session.title}
                               </span>
                               <span className="ml-4 shrink-0 text-xs text-muted-foreground">
@@ -2304,8 +2713,8 @@ export function ChatView() {
                   </div>
                 </ScrollArea>
               </div>
-              <div className="w-1/3 min-h-0 flex flex-col">
-                <ScrollArea className="flex-1">
+              <div className="w-2/5 min-w-[240px] max-w-[560px] shrink-0 min-h-0 flex flex-col">
+                <ScrollArea className="min-h-0 flex-1">
                   <div className="p-4 space-y-6">
                     <div className="flex flex-col gap-3">
                       <div className="flex items-center justify-between">
@@ -2466,63 +2875,47 @@ export function ChatView() {
                 e.target.value = "";
               }}
             />
-            <input
-              ref={projectImageInputRef}
-              type="file"
-              multiple
-              accept="image/*"
-              className="hidden"
-              onChange={async (e) => {
-                const selected = Array.from(e.target.files ?? []);
-                for (const file of selected) {
-                  try {
-                    await addProjectImage(activeProject.id, file);
-                  } catch {
-                    toast.error("Failed to upload image");
-                  }
-                }
-                e.target.value = "";
-              }}
-            />
-          </div>
+             <input
+               ref={projectImageInputRef}
+               type="file"
+               multiple
+               accept="image/*"
+               className="hidden"
+               onChange={async (e) => {
+                 const selected = Array.from(e.target.files ?? []);
+                 for (const file of selected) {
+                   try {
+                     await addProjectImage(activeProject.id, file);
+                   } catch {
+                     toast.error("Failed to upload image");
+                   }
+                 }
+                 e.target.value = "";
+               }}
+             />
+           </div>
+        ) : activeAgentConsole ? (
+          <AgentConsole
+            agent={activeAgentConsole}
+            sessions={sessions
+              .filter((s) => s.agentId === activeAgentConsole.id)
+              .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())}
+            projects={projects}
+            models={allModels}
+            sendOnEnter={settings.sendOnEnter}
+            runningIds={runningIds}
+            backgroundPattern={settings.backgroundPattern}
+            modelSelect={modelSelect()}
+            onUpdateAgent={updateAgent}
+            onSelectSession={selectSession}
+            onSend={(text) => { void handleSend(text); }}
+          />
         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-4 pb-8">
             <h1 className="select-none cursor-default relative z-10 mb-12 text-center text-4xl font-semibold tracking-tight welcome-fade-in">
               {emptyStateHeading}
             </h1>
             <div className="relative z-10 w-full max-w-3xl">
-              {files.length > 0 && (
-                <AttachmentGroup className="mb-2">
-                  {files.map((file) => (
-                    <Attachment key={file.id} className="opacity-50">
-                      <AttachmentMedia
-                        variant={file.previewUrl ? "image" : "icon"}
-                      >
-                        {file.previewUrl ? (
-                          <img src={file.previewUrl} alt={file.name} />
-                        ) : (
-                          <FileText />
-                        )}
-                      </AttachmentMedia>
-                      <AttachmentContent>
-                        <AttachmentTitle>{file.name}</AttachmentTitle>
-                        <AttachmentDescription>
-                          {formatBytes(file.size)}
-                        </AttachmentDescription>
-                      </AttachmentContent>
-                      <AttachmentActions>
-                        <AttachmentAction
-                          aria-label={`Remove ${file.name}`}
-                          onClick={() => removeFile(file.id)}
-                        >
-                          <X />
-                        </AttachmentAction>
-                      </AttachmentActions>
-                    </Attachment>
-                  ))}
-                </AttachmentGroup>
-              )}
-
               {agent?.pendingInput ? (
                 <StructuredInputForm
                   request={agent?.pendingInput}
@@ -2544,14 +2937,53 @@ export function ChatView() {
                     setSettingsTab("connectors");
                     setView("settings");
                   }}
-                  onEnableMode={(mode) => {
-                    setChatMode(mode);
-                    autoModeRef.current = "none";
-                    if (activeSessionId) updateSession(activeSessionId, { chat_mode: mode });
-                  }}
-                />
+                    onEnableMode={(mode) => {
+                      setChatMode(mode);
+                      autoModeRef.current = "none";
+                      if (activeSessionId) updateSession(activeSessionId, { chat_mode: mode });
+                    }}
+                    onSwitchToAgent={
+                      !isAgentTab && activeSessionId
+                        ? () => void switchToAgentMode(activeSessionId)
+                        : undefined
+                    }
+                    onApplyAgentConfig={handleApplyAgentConfig}
+                  />
               ) : (
               <InputGroup className={`bg-card/60 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
+                {files.length > 0 && (
+                  <InputGroupAddon align="block-start">
+                    <AttachmentGroup className="w-full">
+                      {files.map((file) => (
+                        <Attachment key={file.id} size="xs">
+                          <AttachmentMedia
+                            variant={file.previewUrl ? "image" : "icon"}
+                          >
+                            {file.previewUrl ? (
+                              <img src={file.previewUrl} alt={file.name} />
+                            ) : (
+                              <FileText />
+                            )}
+                          </AttachmentMedia>
+                          <AttachmentContent>
+                            <AttachmentTitle>{file.name}</AttachmentTitle>
+                            <AttachmentDescription>
+                              {formatBytes(file.size)}
+                            </AttachmentDescription>
+                          </AttachmentContent>
+                          <AttachmentActions>
+                            <AttachmentAction
+                              aria-label={`Remove ${file.name}`}
+                              onClick={() => removeFile(file.id)}
+                            >
+                              <X />
+                            </AttachmentAction>
+                          </AttachmentActions>
+                        </Attachment>
+                      ))}
+                    </AttachmentGroup>
+                  </InputGroupAddon>
+                )}
                 <InputGroupTextarea
                   value={inputText}
                   onChange={(e) => setInputText(e.currentTarget.value)}
@@ -2726,6 +3158,51 @@ export function ChatView() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={!!movedNoticeId} onOpenChange={(open) => { if (!open) setMovedNoticeId(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Bot className="size-5" />
+              Moved to the Agents tab
+            </DialogTitle>
+          </DialogHeader>
+          <p className="pt-1 text-sm text-muted-foreground">
+            This conversation has been moved to the Agents tab. Continue it there
+            as a task — the entire conversation came along.
+          </p>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" size="sm" onClick={() => setMovedNoticeId(null)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              onClick={() => {
+                const id = movedNoticeId;
+                setMovedNoticeId(null);
+                if (id) openMovedSession(id);
+              }}
+            >
+              <Bot />
+              Open in Agents
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {(() => {
+        const settingsAgent = agents.find((a) => a.id === agentSettingsId);
+        return settingsAgent ? (
+          <AgentSettingsDialog
+            agent={settingsAgent}
+            open={!!agentSettingsId}
+            onOpenChange={(o) => { if (!o) setAgentSettingsId(null); }}
+            onUpdate={updateAgent}
+            projects={projects}
+            models={allModels}
+          />
+        ) : null;
+      })()}
+
     </SidebarProvider>
     </OpenCodeProvider>
   );
@@ -2747,7 +3224,7 @@ export function ChatView() {
       chatMode === "research" ? "research" : chatMode === "council" ? "council" : "chat";
 
     try {
-      const newSession = createSession(text.slice(0, 30), activeProject?.id);
+      const newSession = createSession(instantChatTitle(text), activeProject?.id);
       setActiveSessionId(newSession.id);
       setActiveProjectId(null);
 
@@ -2758,10 +3235,51 @@ export function ChatView() {
 
       const memoryContext = settings.autoMemory ? await buildMemoryContext(activeProject?.id ?? null, text) : "";
       const learnContext = chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
-      const effectiveInstructions = [currentProjectInstructions, learnContext, memoryContext]
+
+      // The project's uploads (persisted files/images) are part of the context
+      // of every conversation in it — this one included.
+      let projectFilesText = "";
+      let projectImageUrls: string[] = [];
+      if (activeProject && (activeProject.files.length > 0 || activeProject.images.length > 0)) {
+        const filesCtx = await buildProjectFilesContext(
+          activeProject.files,
+          activeProject.images,
+          text,
+          provider,
+          selectedModel,
+        );
+        projectFilesText = filesCtx.text;
+        if (filesCtx.skippedImages.length > 0) {
+          const modelLabelStr = selectedModelLabel
+            ? modelLabel(selectedModelLabel)
+            : selectedModel;
+          projectFilesText += `\n\n[Project images not attached — ${modelLabelStr} has no vision: ${filesCtx.skippedImages.join(", ")}]`;
+        }
+        projectImageUrls = filesCtx.imageDataUrls;
+      }
+
+      // currentProjectInstructions is derived from the session's project,
+      // which doesn't exist yet on this first message — use the open project.
+      const effectiveInstructions = [
+        activeProject?.instructions,
+        projectFilesText,
+        learnContext,
+        memoryContext,
+      ]
         .filter(Boolean).join("\n\n") || undefined;
 
       const ctrl = getAgentController(newSession.id);
+
+      let outgoingContent: string | ContentPart[] = text;
+      if (projectImageUrls.length > 0) {
+        outgoingContent = [
+          { type: "text" as const, text },
+          ...projectImageUrls.map((url) => ({
+            type: "image_url" as const,
+            image_url: { url, detail: "high" as const },
+          })),
+        ];
+      }
 
       const assistantMsg = await addMessage(
         newSession.id,
@@ -2788,7 +3306,7 @@ export function ChatView() {
         result = await ctrl.run({
           provider,
           modelName: selectedModel,
-          messages: [{ role: "user" as const, content: text }],
+          messages: [{ role: "user" as const, content: outgoingContent }],
           instructions: effectiveInstructions,
           mode,
           webFetchEnabled,

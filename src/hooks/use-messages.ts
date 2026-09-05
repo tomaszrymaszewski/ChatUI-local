@@ -2,12 +2,14 @@ import { useEffect, useState, useCallback } from "react";
 import type { Message } from "@/types";
 import type { ActivityItem, ReasoningStream } from "@/lib/agent/types";
 import type { Artifact } from "@/lib/artifacts";
+import { deleteFileBlob } from "@/lib/attachment-store";
 
 function storageKey(sessionId: string) {
   return `chatui:messages:${sessionId}`;
 }
 
-function loadMessages(sessionId: string): Message[] {
+/** Read a session's stored messages (any session, not just the active one). */
+export function loadMessages(sessionId: string): Message[] {
   try {
     const raw = localStorage.getItem(storageKey(sessionId));
     if (!raw) return [];
@@ -163,20 +165,39 @@ export function useMessages(sessionId: string | null) {
   );
 
   const deleteMessage = useCallback((sessionId: string, messageId: string) => {
+    const purgeAttachmentBlobs = (dropped: Message[]) => {
+      for (const m of dropped) {
+        for (const a of m.attachments ?? []) {
+          if (a.storageId) void deleteFileBlob(a.storageId);
+        }
+      }
+    };
     setMessages((prev) => {
       if (prev.some((m) => m.id === messageId)) {
         const next = prev.filter((m) => m.id !== messageId);
+        purgeAttachmentBlobs(prev.filter((m) => m.id === messageId));
         saveMessages(sessionId, next);
         return next;
       }
-      saveMessages(sessionId, loadMessages(sessionId).filter((m) => m.id !== messageId));
+      const loaded = loadMessages(sessionId);
+      const next = loaded.filter((m) => m.id !== messageId);
+      if (next.length !== loaded.length) {
+        purgeAttachmentBlobs(loaded.filter((m) => m.id === messageId));
+        saveMessages(sessionId, next);
+      }
       return prev;
     });
   }, []);
 
   const deleteTemporaryMessages = useCallback(async (sessionId: string) => {
     setMessages((prev) => {
+      const dropped = prev.filter((m) => m.is_temporary);
       const next = prev.filter((m) => !m.is_temporary);
+      for (const m of dropped) {
+        for (const a of m.attachments ?? []) {
+          if (a.storageId) void deleteFileBlob(a.storageId);
+        }
+      }
       saveMessages(sessionId, next);
       return next;
     });

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  Bot,
   MoreHorizontal,
   Pencil,
   Trash2,
@@ -39,6 +40,7 @@ export function NavChats({
   onSelect,
   onDelete,
   onRename,
+  onSwitchToAgent,
   projects = [],
   label = "Recents",
   runningIds,
@@ -48,6 +50,7 @@ export function NavChats({
   onSelect: (id: string) => void
   onDelete: (id: string) => void
   onRename?: (id: string, title: string) => void
+  onSwitchToAgent?: (id: string) => void
   projects?: Project[]
   label?: string
   runningIds?: Set<string>
@@ -88,13 +91,21 @@ export function NavChats({
               <SidebarMenuButton
                 isActive={session.id === activeSessionId}
                 onClick={() => onSelect(session.id)}
+                className={session.movedToAgent ? "opacity-50" : undefined}
+                tooltip={session.movedToAgent ? "Moved to the Agents tab" : undefined}
               >
+                {session.movedToAgent && (
+                  <Bot className="size-3.5 shrink-0 text-muted-foreground" />
+                )}
                 <span className="truncate">{session.title}</span>
                 {runningIds?.has(session.id) && (
                   <Spinner className="ml-auto size-3" />
                 )}
                 {projectName && !runningIds?.has(session.id) && (
-                  <Badge variant="secondary" className="ml-auto text-[10px]">
+                  <Badge
+                    variant="secondary"
+                    className="ml-auto -mr-7 text-[10px] max-md:opacity-0 md:group-hover/menu-item:opacity-0 md:group-focus-within/menu-item:opacity-0 md:group-has-data-[state=open]/menu-item:opacity-0"
+                  >
                     {initialsFor(projectName)}
                   </Badge>
                 )}
@@ -107,14 +118,20 @@ export function NavChats({
                   </SidebarMenuAction>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent
-                  className="w-40 rounded-lg"
+                  className="w-44 rounded-lg"
                   side={isMobile ? "bottom" : "right"}
                   align={isMobile ? "end" : "start"}
                 >
-                  {onRename && (
+                  {onRename && !session.movedToAgent && (
                     <DropdownMenuItem onClick={() => handleStartRename(session.id, session.title)}>
                       <Pencil className="text-muted-foreground" />
                       <span>Rename</span>
+                    </DropdownMenuItem>
+                  )}
+                  {onSwitchToAgent && !session.movedToAgent && (
+                    <DropdownMenuItem onClick={() => onSwitchToAgent(session.id)}>
+                      <Bot className="text-muted-foreground" />
+                      <span>Switch to Agent Mode</span>
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuSeparator />

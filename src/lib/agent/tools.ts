@@ -5,7 +5,18 @@ import { runPython } from "@/lib/run-python";
 import { runCommand } from "@/lib/run-command";
 import { runCodingTask } from "@/lib/coding-delegate";
 import { readLocalFile, writeLocalFile } from "@/lib/local-file";
-import { saveAgentDefinition } from "@/lib/agents";
+import {
+  saveAgentDefinition,
+  loadAgentDefinitions,
+  updateAgentDefinition,
+} from "@/lib/agents";
+import {
+  isPathAllowed,
+  sandboxDeniedMessage,
+  ensureAgentWorkspace,
+  type AgentSandbox,
+} from "@/lib/agent/sandbox";
+import type { AgentConfigPatch } from "@/types";
 import { getRunContext, type RunContext } from "@/lib/agent/run-context";
 import { webSearch } from "@/lib/agent/web-search";
 import { CURATED_SKILLS, listBundledSkills, listInstalledSkills } from "@/lib/skills-library";
@@ -16,6 +27,76 @@ let artifactCounter = 0;
 
 /** Which extra tools a run gets: plain chat, an agent-mode task, or the agent builder. */
 export type ToolProfile = "chat" | "task" | "setup";
+
+/** Zod schema for the agent-editable settings (update_agent / suggest). */
+const agentPatchSchema = z.object({
+  name: z.string().optional().describe("New short agent name."),
+  purpose: z.string().optional().describe("New one-line purpose shown in the sidebar."),
+  system_prompt: z.string().optional().describe("The agent's complete new system prompt."),
+  model: z.string().nullable().optional().describe("New model name, or null to go back to the app's default model."),
+  skills: z.array(z.string()).optional().describe("Installed skill names the agent may use (full replacement list)."),
+  connectors: z.array(z.string()).optional().describe("Connector catalog ids (full replacement list)."),
+  terminal: z.boolean().optional().describe("Whether the agent may run shell commands / delegate coding tasks."),
+  web: z.boolean().optional().describe("Whether the agent may search/fetch the web."),
+  files: z.boolean().optional().describe("Whether the agent may read/write local files (within its allowed folders)."),
+  read_chats: z.boolean().optional().describe("Whether the agent may search the user's past chats."),
+});
+
+type AgentPatchInput = z.infer<typeof agentPatchSchema>;
+
+/** Map the tool's snake_case patch into the app's AgentConfigPatch. */
+function toAgentPatch(input: AgentPatchInput): AgentConfigPatch {
+  const patch: AgentConfigPatch = {};
+  if (input.name !== undefined) patch.name = input.name;
+  if (input.purpose !== undefined) patch.purpose = input.purpose;
+  if (input.system_prompt !== undefined) patch.systemPrompt = input.system_prompt;
+  if (input.model !== undefined) patch.model = input.model;
+  if (input.skills !== undefined) patch.skills = input.skills;
+  if (input.connectors !== undefined) patch.connectors = input.connectors;
+  if (input.terminal !== undefined) patch.terminal = input.terminal;
+  if (input.web !== undefined) patch.web = input.web;
+  if (input.files !== undefined) patch.files = input.files;
+  if (input.read_chats !== undefined) patch.readChats = input.read_chats;
+  return patch;
+}
+
+/** Short human-readable summary of a patch, for tool results and cards. */
+export function summarizeAgentPatch(patch: AgentConfigPatch): string {
+  const lines: string[] = [];
+  if (patch.name !== undefined) lines.push(`name: "${patch.name}"`);
+  if (patch.purpose !== undefined) lines.push(`purpose: ${patch.purpose}`);
+  if (patch.systemPrompt !== undefined) lines.push("instructions updated");
+  if (patch.model !== undefined) lines.push(patch.model ? `model: ${patch.model}` : "model: app default");
+  if (patch.skills !== undefined) lines.push(`skills: ${patch.skills.join(", ") || "(none)"}`);
+  if (patch.connectors !== undefined) lines.push(`connectors: ${patch.connectors.join(", ") || "(none)"}`);
+  if (patch.terminal !== undefined) lines.push(`terminal: ${patch.terminal ? "on" : "off"}`);
+  if (patch.web !== undefined) lines.push(`web: ${patch.web ? "on" : "off"}`);
+  if (patch.files !== undefined) lines.push(`files: ${patch.files ? "on" : "off"}`);
+  if (patch.readChats !== undefined) lines.push(`read chats: ${patch.readChats ? "on" : "off"}`);
+  return lines.join("; ");
+}
+
+/** Apply an AgentConfigPatch (from update_agent or a suggestion card) to a saved agent. */
+export function applyAgentConfigPatch(
+  agentId: string,
+  patch: AgentConfigPatch,
+): { name: string } | null {
+  const current = loadAgentDefinitions().find((a) => a.id === agentId);
+  if (!current) return null;
+  const { terminal, web, files, readChats, model, ...rest } = patch;
+  const updated = updateAgentDefinition(agentId, {
+    ...rest,
+    ...(model !== undefined ? { model: model ?? undefined } : {}),
+    ...(readChats !== undefined ? { readChats } : {}),
+    capabilities: {
+      ...current.capabilities,
+      ...(terminal !== undefined ? { terminal } : {}),
+      ...(web !== undefined ? { web } : {}),
+      ...(files !== undefined ? { files } : {}),
+    },
+  });
+  return updated ? { name: updated.name } : null;
+}
 
 async function runLegacyTool(name: string, args: Record<string, unknown>): Promise<string> {
   const result = await executeTool({
@@ -32,8 +113,13 @@ export function buildAgentTools(
   profile: ToolProfile = "chat",
   /** Task profile: add read_file/write_file (sandboxed agents with the local-files capability). */
   enableFiles = false,
+  /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
+  sandbox?: AgentSandbox,
 ): StructuredTool[] {
   const ctxFn = getContext ?? getRunContext;
+  const allowedNote = sandbox?.allowedDirectories
+    ? ` You are sandboxed to these folders: ${sandbox.allowedDirectories.join(", ")}.`
+    : "";
   const tools: StructuredTool[] = [
     tool(
       async ({ timezone }: { timezone?: string }) =>
@@ -309,10 +395,11 @@ export function buildAgentTools(
     ),
     tool(
       async (input: {
-        kind: "skill" | "connector" | "mode";
+        kind: "skill" | "connector" | "mode" | "agent_mode" | "agent_config";
         target: string;
         title: string;
         reason: string;
+        agent_patch?: AgentPatchInput;
       }) => {
         const ctx = ctxFn();
         if (!ctx) return "Error: no active run — suggestion could not be shown.";
@@ -323,6 +410,9 @@ export function buildAgentTools(
             target: input.target,
             title: input.title,
             reason: input.reason,
+            ...(input.kind === "agent_config" && input.agent_patch
+              ? { agentPatch: toAgentPatch(input.agent_patch) }
+              : {}),
           },
         });
         return `Suggestion "${input.title}" has been shown to the user as an actionable card. Continue your reply naturally — do not repeat the suggestion in text.`;
@@ -332,16 +422,23 @@ export function buildAgentTools(
         description:
           "Show the user an actionable suggestion card in place of the text composer. " +
           "Use after search_skills or search_connectors finds something useful that isn't " +
-          "installed/connected yet, or when the user's request would benefit from a mode " +
-          "(research, discuss, learn). The card has a button to install/connect/enable " +
-          "and a dismiss option. Call this instead of just mentioning the suggestion in prose.",
+          "installed/connected yet, when the user's request would benefit from a mode " +
+          "(research, discuss, learn), when the conversation has become a hands-on task " +
+          "(running commands, editing files, multi-step local work) that the Agents tab " +
+          "should take over (kind=agent_mode), or when a change to YOUR OWN agent settings " +
+          "would help (kind=agent_config with an agent_patch — the user gets a one-click " +
+          "Apply card). The card has a button to install/connect/enable/switch/apply and a " +
+          "dismiss option. Call this instead of just mentioning the suggestion in prose.",
         schema: z.object({
-          kind: z.enum(["skill", "connector", "mode"]),
+          kind: z.enum(["skill", "connector", "mode", "agent_mode", "agent_config"]),
           target: z.string().describe(
-            "For skill: the skill name (e.g. 'docx'). For connector: the catalog id (e.g. 'zapier'). For mode: 'research', 'council', or 'learn'.",
+            "For skill: the skill name (e.g. 'docx'). For connector: the catalog id (e.g. 'zapier'). For mode: 'research', 'council', or 'learn'. For agent_mode: 'task'. For agent_config: your own agent id from the configuration section of your prompt.",
           ),
           title: z.string().describe("Short headline for the card, e.g. 'Install Word Documents skill'."),
           reason: z.string().describe("1-2 sentences explaining why this is being suggested."),
+          agent_patch: agentPatchSchema.optional().describe(
+            "kind=agent_config only: the settings change you are proposing. Never include folder/project access — that is user-only.",
+          ),
         }),
       },
     ),
@@ -391,6 +488,12 @@ export function buildAgentTools(
       ),
       tool(
         async ({ prompt, directory }: { prompt: string; directory: string }) => {
+          if (
+            sandbox?.allowedDirectories &&
+            !(await isPathAllowed(directory, sandbox.allowedDirectories))
+          ) {
+            return sandboxDeniedMessage(sandbox.allowedDirectories);
+          }
           let result;
           try {
             const ctx = ctxFn();
@@ -423,7 +526,7 @@ export function buildAgentTools(
             "commands, and returns a summary + diff. Use this for real coding work instead of writing " +
             "code files yourself. ALWAYS confirm the project folder with the user first " +
             "(request_structured_input with a 'directory' field) and reuse that folder for the " +
-            "rest of the task.",
+            "rest of the task." + allowedNote,
           schema: z.object({
             prompt: z
               .string()
@@ -434,10 +537,148 @@ export function buildAgentTools(
       ),
     );
 
+    if (sandbox?.agentId) {
+      tools.push(
+        tool(
+          async (input: AgentPatchInput) => {
+            const agentId = sandbox.agentId!;
+            const patch = toAgentPatch(input);
+            if (Object.keys(patch).length === 0) {
+              return "Nothing to update — pass at least one field to change.";
+            }
+            const applied = applyAgentConfigPatch(agentId, patch);
+            if (!applied) {
+              return "Error: your agent definition could not be found or updated.";
+            }
+            return (
+              `Your settings have been updated (${summarizeAgentPatch(patch)}). ` +
+              `The new model and permissions apply from the next run onward; the new system prompt ` +
+              `and skills apply from the next session. Folder, project, and knowledge-file access ` +
+              `can only be changed by the user in your agent settings.`
+            );
+          },
+          {
+            name: "update_agent",
+            description:
+              "Update your own saved-agent settings: name, purpose, system prompt, model, skills, " +
+              "connectors, and permissions (terminal / web / files / read chats). Call this whenever " +
+              "the user asks you to change your setup by chatting (e.g. 'from now on, be more concise', " +
+              "'use a different model'). Pass ONLY the fields that change. You cannot change your " +
+              "folder, project, or knowledge-file access — those are user-only, so ask the user to " +
+              "edit them in your agent settings.",
+            schema: agentPatchSchema,
+          },
+        ),
+      );
+    }
+
+    if (sandbox?.readChats) {
+      tools.push(
+        tool(
+          async ({ query, session_id }: { query?: string; session_id?: string }) => {
+            interface StoredSession {
+              id: string;
+              title: string;
+              updatedAt?: string;
+              isTemporary?: boolean;
+            }
+            let sessions: StoredSession[] = [];
+            try {
+              sessions = JSON.parse(localStorage.getItem("chatui:sessions") ?? "[]");
+            } catch {
+              return "Could not read the chat history.";
+            }
+            sessions = sessions.filter((s) => s && !s.isTemporary);
+
+            // Read one session in full.
+            if (session_id) {
+              const session = sessions.find((s) => s.id === session_id);
+              if (!session) return `No chat found with id "${session_id}". Use search_chats with a query to find the right id first.`;
+              let messages: Array<{ role?: string; content?: string }> = [];
+              try {
+                messages = JSON.parse(
+                  localStorage.getItem(`chatui:messages:${session_id}`) ?? "[]",
+                );
+              } catch {
+                return `Could not read the messages of "${session.title}".`;
+              }
+              const MAX_MSGS = 40;
+              const body = messages
+                .filter((m) => (m.role === "user" || m.role === "assistant") && m.content)
+                .slice(0, MAX_MSGS)
+                .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${String(m.content).slice(0, 500)}`)
+                .join("\n\n");
+              return `Chat "${session.title}" (${messages.length} messages, showing up to ${MAX_MSGS}):\n\n${body || "(empty)"}`.slice(0, 12000);
+            }
+
+            if (!query?.trim()) {
+              return "Pass a search query, or a session_id (from a previous search) to read one chat in full.";
+            }
+            const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+            const matches: Array<{ session: StoredSession; hits: number; snippet: string }> = [];
+            for (const session of sessions) {
+              const title = session.title.toLowerCase();
+              let hits = terms.filter((t) => title.includes(t)).length * 3;
+              let snippet = "";
+              let raw: string | null = null;
+              try {
+                raw = localStorage.getItem(`chatui:messages:${session.id}`);
+              } catch {
+                raw = null;
+              }
+              const lower = (raw ?? "").toLowerCase();
+              for (const t of terms) {
+                if (lower.includes(t)) hits += 1;
+              }
+              if (hits === 0) continue;
+              const idx = lower.indexOf(terms.find((t) => lower.includes(t)) ?? "");
+              if (idx >= 0) {
+                snippet = (raw ?? "").slice(Math.max(0, idx - 120), idx + 240).replace(/\s+/g, " ");
+              }
+              matches.push({ session, hits, snippet });
+            }
+            if (matches.length === 0) {
+              return `No chats matched "${query}".`;
+            }
+            matches.sort((a, b) => b.hits - a.hits);
+            const top = matches.slice(0, 8);
+            const lines = top.map(
+              (m, i) =>
+                `[${i + 1}] ${m.session.title}\n    id: ${m.session.id}` +
+                (m.session.updatedAt ? `\n    last updated: ${m.session.updatedAt.slice(0, 10)}` : "") +
+                (m.snippet ? `\n    …${m.snippet}…` : ""),
+            );
+            return (
+              `Found ${matches.length} chat(s) for "${query}" (top ${top.length}). ` +
+              `Call search_chats again with session_id to read one in full:\n\n${lines.join("\n\n")}`
+            );
+          },
+          {
+            name: "search_chats",
+            description:
+              "Search the user's past chat sessions by keyword, or read one chat in full by its id. " +
+              "Use it when the user refers to an earlier conversation ('what did we decide about X?', " +
+              "'find that chat about the apartment'). First search with a query to get session ids + " +
+              "snippets, then call again with session_id to read the full conversation.",
+            schema: z.object({
+              query: z.string().optional().describe("Keywords to search chat titles and messages for."),
+              session_id: z.string().optional().describe("Read this chat in full (from a previous search result)."),
+            }),
+          },
+        ),
+      );
+    }
+
     if (enableFiles) {
       tools.push(
         tool(
           async ({ path, reason }: { path: string; reason?: string }) => {
+            if (
+              sandbox?.allowedDirectories &&
+              !(await isPathAllowed(path, sandbox.allowedDirectories))
+            ) {
+              return sandboxDeniedMessage(sandbox.allowedDirectories);
+            }
             const ctx = ctxFn();
             if (!ctx?.requestApproval) {
               return "Error: file access approval is not available in this context. Tell the user which file you wanted to read.";
@@ -480,7 +721,7 @@ export function buildAgentTools(
             description:
               "Read a file from the user's Mac: text files return their content, PDFs return extracted text, " +
               "and a folder path returns its listing. Use it whenever the user points you at a local document " +
-              "or folder (e.g. \"look at ~/Documents/…/report.pdf\"). The user approves each access.",
+              "or folder (e.g. \"look at ~/Documents/…/report.pdf\"). The user approves each access." + allowedNote,
             schema: z.object({
               path: z
                 .string()
@@ -491,6 +732,12 @@ export function buildAgentTools(
         ),
         tool(
           async ({ path, content, reason }: { path: string; content: string; reason?: string }) => {
+            if (
+              sandbox?.allowedDirectories &&
+              !(await isPathAllowed(path, sandbox.allowedDirectories))
+            ) {
+              return sandboxDeniedMessage(sandbox.allowedDirectories);
+            }
             const ctx = ctxFn();
             if (!ctx?.requestApproval) {
               return "Error: file access approval is not available in this context. Tell the user which file you wanted to write.";
@@ -518,7 +765,7 @@ export function buildAgentTools(
             description:
               "Create or overwrite a file on the user's Mac with the given full content. The parent folder must " +
               "already exist. When editing an existing file, read it first, then write the complete new content. " +
-              "The user approves each write.",
+              "The user approves each write." + allowedNote,
             schema: z.object({
               path: z
                 .string()
@@ -544,6 +791,8 @@ export function buildAgentTools(
           terminal?: boolean;
           web?: boolean;
           files?: boolean;
+          model?: string | null;
+          read_chats?: boolean;
         }) => {
           const def = saveAgentDefinition({
             name: input.name.trim(),
@@ -557,10 +806,17 @@ export function buildAgentTools(
               files: input.files ?? false,
               computerUse: false,
             },
+            model: input.model ?? undefined,
+            readChats: input.read_chats ?? false,
           });
+          // The agent's private on-disk workspace (~/Documents/chatUI/agents/<id>).
+          void ensureAgentWorkspace(def.id).catch(() => {});
           return (
             `Agent "${def.name}" has been created and now appears in the sidebar under Agents. ` +
-            `Confirm this to the user in one short sentence and recap what the agent does.`
+            `It runs sandboxed on-device: it gets a private workspace folder for its files, and terminal/file ` +
+            `access stays off unless enabled. Confirm this to the user in one short sentence, recap what the ` +
+            `agent does, and mention they can tune everything later in the agent's settings (gear menu) or by ` +
+            `chatting with the agent itself.`
           );
         },
         {
@@ -578,7 +834,9 @@ export function buildAgentTools(
             connectors: z.array(z.string()).optional().describe("Connector catalog ids (e.g. 'zapier') to include."),
             terminal: z.boolean().optional().describe("Whether it may run shell commands / delegate coding (default false)."),
             web: z.boolean().optional().describe("Whether it may search/fetch the web (default true)."),
-            files: z.boolean().optional().describe("Whether it may read/write local files on the user's Mac via read_file/write_file, each access user-approved (default false)."),
+            files: z.boolean().optional().describe("Whether it may read/write local files via read_file/write_file, sandboxed to its workspace + user-granted folders, each access user-approved (default false)."),
+            model: z.string().nullable().optional().describe("Model name this agent should always run on, or null for the app's default model."),
+            read_chats: z.boolean().optional().describe("Whether it may search the user's past chats (default false)."),
           }),
         },
       ),

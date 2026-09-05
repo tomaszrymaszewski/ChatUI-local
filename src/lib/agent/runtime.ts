@@ -6,6 +6,7 @@ import type { ContentPart } from "@/lib/llm";
 import { buildSystemPrompt } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
 import { buildAgentTools, type ToolProfile } from "@/lib/agent/tools";
+import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { loadMcpTools, type McpToolsResult } from "@/lib/agent/mcp";
 import { loadSkillFiles, type SkillFile } from "@/lib/agent/skills";
 import type { RunContext } from "@/lib/agent/run-context";
@@ -42,7 +43,18 @@ export interface AgentSessionOptions {
   skillNames?: string[];
   /** Restrict MCP connectors to these opencode.json config keys. undefined = all enabled; [] = none. */
   mcpNames?: string[];
+  /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
+  sandbox?: AgentSandbox;
 }
+
+const CORE_BEHAVIOR_PROMPT = `
+You are a helpful assistant in a local chat app. Answer exactly what the user asked:
+- Be concise and direct. No preamble ("Sure!", "Great question!") and no narration of what
+  you are about to do — just do it.
+- Do not append unsolicited offers ("If you'd like, I can also…") or follow-up menus.
+  Give the answer; the user will ask for more if they want it.
+- For simple questions and summaries, just answer — no tools, no todos, no artifacts.
+`.trim();
 
 const RICH_FORMAT_PROMPT = `
 You can generate rich content inline in your markdown replies:
@@ -59,16 +71,11 @@ Side panel artifacts:
   instead write a brief 1-2 sentence summary of what you created and mention the user can
   view, edit, and download it.
 
- Working style:
-- For multi-step tasks, use write_todos to plan and keep the todo list updated as you progress.
-- For work that benefits from isolation or parallelism (broad research, comparing perspectives,
-  independent subtasks), use the task tool to spawn subagents — in parallel when independent —
-  and synthesize their reports.
+Other tools:
 - When you need specific structured parameters from the user (research topic and depth, a code
   task spec, document requirements), call request_structured_input with a short form instead of
   asking in prose.
 - You can run Python on the user's machine with run_python to execute or verify code.
-- Installed skills are available under /skills/ — read a skill's SKILL.md when a task matches it.
 `.trim();
 
 const SUGGESTIONS_PROMPT = `
@@ -91,6 +98,13 @@ Skills and connectors — proactive discovery:
   connector covers all of them — search for "gmail", "office", or "google" to find it.
 - Never suggest something that is already installed or connected (the search results show status).
 - After calling suggest, continue your reply naturally — the card is shown to the user automatically.
+
+Agent mode — handing off hands-on work:
+- When the conversation clearly turns into a task the Agents tab handles better — running terminal
+  commands, editing local files, multi-step local execution, or producing a deliverable that needs
+  tools the chat doesn't have — call suggest with kind=agent_mode and target="task". The card moves
+  this conversation to the Agents tab with its full history. Only suggest this once per
+  conversation, and never when you can already complete the request yourself.
 `.trim();
 
 const TASK_MANAGER_PROMPT = `
@@ -138,6 +152,45 @@ Local files:
   ask what to do instead.
 `.trim();
 
+/**
+ * Sandbox + self-configuration section for saved-agent runs: where the agent
+ * may work on disk, and how it can change its own settings via chat.
+ */
+function buildAgentSandboxPrompt(sandbox: AgentSandbox): string {
+  const dirs = (sandbox.allowedDirectories ?? []).filter(Boolean);
+  const workspace = sandbox.workspace;
+  const folders = workspace ? dirs.filter((d) => d !== workspace) : dirs;
+  const lines: string[] = [
+    `Your sandbox and configuration (your agent id: ${sandbox.agentId}):`,
+  ];
+  if (workspace) {
+    lines.push(
+      `- Private workspace: ${workspace} — your own persistent folder on the user's Mac. ` +
+        "You can always read and write files there; use it for your notes and deliverables.",
+    );
+  }
+  if (folders.length > 0) {
+    lines.push(
+      `- Allowed folders (read_file / write_file / run_coding_task): ${folders.join(", ")}`,
+    );
+  } else {
+    lines.push(
+      "- No extra folders granted yet. If you need to work on a codebase or read documents " +
+        "outside your workspace, ask the user to add the folder in your agent settings (Permissions).",
+    );
+  }
+  lines.push(
+    "- Every local action (file access, shell command) still shows the user an approve/deny card.",
+    "- Self-configuration: when the user asks you to change your own setup by chatting " +
+      "(instructions, purpose, model, skills, connectors, terminal/web/files/read-chats " +
+      "permissions), call update_agent with only the fields that change. When you merely think " +
+      "a change would help, propose it with suggest (kind=agent_config + agent_patch) so the " +
+      "user can apply it with one click. Folder, project, and knowledge-file access is " +
+      "user-only — never claim to change it yourself.",
+  );
+  return lines.join("\n");
+}
+
 const AGENT_BUILDER_PROMPT = `
 You are the agent builder. The user just clicked "New agent" and this chat sets up a new
 persistent, sandboxed agent.
@@ -173,8 +226,12 @@ function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
     if (opts.enableFileTools) {
       parts.push(TASK_FILE_TOOLS_PROMPT);
     }
+    if (opts.sandbox?.agentId) {
+      parts.push(buildAgentSandboxPrompt(opts.sandbox));
+    }
     if (opts.instructions) parts.push(opts.instructions);
   } else {
+    parts.push(CORE_BEHAVIOR_PROMPT);
     if (opts.toolProfile === "setup") parts.push(AGENT_BUILDER_PROMPT);
     const base = buildSystemPrompt(opts.instructions);
     if (base) parts.push(base);
@@ -207,7 +264,7 @@ function toLangChainMessages(
     }
     const blocks = m.content.map((part) =>
       part.type === "image_url"
-        ? { type: "image_url", image_url: { url: part.image_url?.url ?? "" } }
+        ? { type: "image_url", image_url: { url: part.image_url?.url ?? "", detail: part.image_url?.detail } }
         : { type: "text", text: part.text ?? "" },
     );
     return { role: m.role, content: blocks };
@@ -320,6 +377,7 @@ export class DeepAgentSession {
       () => runCtx.current,
       profile,
       opts.enableFileTools ?? false,
+      opts.sandbox,
     );
     if (profile === "task" && opts.enableCommandTools === false) {
       tools = tools.filter((t) => t.name !== "run_command" && t.name !== "run_coding_task");

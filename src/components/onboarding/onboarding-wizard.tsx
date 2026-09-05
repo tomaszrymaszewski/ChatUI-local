@@ -6,6 +6,7 @@ import { ThemeStep } from "@/components/onboarding/theme-step";
 import { ProvidersStep } from "@/components/onboarding/providers-step";
 import { ProviderKeyStep } from "@/components/onboarding/provider-key-step";
 import { ProviderModelsStep } from "@/components/onboarding/provider-models-step";
+import { EmbeddingsStep } from "@/components/onboarding/embeddings-step";
 import { StepFooter } from "@/components/onboarding/step-chrome";
 import { PatternBackground } from "@/components/background-pattern";
 import { useProviders } from "@/hooks/use-providers";
@@ -13,6 +14,7 @@ import { useUserSettings } from "@/hooks/use-user-settings";
 import { fetchProviders } from "@/lib/llm";
 import { getBuiltinProvider } from "@/lib/builtin-providers";
 import { getProviderMeta } from "@/lib/provider-meta";
+import { RECOMMENDED_EMBEDDING_MODEL } from "@/lib/embeddings";
 import {
   markOnboardingDone,
   loadOnboardingStep,
@@ -27,6 +29,7 @@ type Step =
   | "providers"
   | "provider-key"
   | "provider-models"
+  | "embeddings"
   | "done";
 
 const ALL_STEPS: Step[] = [
@@ -35,13 +38,14 @@ const ALL_STEPS: Step[] = [
   "providers",
   "provider-key",
   "provider-models",
+  "embeddings",
   "done",
 ];
 
 const TOP_STEPS: Array<{ label: string; steps: Step[] }> = [
   { label: "Welcome", steps: ["welcome"] },
   { label: "Theme", steps: ["theme"] },
-  { label: "Providers", steps: ["providers", "provider-key", "provider-models"] },
+  { label: "Providers", steps: ["providers", "provider-key", "provider-models", "embeddings"] },
   { label: "Done", steps: ["done"] },
 ];
 
@@ -56,6 +60,7 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
   const [setupProviderId, setSetupProviderId] = useState<string | null>(null);
   const [headerBox, setHeaderBox] = useState<HTMLDivElement | null>(null);
   const [footerBox, setFooterBox] = useState<HTMLDivElement | null>(null);
+  const [embeddingChoice, setEmbeddingChoice] = useState(RECOMMENDED_EMBEDDING_MODEL);
   const mainRef = useRef<HTMLDivElement | null>(null);
 
   const { providers, createProvider, addModel } = useProviders();
@@ -210,7 +215,7 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
                 headerBox={headerBox}
                 footerBox={footerBox}
                 onSelect={handleSelectProvider}
-                onContinue={() => gotoStep("done")}
+                onContinue={() => gotoStep("embeddings")}
                 onBack={() => gotoStep("theme")}
               />
             )}
@@ -235,6 +240,20 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
                 onAddModels={handleAddModels}
                 onDone={() => gotoStep("providers")}
                 onBack={() => gotoStep("providers")}
+              />
+            )}
+
+            {step === "embeddings" && (
+              <EmbeddingsStep
+                selected={embeddingChoice}
+                onSelect={(modelId) => {
+                  setEmbeddingChoice(modelId);
+                  void updateSettings({ embeddingModel: modelId });
+                }}
+                onDone={() => gotoStep("done")}
+                onBack={() => gotoStep("providers")}
+                headerBox={headerBox}
+                footerBox={footerBox}
               />
             )}
 

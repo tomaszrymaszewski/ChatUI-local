@@ -1,6 +1,7 @@
 import { useSyncExternalStore } from "react";
 import type { Provider } from "@/types";
 import type { Artifact } from "@/lib/artifacts";
+import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { DeepAgentSession, type AgentMessage } from "@/lib/agent/runtime";
 import { runDeepResearch } from "@/lib/agent/deep-research";
 import { runDiscuss } from "@/lib/agent/discuss";
@@ -40,6 +41,8 @@ export interface DeepAgentRunOptions {
     skillNames?: string[];
     /** Restrict MCP connectors to these opencode.json keys (sandboxed agents). */
     mcpNames?: string[];
+    /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
+    sandbox?: AgentSandbox;
   };
 }
 
@@ -399,6 +402,7 @@ class AgentController implements AgentControllerApi {
           enableFileTools: opts.taskProfile?.enableFileTools,
           skillNames: opts.taskProfile?.skillNames,
           mcpNames: opts.taskProfile?.mcpNames,
+          sandbox: opts.taskProfile?.sandbox,
         });
 
         await session.stream(

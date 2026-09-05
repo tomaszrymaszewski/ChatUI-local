@@ -88,6 +88,100 @@ export function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
+// ─── Image normalization for vision-model APIs ─────────────────────────────
+
+const API_SAFE_IMAGE_TYPES = new Set([
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+]);
+/** Payload guard: APIs commonly reject images above ~10-20 MB. */
+const MAX_IMAGE_BYTES = 10 * 1024 * 1024;
+/** Detail guard: never downscale below this long edge, only cap above it. */
+const MAX_IMAGE_EDGE = 4096;
+
+/**
+ * Normalize an image for vision-model APIs while preserving as much detail
+ * as possible: re-encode unsupported formats (HEIC, TIFF, BMP, …) to JPEG at
+ * the ORIGINAL resolution, and only shrink when the long edge exceeds 4096px
+ * or the file exceeds 10 MB. JPEG/PNG/WebP/GIF under the limits pass through
+ * untouched (no recompression loss).
+ */
+export async function normalizeImageFile(file: File): Promise<File> {
+  const safeType = API_SAFE_IMAGE_TYPES.has(file.type);
+  try {
+    const bitmap = await createImageBitmap(file);
+    const needsResize =
+      bitmap.width > MAX_IMAGE_EDGE || bitmap.height > MAX_IMAGE_EDGE;
+    if (safeType && file.size <= MAX_IMAGE_BYTES && !needsResize) {
+      bitmap.close();
+      return file;
+    }
+    const scale = needsResize
+      ? MAX_IMAGE_EDGE / Math.max(bitmap.width, bitmap.height)
+      : 1;
+    const width = Math.max(1, Math.round(bitmap.width * scale));
+    const height = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      bitmap.close();
+      return file;
+    }
+    ctx.drawImage(bitmap, 0, 0, width, height);
+    bitmap.close();
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/jpeg", 0.92),
+    );
+    if (!blob || blob.size >= file.size) return file;
+    const name = (file.name.replace(/\.[^.]+$/, "") || "image") + ".jpg";
+    return new File([blob], name, { type: "image/jpeg" });
+  } catch {
+    // Undecodable here (e.g. HEIC on an older OS) — send the original and
+    // let the provider accept or reject it.
+    return file;
+  }
+}
+
+/**
+ * Render the first pages of a scanned (image-only) PDF to JPEG data URLs so
+ * vision models can read them with full visual detail. Returns [] when
+ * nothing could be rendered.
+ */
+export async function pdfPagesToDataUrls(
+  file: File,
+  maxPages = 10,
+): Promise<string[]> {
+  try {
+    const pdfjs = await import("pdfjs-dist");
+    pdfjs.GlobalWorkerOptions.workerSrc = PDFJS_WORKER_URL;
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjs.getDocument({ data: arrayBuffer }).promise;
+    const urls: string[] = [];
+    const pages = Math.min(pdf.numPages, maxPages);
+    for (let i = 1; i <= pages; i++) {
+      const page = await pdf.getPage(i);
+      const base = page.getViewport({ scale: 1 });
+      // ~2x for readable scanned text, capped at the 4096px edge.
+      const scale = Math.min(2, MAX_IMAGE_EDGE / Math.max(base.width, base.height));
+      const viewport = page.getViewport({ scale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) break;
+      await page.render({ canvas, canvasContext: ctx, viewport }).promise;
+      urls.push(canvas.toDataURL("image/jpeg", 0.92));
+    }
+    return urls;
+  } catch {
+    return [];
+  }
+}
+
 /** Split text into overlapping chunks. */
 export function chunkText(text: string, chunkSize = 800, overlap = 100): string[] {
   if (!text.trim()) return [];

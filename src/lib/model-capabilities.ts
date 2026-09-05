@@ -186,3 +186,25 @@ export async function getModelContextWindow(
   const ctx = entry?.limit?.context;
   return typeof ctx === "number" && ctx > 0 ? ctx : null;
 }
+
+/**
+ * Best-effort max output tokens from the models.dev catalog.
+ * Returns null when unknown — callers should apply their own fallback.
+ */
+export async function getModelOutputLimit(
+  provider: Provider,
+  modelName: string,
+): Promise<number | null> {
+  const providerKey = providerKeyForBaseUrl(provider.baseUrl);
+  if (!providerKey) return null;
+  const catalog = await getModelsDevCatalog();
+  const models = catalog?.[providerKey]?.models;
+  if (!models) return null;
+  const entry =
+    models[modelName] ??
+    Object.values(models).find(
+      (m) => m.id === modelName || m.name?.toLowerCase() === modelName.toLowerCase(),
+    );
+  const out = entry?.limit?.output;
+  return typeof out === "number" && out > 0 ? out : null;
+}

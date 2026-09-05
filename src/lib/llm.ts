@@ -183,6 +183,7 @@ const EXPORT_BASE_KEYS = [
   "chatui:settings",
   "chatui:projects",
   "chatui:sessions",
+  "chatui:agents",
   "chatui_last_project_dir",
   "chatui_imported_dirs",
   "chatui_active_project_dir",
@@ -250,7 +251,7 @@ export function buildSystemPrompt(projectInstructions?: string, skillsContext?: 
 export interface ContentPart {
   type: "text" | "image_url";
   text?: string;
-  image_url?: { url: string };
+  image_url?: { url: string; detail?: "auto" | "low" | "high" };
 }
 
 export interface ChatCompletionMessage {
@@ -473,6 +474,44 @@ function isTitleLeak(title: string): boolean {
   return TITLE_LEAK_WORDS.some((w) => lower.includes(w));
 }
 
+/** Cap a title at maxWords words, trimming trailing punctuation. */
+export function capTitleWords(raw: string, maxWords = 4): string {
+  const words = raw
+    .replace(/["'\n]/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, maxWords);
+  return words.join(" ").replace(/[.,;:!?]+$/, "").trim();
+}
+
+const TITLE_TRIGGER_PREFIXES = [
+  "research",
+  "teach me",
+  "i want to learn",
+  "discuss",
+];
+
+/**
+ * Instant session title from the first user message: up to 4 words, stripped
+ * of mode-trigger prefixes and punctuation, so the chat has a real title the
+ * moment it starts (the LLM refines it in the background afterwards).
+ */
+export function instantChatTitle(text: string): string {
+  let t = text.trim();
+  if (!t) return "New Chat";
+  const lower = t.toLowerCase();
+  for (const prefix of TITLE_TRIGGER_PREFIXES) {
+    if (lower.startsWith(prefix)) {
+      t = t.slice(prefix.length);
+      break;
+    }
+  }
+  const title = capTitleWords(t, 4);
+  if (!title) return "New Chat";
+  return title.charAt(0).toUpperCase() + title.slice(1);
+}
+
 export async function generateChatTitle(
   provider: Provider,
   model: string,
@@ -488,7 +527,7 @@ export async function generateChatTitle(
     {
       role: "system" as const,
       content:
-        "You are a title generator. Output ONLY a 2-5 word title that captures the main topic of the conversation. No explanation, no quotes, no punctuation, no full sentences.",
+        "You are a title generator. Output ONLY a maximally short title (aim for 4 words or fewer) that captures the main topic of the conversation. Never cut off a name or phrase just to keep the title short. No explanation, no quotes, no punctuation, no full sentences.",
     },
     {
       role: "user" as const,
@@ -514,7 +553,7 @@ export async function generateChatTitle(
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ ...baseBody, [maxField]: 20 }),
+      body: JSON.stringify({ ...baseBody, [maxField]: 200 }),
     });
   };
 
@@ -531,7 +570,14 @@ export async function generateChatTitle(
     "";
   if (!raw) return "";
 
-  const title = raw.replace(/["'\n.]/g, "").trim();
+  // Trust the prompt for brevity — no word-count cutoff. Only clean up
+  // formatting; the leak filter and the 50-char cap below stay as guards
+  // against rambling models.
+  const title = raw
+    .replace(/["'\n]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/[.,;:!?]+$/, "");
   if (!title || isTitleLeak(title)) return "";
   return title.slice(0, 50);
 }

@@ -17,7 +17,9 @@ localStorage plus JSON files under `~/Documents/chatUI` (managed by the Rust sid
     create_artifact, run_python, request_structured_input, search_skills,
     search_connectors, suggest).
   - `src/lib/agent/{models,skills,mcp,run-context,types}.ts` — ChatOpenAI factory
-    (OpenAI-compatible endpoints only), skill files, remote MCP tools, per-run context.
+    (OpenAI-compatible endpoints only; maxTokens comes from models.dev `limit.output`,
+    8192 fallback — omitting it means small provider defaults like DeepSeek's 4096),
+    skill files, remote MCP tools, per-run context.
   - `src/lib/run-python.ts` → Tauri command `run_python` in `src-tauri/src/lib.rs`
     (system python3, temp file, try_wait poll + kill on timeout).
 - **Rich content** — `src/components/markdown-renderer.tsx` renders LaTeX (KaTeX),

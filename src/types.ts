@@ -8,7 +8,10 @@ export interface MessageAttachment {
   name: string;
   size: number;
   type: string;
+  /** Runtime-only image preview (blob URL) — dies on reload; rehydrated from storageId. */
   previewUrl?: string;
+  /** Key into the IndexedDB file store — makes the attachment persist across restarts. */
+  storageId?: string;
 }
 
 export interface Message {
@@ -32,12 +35,17 @@ export interface ProjectFile {
   name: string;
   size: number;
   type: string;
+  /** Key into the IndexedDB file store (content persists across restarts). */
+  storageId?: string;
 }
 
 export interface ProjectImage {
   id: string;
   name: string;
-  url: string;
+  /** Runtime-only blob URL — rehydrated from storageId after reload. */
+  url?: string;
+  /** Key into the IndexedDB file store. */
+  storageId?: string;
 }
 
 export interface Project {
@@ -71,6 +79,12 @@ export interface ChatSession {
   agentId?: string;
   /** True while this session is an agent-builder setup interview. */
   isSetup?: boolean;
+  /**
+   * True for sessions moved from the Chat tab to the Agents tab via
+   * "Switch to Agent Mode". type becomes "agent"; the chat sidebar keeps
+   * listing them grayed out with a redirect notice.
+   */
+  movedToAgent?: boolean;
 }
 
 export interface AgentCapabilities {
@@ -82,6 +96,16 @@ export interface AgentCapabilities {
   web: boolean;
   /** Reserved for the computer-use phase (not implemented yet). */
   computerUse: boolean;
+}
+
+/** A knowledge file/image attached to a saved agent (bytes in IndexedDB). */
+export interface AgentAttachment {
+  id: string;
+  name: string;
+  size: number;
+  type: string;
+  /** Key into the IndexedDB file store. */
+  storageId?: string;
 }
 
 /** A user-defined sandboxed agent created via the agent builder. */
@@ -97,7 +121,37 @@ export interface AgentDefinition {
   /** Connector config keys (opencode.json mcp.<id>) this agent may use. */
   connectors: string[];
   capabilities: AgentCapabilities;
+  /** Model name (from the providers list) this agent always runs on. undefined = the composer/global default. */
+  model?: string;
+  /** May search & read the user's past chat sessions. */
+  readChats?: boolean;
+  /** Absolute folder paths on the user's Mac this agent may access (plus its workspace). */
+  allowedFolders?: string[];
+  /** Project ids whose folders this agent may work in. */
+  allowedProjects?: string[];
+  /** Knowledge files/images sent with every run of this agent. */
+  attachments?: AgentAttachment[];
   createdAt: string;
+}
+
+/**
+ * The subset of an agent's settings the agent itself may change via chat
+ * (update_agent tool / suggest kind=agent_config). Folder, project, and
+ * attachment access stays user-only — an agent can never widen its own
+ * filesystem sandbox.
+ */
+export interface AgentConfigPatch {
+  name?: string;
+  purpose?: string;
+  systemPrompt?: string;
+  /** Model name; undefined/null clears back to the global default. */
+  model?: string | null;
+  skills?: string[];
+  connectors?: string[];
+  terminal?: boolean;
+  web?: boolean;
+  files?: boolean;
+  readChats?: boolean;
 }
 
 export interface ProviderModel {

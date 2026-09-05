@@ -1,6 +1,7 @@
 import { useState } from "react";
 import {
   ArrowUp,
+  Bot,
   SquarePen,
   Sparkles,
   Plug,
@@ -9,6 +10,7 @@ import {
   UsersRound,
   Check,
   Loader2,
+  Settings2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { InputGroup } from "@/components/ui/input-group";
@@ -19,6 +21,8 @@ import {
   CURATED_SKILLS,
   getBundledSkillContent,
 } from "@/lib/skills-library";
+import { summarizeAgentPatch } from "@/lib/agent/tools";
+import type { AgentConfigPatch } from "@/types";
 import type { SuggestionRequest } from "@/lib/agent/types";
 
 export function SuggestionCard({
@@ -27,21 +31,30 @@ export function SuggestionCard({
   onInstallSkill,
   onOpenConnectors,
   onEnableMode,
+  onSwitchToAgent,
+  onApplyAgentConfig,
 }: {
   suggestion: SuggestionRequest;
   onDismiss: () => void;
   onInstallSkill: (name: string) => Promise<void>;
   onOpenConnectors: () => void;
   onEnableMode: (mode: "council" | "learn" | "research") => void;
+  onSwitchToAgent?: () => void;
+  onApplyAgentConfig?: (agentId: string, patch: AgentConfigPatch) => void;
 }) {
   const [installing, setInstalling] = useState(false);
   const [installed, setInstalled] = useState(false);
+  const [applied, setApplied] = useState(false);
 
   const icon =
     suggestion.kind === "skill" ? (
       <Sparkles className="size-4" />
     ) : suggestion.kind === "connector" ? (
       <Plug className="size-4" />
+    ) : suggestion.kind === "agent_mode" ? (
+      <Bot className="size-4" />
+    ) : suggestion.kind === "agent_config" ? (
+      <Settings2 className="size-4" />
     ) : suggestion.target === "learn" ? (
       <GraduationCap className="size-4" />
     ) : suggestion.target === "research" ? (
@@ -73,6 +86,20 @@ export function SuggestionCard({
     onDismiss();
   };
 
+  const handleSwitchToAgent = () => {
+    if (!onSwitchToAgent) return;
+    onSwitchToAgent();
+    onDismiss();
+  };
+
+  const handleApplyConfig = () => {
+    if (!suggestion.agentPatch || !onApplyAgentConfig) return;
+    onApplyAgentConfig(suggestion.target, suggestion.agentPatch!);
+    setApplied(true);
+    toast.success("Agent settings updated");
+    onDismiss();
+  };
+
   return (
     <InputGroup className="h-auto flex-col items-stretch gap-2 p-3">
       <div className="flex items-center justify-between gap-2">
@@ -84,6 +111,11 @@ export function SuggestionCard({
           <span className="truncate text-xs text-muted-foreground mt-0.5">
             {suggestion.reason}
           </span>
+          {suggestion.kind === "agent_config" && suggestion.agentPatch && (
+            <span className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+              {summarizeAgentPatch(suggestion.agentPatch)}
+            </span>
+          )}
         </div>
         <button
           onClick={onDismiss}
@@ -118,6 +150,28 @@ export function SuggestionCard({
           <Button size="sm" onClick={handleEnableMode}>
             <ArrowUp />
             Turn on
+          </Button>
+        )}
+        {suggestion.kind === "agent_mode" && (
+          <Button size="sm" onClick={handleSwitchToAgent} disabled={!onSwitchToAgent}>
+            <Bot />
+            Switch to Agent Mode
+          </Button>
+        )}
+        {suggestion.kind === "agent_config" && !applied && (
+          <Button
+            size="sm"
+            onClick={handleApplyConfig}
+            disabled={!suggestion.agentPatch || !onApplyAgentConfig}
+          >
+            <Settings2 />
+            Apply changes
+          </Button>
+        )}
+        {suggestion.kind === "agent_config" && applied && (
+          <Button size="sm" variant="outline" onClick={onDismiss} disabled>
+            <Check />
+            Applied
           </Button>
         )}
         <Button variant="ghost" size="sm" onClick={onDismiss}>

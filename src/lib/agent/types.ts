@@ -1,4 +1,5 @@
 import type { Artifact } from "@/lib/artifacts";
+import type { AgentConfigPatch } from "@/types";
 
 export type ActivityKind = "tool" | "subagent" | "todo" | "input" | "source";
 export type ActivityStatus = "running" | "done" | "error";
@@ -49,13 +50,18 @@ export interface StructuredInputRequest {
 }
 
 export interface SuggestionRequest {
-  kind: "skill" | "connector" | "mode";
-  /** Skill name, connector id, or mode name (council/learn/research). */
+  kind: "skill" | "connector" | "mode" | "agent_mode" | "agent_config";
+  /**
+   * Skill name, connector id, mode name (council/learn/research), "task" for
+   * the switch-to-agent-mode suggestion, or the agent id for agent_config.
+   */
   target: string;
   /** Short headline shown on the card. */
   title: string;
   /** 1–2 sentence explanation of why this is being suggested. */
   reason: string;
+  /** kind=agent_config: the proposed settings change, applied on click. */
+  agentPatch?: AgentConfigPatch;
 }
 
 /** A local action (shell command / file access / coding-agent permission) awaiting user approval. */

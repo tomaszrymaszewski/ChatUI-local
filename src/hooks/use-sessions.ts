@@ -17,6 +17,7 @@ function loadSessions(): ChatSession[] {
       chatMode?: SessionChatMode;
       agentId?: string;
       isSetup?: boolean;
+      movedToAgent?: boolean;
     }>;
     return data.map((s) => ({
       id: s.id,
@@ -28,6 +29,7 @@ function loadSessions(): ChatSession[] {
       chatMode: s.chatMode,
       agentId: s.agentId,
       isSetup: s.isSetup,
+      movedToAgent: s.movedToAgent,
     }));
   } catch {
     return [];
@@ -48,6 +50,7 @@ function saveSessions(sessions: ChatSession[]) {
         chatMode: s.chatMode,
         agentId: s.agentId,
         isSetup: s.isSetup,
+        movedToAgent: s.movedToAgent,
       })),
     ),
   );
@@ -59,7 +62,13 @@ export function useSessions(type: "chat" | "agent") {
 
   useEffect(() => {
     const all = loadSessions();
-    setSessions(all.filter((s) => s.type === type).sort(
+    // The chat tab also lists sessions moved to the Agents tab (grayed out,
+    // click → redirect notice), so they don't vanish from where they started.
+    const visible =
+      type === "chat"
+        ? all.filter((s) => s.type === "chat" || s.movedToAgent)
+        : all.filter((s) => s.type === type);
+    setSessions(visible.sort(
       (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
     ));
     setLoading(false);
@@ -70,9 +79,11 @@ export function useSessions(type: "chat" | "agent") {
       setSessions((prev) => {
         const next = updater(prev);
         const all = loadSessions();
-        const otherType = all.filter((s) => s.type !== type);
-        const combined = [...otherType, ...next];
-        saveSessions(combined);
+        // next can contain moved (agent-type) sessions on the chat tab —
+        // de-dupe by id so they aren't written twice.
+        const nextIds = new Set(next.map((s) => s.id));
+        const others = all.filter((s) => !nextIds.has(s.id));
+        saveSessions([...others, ...next]);
         return next;
       });
     },
@@ -141,14 +152,37 @@ export function useSessions(type: "chat" | "agent") {
     [persistSessions],
   );
 
+  /**
+   * Move a chat session to the Agents tab (type "agent" + movedToAgent flag).
+   * The messages store is keyed by session id, so the conversation carries
+   * over untouched. Called from the chat tab; the agent tab picks the session
+   * up from storage when it becomes active.
+   */
+  const moveToAgentTab = useCallback(
+    async (id: string) => {
+      persistSessions((prev) =>
+        prev.map((s) =>
+          s.id === id
+            ? { ...s, type: "agent", movedToAgent: true, updatedAt: new Date() }
+            : s,
+        ),
+      );
+    },
+    [persistSessions],
+  );
+
   const refetch = useCallback(() => {
     const all = loadSessions();
-    setSessions(all.filter((s) => s.type === type).sort(
+    const visible =
+      type === "chat"
+        ? all.filter((s) => s.type === "chat" || s.movedToAgent)
+        : all.filter((s) => s.type === type);
+    setSessions(visible.sort(
       (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
     ));
   }, [type]);
 
-  return { sessions, loading, createSession, deleteSession, updateSession, refetch };
+  return { sessions, loading, createSession, deleteSession, updateSession, moveToAgentTab, refetch };
 }
 
 /**
