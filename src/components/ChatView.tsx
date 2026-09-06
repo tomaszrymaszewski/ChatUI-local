@@ -211,7 +211,10 @@ const WELCOME_PROMPTS = [
 // The chat column must keep at least this much width so the composer and
 // messages never overflow. The artifact panel's max width is derived from it:
 // max artifact width = container content width - overhead - CHAT_MIN_WIDTH_PX.
-const CHAT_MIN_WIDTH_PX = 440;
+// Sized to fit the composer's worst-case bottom row: add button, project chip
+// (capped at max-w-20), four mode toggles, model label at max-w-48 with
+// provider logo and reasoning icon, send button, gaps, and padding.
+const CHAT_MIN_WIDTH_PX = 600;
 /** Drag handle (6px) + two flex gaps (2 × 8px) in the chat/artifact row. */
 const ARTIFACT_ROW_OVERHEAD_PX = 22;
 /** The session container's p-2 padding (2 × 8px). */
@@ -1001,8 +1004,22 @@ export function ChatView() {
         deleteMessage(sessionId, assistantMsg.id);
       }
 
-      if (isNewSession && result.content) {
-        generateChatTitle(provider, runModelName, text, result.content)
+      // Title seed: for research runs result.content is only a 1-2 sentence
+      // summary ("I generated a report…"), which makes the LLM title wrong.
+      // Prefer the report artifact — its opening restates the topic faithfully.
+      const titleSeed =
+        result.artifacts?.find((a) => a.language === "markdown")?.content ||
+        result.content ||
+        "";
+
+      // Title the chat on the first reply, then refresh the title every 8
+      // messages so it keeps tracking where the conversation went.
+      const messageCount = sessionId ? loadMessages(sessionId).length : 0;
+      if (
+        titleSeed &&
+        (isNewSession || (messageCount > 0 && messageCount % 8 === 0))
+      ) {
+        generateChatTitle(provider, runModelName, text, titleSeed)
           .then((title) => {
             if (title && sessionId) {
               updateSession(sessionId, { title });
@@ -2613,7 +2630,7 @@ export function ChatView() {
                     placeholder={chatComposerPlaceholder}
                     className="max-h-40 min-h-12"
                   />
-                  <InputGroupAddon align="block-end">
+                  <InputGroupAddon align="block-end" className="flex-wrap">
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
                         <InputGroupButton size="icon-xs" aria-label="Add">
@@ -2673,7 +2690,7 @@ export function ChatView() {
                         className="group bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500"
                         onClick={() => assignProject(undefined)}
                       >
-                        <span className="group-hover:line-through">{currentProjectName}</span>
+                        <span className="max-w-20 truncate group-hover:line-through">{currentProjectName}</span>
                       </InputGroupButton>
                     )}
                     {modeToggles}
