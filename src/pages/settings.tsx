@@ -20,7 +20,6 @@ import {
   Card,
   CardContent,
   CardDescription,
-  CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 import { Separator } from "@/components/ui/separator";
@@ -51,7 +50,6 @@ import { useUserSettings } from "@/hooks/use-user-settings";
 import { useProjects } from "@/hooks/use-projects";
 import { useOpencodeContext } from "@/lib/opencode-context";
 import { exportAllData, importAllData, getTavilyApiKey, setTavilyApiKey } from "@/lib/llm";
-import { getBuiltinProvider } from "@/lib/builtin-providers";
 import { getProviderMeta } from "@/lib/provider-meta";
 import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync } from "@/lib/model-capabilities";
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
@@ -597,37 +595,21 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-xl font-semibold">Providers</h2>
-                  <p className="text-sm text-muted-foreground">
-                    Configure your AI provider endpoints and API keys
-                  </p>
                 </div>
-                {!showProviderForm && (
-                  <Button
-                    onClick={() => {
-                      setEditingProvider(null);
-                      setShowProviderForm(true);
-                    }}
-                  >
-                    <Plus className="size-4" />
-                    Add Provider
-                  </Button>
-                )}
-              </div>
-
-              {showProviderForm && (
-                <ProviderForm
-                  provider={editingProvider}
-                  onSave={handleSaveProvider}
-                  onCancel={() => {
-                    setShowProviderForm(false);
+                <Button
+                  onClick={() => {
                     setEditingProvider(null);
+                    setShowProviderForm(true);
                   }}
-                />
-              )}
+                >
+                  <Plus className="size-4" />
+                  Add Provider
+                </Button>
+              </div>
 
               {loading ? (
                 <p className="text-sm text-muted-foreground">Loading providers...</p>
-              ) : providers.length === 0 && !showProviderForm ? (
+              ) : providers.length === 0 ? (
                 <Card className="border-dashed">
                   <CardContent className="flex flex-col items-center gap-2 py-10">
                     <Server className="size-8 text-muted-foreground" />
@@ -644,77 +626,53 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                   </CardContent>
                 </Card>
               ) : (
-                <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-4">
                   {providers.map((provider) => {
-                    const builtin = provider.builtinKey ? getBuiltinProvider(provider.builtinKey) : null;
                     const logoKey = provider.builtinKey
                       ? getProviderMeta(provider.builtinKey)?.logoKey ?? "custom"
                       : "custom";
                     return (
-                      <Card key={provider.id}>
-                        <CardHeader>
-                          <div className="flex items-start justify-between">
-                            <div className="flex flex-col gap-1">
-                              <CardTitle className="flex items-center gap-2">
-                                <ProviderLogo logoKey={logoKey} className="size-4" />
-                                {provider.name}
-                                {builtin && (
-                                  <span className="rounded-full bg-secondary px-2 py-0.5 text-[10px] text-secondary-foreground">
-                                    built-in
-                                  </span>
-                                )}
-                              </CardTitle>
-                              <CardDescription className="flex items-center gap-2">
-                                <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
-                                  {provider.baseUrl || "(local)"}
-                                </code>
-                              </CardDescription>
+                        <Card key={provider.id}>
+                            <div className="flex items-center justify-between ml-8 mr-6">
+                              <div className="flex flex-col gap-1">
+                                <CardTitle className="flex items-center gap-2">
+                                  <ProviderLogo logoKey={logoKey} className="size-4" />
+                                  {provider.name}
+                                  <CardDescription className="flex items-center gap-2">
+                                    <code className="rounded bg-muted px-1.5 py-0.5 text-xs">
+                                      {provider.baseUrl || "(local)"}
+                                    </code>
+                                  </CardDescription>
+                                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                                    <span className="mx-1">·</span>
+                                    <KeyRound className="size-3" />
+                                    {provider.hasKey ? "API key set" : "No API key"}
+                                    <span className="mx-1">·</span>
+                                    {provider.models.length} model{provider.models.length !== 1 ? "s" : ""}
+                                  </div>
+                                </CardTitle>
+                              </div>
+                              <div className="flex gap-1">
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => {
+                                    setEditingProvider(provider);
+                                    setShowProviderForm(true);
+                                  }}
+                                >
+                                  <Pencil className="size-4" />
+                                </Button>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  onClick={() => setDeleteTarget(provider)}
+                                >
+                                  <Trash2 className="size-4 text-destructive" />
+                                </Button>
+                              </div>
                             </div>
-                            <div className="flex gap-1">
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => {
-                                  setEditingProvider(provider);
-                                  setShowProviderForm(true);
-                                }}
-                              >
-                                <Pencil className="size-4" />
-                              </Button>
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => setDeleteTarget(provider)}
-                              >
-                                <Trash2 className="size-4 text-destructive" />
-                              </Button>
-                            </div>
-                          </div>
-                        </CardHeader>
-                        <CardContent>
-                          <div className="flex flex-wrap gap-2">
-                            {provider.models.map((model) => (
-                              <span
-                                key={model.id}
-                                className="rounded-md bg-muted px-2 py-1 text-xs font-medium"
-                              >
-                                {modelLabel(model)}
-                              </span>
-                            ))}
-                            {provider.models.length === 0 && (
-                              <span className="text-xs text-muted-foreground">
-                                No models added yet
-                              </span>
-                            )}
-                          </div>
-                          <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
-                            <KeyRound className="size-3" />
-                            {provider.hasKey ? "API key set" : "No API key"}
-                            <span className="mx-1">·</span>
-                            {provider.models.length} model{provider.models.length !== 1 ? "s" : ""}
-                          </div>
-                        </CardContent>
-                      </Card>
+                        </Card>
                     );
                   })}
                 </div>
@@ -728,35 +686,19 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-xl font-semibold">Models</h2>
-                  <p className="text-sm text-muted-foreground">
-                    Add models to your providers and select a default
-                  </p>
                 </div>
-                {!showModelForm && (
-                  <Button
-                    onClick={() => setShowModelForm(true)}
-                    disabled={providers.length === 0}
-                  >
-                    <Plus className="size-4" />
-                    Add Model
-                  </Button>
-                )}
+                <Button
+                  onClick={() => setShowModelForm(true)}
+                  disabled={providers.length === 0}
+                >
+                  <Plus className="size-4" />
+                  Add Model
+                </Button>
               </div>
-
-              {showModelForm && (
-                <ModelForm
-                  providers={providers}
-                  onSave={handleAddModel}
-                  onCancel={() => setShowModelForm(false)}
-                />
-              )}
 
               <div className="flex items-center justify-between">
                 <div className="flex flex-col gap-0.5">
                   <span className="text-sm font-medium">Default Model</span>
-                  <span className="text-xs text-muted-foreground">
-                    Model used for new conversations
-                  </span>
                 </div>
                 <Select
                   value={settings.defaultModel ?? ""}
@@ -775,7 +717,13 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                     ) : (
                       allModels.map((m) => (
                         <SelectItem key={m.id} value={m.name}>
-                          {modelLabel(m)} ({m.providerName})
+                          <span className="flex items-center gap-2">
+                            <ProviderLogo
+                              logoKey={getProviderMeta(m.builtinKey ?? "custom")?.logoKey ?? "custom"}
+                              className="size-3.5 shrink-0 text-muted-foreground"
+                            />
+                            {modelLabel(m)}
+                          </span>
                         </SelectItem>
                       ))
                     )}
@@ -849,7 +797,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                 </div>
               )}
 
-              {allModels.length === 0 && !showModelForm && (
+              {allModels.length === 0 && (
                 <Card className="border-dashed">
                   <CardContent className="flex flex-col items-center gap-2 py-10">
                     <Cpu className="size-8 text-muted-foreground" />
@@ -887,6 +835,58 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
         )}
 
       </div>
+
+      {/* Add/Edit Provider Dialog */}
+      <Dialog
+        open={showProviderForm}
+        onOpenChange={(o) => {
+          if (!o) {
+            setShowProviderForm(false);
+            setEditingProvider(null);
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {editingProvider ? "Edit Provider" : "Add Provider"}
+            </DialogTitle>
+            <DialogDescription>
+              {editingProvider
+                ? "Update your provider configuration. Leave API key blank to keep the existing key."
+                : "Choose a built-in provider or add a custom OpenAI-compatible endpoint."}
+            </DialogDescription>
+          </DialogHeader>
+          <ProviderForm
+            provider={editingProvider}
+            onSave={handleSaveProvider}
+            onCancel={() => {
+              setShowProviderForm(false);
+              setEditingProvider(null);
+            }}
+          />
+        </DialogContent>
+      </Dialog>
+
+      {/* Add Model Dialog */}
+      <Dialog
+        open={showModelForm}
+        onOpenChange={(o) => !o && setShowModelForm(false)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add Model</DialogTitle>
+            <DialogDescription>
+              Select a provider, then choose a model from its API.
+            </DialogDescription>
+          </DialogHeader>
+          <ModelForm
+            providers={providers}
+            onSave={handleAddModel}
+            onCancel={() => setShowModelForm(false)}
+          />
+        </DialogContent>
+      </Dialog>
 
       {/* Delete Provider Dialog */}
       <Dialog

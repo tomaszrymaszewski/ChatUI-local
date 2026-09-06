@@ -39,6 +39,41 @@ import { Spinner } from "@/components/ui/spinner"
  * Agent-mode sidebar content: the saved agents (start sessions with them)
  * plus every agent-mode session (standalone tasks and agent chats).
  */
+/**
+ * Agent avatar rail — rendered only when the sidebar is collapsed to the
+ * icon rail (the Agents group above is hidden there). Expanded, this
+ * renders nothing.
+ */
+export function AgentAvatarRail({
+  agents,
+  activeAgentId,
+  onOpenAgentConsole,
+}: {
+  agents: AgentDefinition[]
+  activeAgentId?: string | null
+  onOpenAgentConsole: (agentId: string) => void
+}) {
+  if (agents.length === 0) return null
+  return (
+    <SidebarGroup className="hidden group-data-[collapsible=icon]:flex">
+      <SidebarMenu>
+        {agents.map((agent) => (
+          <SidebarMenuItem key={agent.id}>
+            <SidebarMenuButton
+              isActive={agent.id === activeAgentId}
+              onClick={() => onOpenAgentConsole(agent.id)}
+              tooltip={agent.name}
+            >
+              <AgentAvatar seed={agent.id} className="size-4" />
+              <span>{agent.name}</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        ))}
+      </SidebarMenu>
+    </SidebarGroup>
+  )
+}
+
 export function NavAgents({
   agents,
   sessions,
@@ -51,6 +86,7 @@ export function NavAgents({
   onDeleteAgent,
   onOpenAgentSettings,
   runningIds,
+  activeAgentId,
 }: {
   agents: AgentDefinition[]
   sessions: ChatSession[]
@@ -63,6 +99,7 @@ export function NavAgents({
   onDeleteAgent: (id: string) => void
   onOpenAgentSettings?: (id: string) => void
   runningIds?: Set<string>
+  activeAgentId?: string | null
 }) {
   const { isMobile } = useSidebar()
   const [renameTarget, setRenameTarget] = useState<{ id: string; title: string } | null>(null)
@@ -138,7 +175,7 @@ export function NavAgents({
           ))}
           {agents.length === 0 && (
             <span className="px-2 text-xs text-muted-foreground">
-              No agents yet — click "New Agent" to set one up.
+              No agents yet — describe one in the dashboard composer to set it up.
             </span>
           )}
         </SidebarMenu>
@@ -200,11 +237,17 @@ export function NavAgents({
           })}
           {sessions.length === 0 && (
             <span className="px-2 text-xs text-muted-foreground">
-              No tasks yet — click "New Task" to start one.
+              No tasks yet — start one from the dashboard composer.
             </span>
           )}
         </SidebarMenu>
       </SidebarGroup>
+
+      <AgentAvatarRail
+        agents={agents}
+        activeAgentId={activeAgentId}
+        onOpenAgentConsole={onOpenAgentConsole}
+      />
 
       <Dialog open={!!renameTarget} onOpenChange={(open) => { if (!open) { setRenameTarget(null); setRenameDraft(""); } }}>
         <DialogContent>

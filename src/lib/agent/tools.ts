@@ -111,7 +111,7 @@ export function buildAgentTools(
   webFetchEnabled: boolean,
   getContext?: () => RunContext | null,
   profile: ToolProfile = "chat",
-  /** Task profile: add read_file/write_file (sandboxed agents with the local-files capability). */
+  /** Task profile: add read_local_file/write_local_file (saved agents; sandboxed to workspace + granted folders). */
   enableFiles = false,
   /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
   sandbox?: AgentSandbox,
@@ -670,27 +670,34 @@ export function buildAgentTools(
     }
 
     if (enableFiles) {
+      // Folders-only access model: when a sandbox allowlist exists, passing it
+      // IS the authorization — the user granted those folders, so no
+      // per-access approval card. Only unrestricted runs (no sandbox) keep
+      // the approve/deny gate.
+      const sandboxed = sandbox?.allowedDirectories !== undefined;
       tools.push(
         tool(
           async ({ path, reason }: { path: string; reason?: string }) => {
             if (
-              sandbox?.allowedDirectories &&
-              !(await isPathAllowed(path, sandbox.allowedDirectories))
+              sandboxed &&
+              !(await isPathAllowed(path, sandbox!.allowedDirectories!))
             ) {
-              return sandboxDeniedMessage(sandbox.allowedDirectories);
+              return sandboxDeniedMessage(sandbox!.allowedDirectories!);
             }
-            const ctx = ctxFn();
-            if (!ctx?.requestApproval) {
-              return "Error: file access approval is not available in this context. Tell the user which file you wanted to read.";
-            }
-            const { approved } = await ctx.requestApproval({
-              command: path,
-              action: "read",
-              source: "local_file",
-              reason,
-            });
-            if (!approved) {
-              return "The user denied reading this file. Do not retry it — ask what to do differently or continue without it.";
+            if (!sandboxed) {
+              const ctx = ctxFn();
+              if (!ctx?.requestApproval) {
+                return "Error: file access approval is not available in this context. Tell the user which file you wanted to read.";
+              }
+              const { approved } = await ctx.requestApproval({
+                command: path,
+                action: "read",
+                source: "local_file",
+                reason,
+              });
+              if (!approved) {
+                return "The user denied reading this file. Do not retry it — ask what to do differently or continue without it.";
+              }
             }
             let result;
             try {
@@ -717,11 +724,11 @@ export function buildAgentTools(
             return parts.join("\n\n");
           },
           {
-            name: "read_file",
+            name: "read_local_file",
             description:
               "Read a file from the user's Mac: text files return their content, PDFs return extracted text, " +
               "and a folder path returns its listing. Use it whenever the user points you at a local document " +
-              "or folder (e.g. \"look at ~/Documents/…/report.pdf\"). The user approves each access." + allowedNote,
+              "or folder (e.g. \"look at ~/Documents/…/report.pdf\"). You may only access the user's granted folders." + allowedNote,
             schema: z.object({
               path: z
                 .string()
@@ -733,23 +740,25 @@ export function buildAgentTools(
         tool(
           async ({ path, content, reason }: { path: string; content: string; reason?: string }) => {
             if (
-              sandbox?.allowedDirectories &&
-              !(await isPathAllowed(path, sandbox.allowedDirectories))
+              sandboxed &&
+              !(await isPathAllowed(path, sandbox!.allowedDirectories!))
             ) {
-              return sandboxDeniedMessage(sandbox.allowedDirectories);
+              return sandboxDeniedMessage(sandbox!.allowedDirectories!);
             }
-            const ctx = ctxFn();
-            if (!ctx?.requestApproval) {
-              return "Error: file access approval is not available in this context. Tell the user which file you wanted to write.";
-            }
-            const { approved } = await ctx.requestApproval({
-              command: path,
-              action: "write",
-              source: "local_file",
-              reason,
-            });
-            if (!approved) {
-              return "The user denied writing this file. Do not retry it — ask what to do differently or continue without it.";
+            if (!sandboxed) {
+              const ctx = ctxFn();
+              if (!ctx?.requestApproval) {
+                return "Error: file access approval is not available in this context. Tell the user which file you wanted to write.";
+              }
+              const { approved } = await ctx.requestApproval({
+                command: path,
+                action: "write",
+                source: "local_file",
+                reason,
+              });
+              if (!approved) {
+                return "The user denied writing this file. Do not retry it — ask what to do differently or continue without it.";
+              }
             }
             try {
               const result = await writeLocalFile(path, content);
@@ -761,11 +770,11 @@ export function buildAgentTools(
             }
           },
           {
-            name: "write_file",
+            name: "write_local_file",
             description:
               "Create or overwrite a file on the user's Mac with the given full content. The parent folder must " +
               "already exist. When editing an existing file, read it first, then write the complete new content. " +
-              "The user approves each write." + allowedNote,
+              "You may only write inside the user's granted folders." + allowedNote,
             schema: z.object({
               path: z
                 .string()
@@ -786,11 +795,9 @@ export function buildAgentTools(
           name: string;
           purpose: string;
           system_prompt: string;
-          skills?: string[];
           connectors?: string[];
           terminal?: boolean;
           web?: boolean;
-          files?: boolean;
           model?: string | null;
           read_chats?: boolean;
         }) => {
@@ -798,12 +805,11 @@ export function buildAgentTools(
             name: input.name.trim(),
             purpose: input.purpose.trim(),
             systemPrompt: input.system_prompt.trim(),
-            skills: input.skills ?? [],
+            skills: [],
             connectors: input.connectors ?? [],
             capabilities: {
               terminal: input.terminal ?? false,
               web: input.web ?? true,
-              files: input.files ?? false,
               computerUse: false,
             },
             model: input.model ?? undefined,
@@ -813,28 +819,26 @@ export function buildAgentTools(
           void ensureAgentWorkspace(def.id).catch(() => {});
           return (
             `Agent "${def.name}" has been created and now appears in the sidebar under Agents. ` +
-            `It runs sandboxed on-device: it gets a private workspace folder for its files, and terminal/file ` +
-            `access stays off unless enabled. Confirm this to the user in one short sentence, recap what the ` +
-            `agent does, and mention they can tune everything later in the agent's settings (gear menu) or by ` +
-            `chatting with the agent itself.`
+            `It runs sandboxed on-device: it gets a private workspace folder for its files, and the user can ` +
+            `grant extra folders, connect apps, and tune everything later in the agent's settings (gear menu) ` +
+            `or by chatting with the agent itself. Confirm this to the user in one short sentence, recap what ` +
+            `the agent does.`
           );
         },
         {
           name: "create_agent",
           description:
             "Create the new agent from the agreed setup. Call exactly once, after the user confirmed " +
-            "the name, purpose, skills, connectors, and capabilities.",
+            "the name, purpose, connectors, and capabilities.",
           schema: z.object({
             name: z.string().describe("Short agent name, e.g. 'Invoice Wrangler'."),
             purpose: z.string().describe("One-line description shown in the sidebar."),
             system_prompt: z
               .string()
               .describe("The agent's complete system prompt: identity, how it works, its limits."),
-            skills: z.array(z.string()).optional().describe("Installed skill names to include."),
             connectors: z.array(z.string()).optional().describe("Connector catalog ids (e.g. 'zapier') to include."),
             terminal: z.boolean().optional().describe("Whether it may run shell commands / delegate coding (default false)."),
             web: z.boolean().optional().describe("Whether it may search/fetch the web (default true)."),
-            files: z.boolean().optional().describe("Whether it may read/write local files via read_file/write_file, sandboxed to its workspace + user-granted folders, each access user-approved (default false)."),
             model: z.string().nullable().optional().describe("Model name this agent should always run on, or null for the app's default model."),
             read_chats: z.boolean().optional().describe("Whether it may search the user's past chats (default false)."),
           }),

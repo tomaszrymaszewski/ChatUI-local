@@ -1,14 +1,6 @@
 import { useState, useEffect, useCallback } from "react";
-import { Loader2, Plus, RefreshCw } from "lucide-react";
+import { Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -92,36 +84,22 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
 
   if (providers.length === 0) {
     return (
-      <Card className="w-full">
-        <CardHeader>
-          <CardTitle>Add Model</CardTitle>
-          <CardDescription>
-            Add a provider first, then you can add models to it.
-          </CardDescription>
-        </CardHeader>
-        <CardFooter>
+      <div className="flex flex-col gap-4">
+        <p className="text-sm text-muted-foreground">
+          Add a provider first, then you can add models to it.
+        </p>
+        <div className="flex justify-end gap-2">
           <Button variant="outline" onClick={onCancel}>
             Close
           </Button>
-        </CardFooter>
-      </Card>
+        </div>
+      </div>
     );
   }
 
   return (
-    <Card className="w-full">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Plus className="size-4" />
-          Add Model
-        </CardTitle>
-        <CardDescription>
-          Select a provider, then choose a model from its API.
-        </CardDescription>
-      </CardHeader>
-      <form onSubmit={handleSubmit}>
-        <CardContent className="flex flex-col gap-4">
-          <div className="flex flex-col gap-2">
+    <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2">
             <Label htmlFor="model-provider">Provider</Label>
             <Select value={providerId} onValueChange={setProviderId}>
               <SelectTrigger id="model-provider">
@@ -190,31 +168,23 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
                   <Label htmlFor="model-display-name">Display Name</Label>
                   <Input
                     id="model-display-name"
-                    placeholder="Optional — auto-formatted from model ID"
-                    value={displayName}
+                    placeholder="Visible in all dropdowns in this app"
+                    value={displayName.trim() || formatModelName(modelId)}
                     onChange={(e) => setDisplayName(e.target.value)}
                   />
-                  <p className="text-xs text-muted-foreground">
-                    Will appear as{" "}
-                    <span className="font-medium text-foreground">
-                      {displayName.trim() || formatModelName(modelId)}
-                    </span>
-                  </p>
                 </div>
               )}
             </>
           )}
-        </CardContent>
-        <CardFooter className="flex justify-end gap-2">
-          <Button type="button" variant="outline" onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button type="submit" disabled={saving || !modelId.trim()}>
-            {saving && <Loader2 className="size-4 animate-spin" />}
-            Add Model
-          </Button>
-        </CardFooter>
-      </form>
-    </Card>
+      <div className="flex justify-end gap-2">
+        <Button type="button" variant="outline" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button type="submit" disabled={saving || !modelId.trim()}>
+          {saving && <Loader2 className="size-4 animate-spin" />}
+          Add Model
+        </Button>
+      </div>
+    </form>
   );
 }

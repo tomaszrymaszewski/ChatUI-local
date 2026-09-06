@@ -1,11 +1,12 @@
 import { useSyncExternalStore } from "react";
-import type { Provider } from "@/types";
+import type { Provider, ReasoningEffort } from "@/types";
 import type { Artifact } from "@/lib/artifacts";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { DeepAgentSession, type AgentMessage } from "@/lib/agent/runtime";
 import { runDeepResearch } from "@/lib/agent/deep-research";
 import { runDiscuss } from "@/lib/agent/discuss";
 import { loadUserSettings } from "@/hooks/use-user-settings";
+import { estimateTokens, recordAgentUsage } from "@/lib/agent-usage";
 import type {
   ActivityItem,
   AgentEvent,
@@ -26,6 +27,8 @@ export interface DeepAgentRunOptions {
   mode?: AgentMode;
   webFetchEnabled: boolean;
   projectDir?: string | null;
+  /** Reasoning effort for reasoning-capable models ("default" = provider default). */
+  reasoningEffort?: ReasoningEffort;
   /** All configured models (name → providerId), used by discuss mode for per-role model assignment. */
   availableModels?: Array<{ name: string; providerId: string; displayName?: string }>;
   /** All providers, used by discuss mode to resolve per-role model → ChatOpenAI. */
@@ -35,7 +38,7 @@ export interface DeepAgentRunOptions {
     toolProfile: "task" | "setup";
     /** false withholds run_command/run_coding_task (sandboxed agents without terminal). */
     enableCommandTools?: boolean;
-    /** true adds read_file/write_file (agents with the local-files capability). */
+    /** true adds read_local_file/write_local_file (agents with the local-files capability). */
     enableFileTools?: boolean;
     /** Restrict skills to these names (sandboxed agents). */
     skillNames?: string[];
@@ -44,6 +47,32 @@ export interface DeepAgentRunOptions {
     /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
     sandbox?: AgentSandbox;
   };
+  /**
+   * True for headless (scheduler/workflow) runs: structured-input requests are
+   * auto-skipped and — in "ask" terminal-approval mode — commands are
+   * auto-denied, so an unattended run can never hang on the UI.
+   */
+  unattended?: boolean;
+}
+
+/** Best-effort char count of the run input (text parts only; images excluded). */
+function inputChars(messages: AgentMessage[]): number {
+  let n = 0;
+  for (const m of messages) {
+    const c = m.content;
+    if (typeof c === "string") {
+      n += c.length;
+    } else if (Array.isArray(c)) {
+      for (const part of c) {
+        const p: unknown = part;
+        if (typeof p === "string") n += p.length;
+        else if (p && typeof p === "object" && "text" in p) {
+          n += String((p as { text: unknown }).text ?? "").length;
+        }
+      }
+    }
+  }
+  return n;
 }
 
 type InputResolution =
@@ -100,6 +129,8 @@ class AgentController implements AgentControllerApi {
   private approvalResolverRef: ((approved: boolean) => void) | null = null;
   /** Session-level: the user approved one command in "task" approval mode. */
   private commandsApprovedForTask = false;
+  /** Headless runs never surface prompts — see DeepAgentRunOptions.unattended. */
+  private unattended = false;
   private reasoningStartRef: number | null = null;
   private reasoningMsRef = 0;
   private reasoningStreamsRef = new Map<string, { text: string; label: string; startTime: number; endTime?: number; seq: number }>();
@@ -284,6 +315,19 @@ class AgentController implements AgentControllerApi {
   }
 
   private promptForInput = (request: StructuredInputRequest): Promise<InputResolution> => {
+    if (this.unattended) {
+      this.emit({
+        type: "activity",
+        activity: {
+          id: "structured-input",
+          kind: "input",
+          name: request.title,
+          status: "done",
+          label: "Skipped — unattended run",
+        },
+      });
+      return Promise.resolve({ cancelled: true });
+    }
     this.emit({
       type: "activity",
       activity: {
@@ -312,6 +356,21 @@ class AgentController implements AgentControllerApi {
     const mode = loadUserSettings().terminalApproval;
     if (mode === "auto" || (mode === "task" && this.commandsApprovedForTask)) {
       return Promise.resolve({ approved: true });
+    }
+    if (this.unattended) {
+      // "ask" mode with nobody at the keyboard — deny instead of hanging.
+      const label = request.command.split("\n")[0].slice(0, 60);
+      this.emit({
+        type: "activity",
+        activity: {
+          id: "command-approval",
+          kind: "input",
+          name: label,
+          status: "done",
+          label: "Denied — unattended run",
+        },
+      });
+      return Promise.resolve({ approved: false });
     }
     const label = request.command.split("\n")[0].slice(0, 60);
     this.emit({
@@ -347,6 +406,7 @@ class AgentController implements AgentControllerApi {
   run = async (opts: DeepAgentRunOptions): Promise<AgentRunResult> => {
     this.resetState();
     this.isRunning = true;
+    this.unattended = opts.unattended ?? false;
     registryNotify();
     const controller = new AbortController();
     this.abortRef = controller;
@@ -393,6 +453,7 @@ class AgentController implements AgentControllerApi {
         session = await DeepAgentSession.create({
           provider: opts.provider,
           modelName: opts.modelName,
+          reasoningEffort: opts.reasoningEffort,
           instructions: opts.instructions,
           mode: mode === "task" ? "task" : "chat",
           webFetchEnabled: opts.webFetchEnabled,
@@ -428,6 +489,7 @@ class AgentController implements AgentControllerApi {
       this.approvalResolverRef = null;
       this.abortRef = null;
       this.isRunning = false;
+      this.unattended = false;
       this.pendingInput = null;
       this.pendingSuggestion = null;
       this.pendingApproval = null;
@@ -451,6 +513,18 @@ class AgentController implements AgentControllerApi {
       name: t.content,
       status: t.status === "completed" ? "done" : t.status === "in_progress" ? "running" : "pending" as ActivityItem["status"],
     }));
+
+    const usageAgentId = opts.taskProfile?.sandbox?.agentId;
+    if (usageAgentId && (this.contentRef || this.reasoningRef)) {
+      // No provider reports token counts through this pipeline, so log a
+      // chars/4 estimate (the usage chart labels values as estimated).
+      // The sandbox id is set for every saved-agent run (interactive and
+      // headless); plain chat/standalone runs have none and log nothing.
+      recordAgentUsage(
+        usageAgentId,
+        estimateTokens(inputChars(opts.messages) + this.contentRef.length + this.reasoningRef.length),
+      );
+    }
 
     return {
       content: this.contentRef,

@@ -1,7 +1,7 @@
-import { createDeepAgent, type DeepAgent } from "deepagents";
+import { createDeepAgent, registerHarnessProfile, type DeepAgent } from "deepagents";
 import { todoListMiddleware } from "langchain";
 import { MemorySaver } from "@langchain/langgraph";
-import type { Provider } from "@/types";
+import type { Provider, ReasoningEffort } from "@/types";
 import type { ContentPart } from "@/lib/llm";
 import { buildSystemPrompt } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
@@ -21,6 +21,31 @@ import type {
   TodoItem,
 } from "@/lib/agent/types";
 
+/**
+ * deepagents ships its own filesystem tools (ls, read_file, write_file, …)
+ * backed by an in-memory StateBackend. Ours (read_local_file /
+ * write_local_file) are the sandboxed Tauri-backed ones, so hide the
+ * built-ins — otherwise the model sees two file toolsets and the sandbox can
+ * be bypassed. Registration merges (set union) with the library's own
+ * profiles; our models are all ChatOpenAI instances (hint "openai"), the
+ * other hints are covered for safety.
+ */
+const HIDDEN_BUILTIN_FILESYSTEM_TOOLS = [
+  "ls",
+  "read_file",
+  "write_file",
+  "edit_file",
+  "delete",
+  "glob",
+  "grep",
+  "execute",
+];
+for (const providerHint of ["openai", "anthropic", "google"]) {
+  registerHarnessProfile(providerHint, {
+    excludedTools: HIDDEN_BUILTIN_FILESYSTEM_TOOLS,
+  });
+}
+
 export interface AgentMessage {
   role: "user" | "assistant" | "system";
   content: string | ContentPart[];
@@ -29,15 +54,17 @@ export interface AgentMessage {
 export interface AgentSessionOptions {
   provider: Provider;
   modelName: string;
+  /** Reasoning effort for reasoning-capable models ("default" = provider default). */
+  reasoningEffort?: ReasoningEffort;
   instructions?: string;
   mode: AgentMode;
   webFetchEnabled: boolean;
   projectDir?: string | null;
-  /** "chat" (default) = chat tools; "task" = + run_command/run_coding_task (+ read_file/write_file with enableFileTools); "setup" = + create_agent. */
+  /** "chat" (default) = chat tools; "task" = + run_command/run_coding_task (+ read_local_file/write_local_file with enableFileTools); "setup" = + create_agent. */
   toolProfile?: ToolProfile;
   /** Task profile: set false to withhold run_command/run_coding_task (sandboxed agents without terminal). */
   enableCommandTools?: boolean;
-  /** Task profile: set true to add read_file/write_file (agents with the local-files capability). */
+  /** Task profile: set true to add read_local_file/write_local_file (agents with the local-files capability). */
   enableFileTools?: boolean;
   /** Restrict loaded skills to these names (sandboxed agents). undefined = all installed. */
   skillNames?: string[];
@@ -143,10 +170,10 @@ Coding tasks:
 
 const TASK_FILE_TOOLS_PROMPT = `
 Local files:
-- read_file reads a file from the user's Mac — text files directly, PDFs as extracted text, and a
+- read_local_file reads a file from the user's Mac — text files directly, PDFs as extracted text, and a
   folder path as a listing. Use it whenever the user points you at a local document or folder
   (e.g. a report, paper, or project directory).
-- write_file creates or overwrites a file with the full content. When editing an existing file,
+- write_local_file creates or overwrites a file with the full content. When editing an existing file,
   read it first, then write the complete new content.
 - The user approves every file access with an approve/deny card; if one is denied, don't retry —
   ask what to do instead.
@@ -171,7 +198,7 @@ function buildAgentSandboxPrompt(sandbox: AgentSandbox): string {
   }
   if (folders.length > 0) {
     lines.push(
-      `- Allowed folders (read_file / write_file / run_coding_task): ${folders.join(", ")}`,
+      `- Allowed folders (read_local_file / write_local_file / run_coding_task): ${folders.join(", ")}`,
     );
   } else {
     lines.push(
@@ -180,13 +207,14 @@ function buildAgentSandboxPrompt(sandbox: AgentSandbox): string {
     );
   }
   lines.push(
-    "- Every local action (file access, shell command) still shows the user an approve/deny card.",
+    "- File access inside your workspace and granted folders is trusted (no approval cards); " +
+      "shell commands still show the user an approve/deny card.",
     "- Self-configuration: when the user asks you to change your own setup by chatting " +
-      "(instructions, purpose, model, skills, connectors, terminal/web/files/read-chats " +
-      "permissions), call update_agent with only the fields that change. When you merely think " +
-      "a change would help, propose it with suggest (kind=agent_config + agent_patch) so the " +
-      "user can apply it with one click. Folder, project, and knowledge-file access is " +
-      "user-only — never claim to change it yourself.",
+      "(instructions, purpose, model, connectors, terminal/web/read-chats permissions), call " +
+      "update_agent with only the fields that change. When you merely think a change would " +
+      "help, propose it with suggest (kind=agent_config + agent_patch) so the user can apply " +
+      "it with one click. Folder, project, and knowledge-file access is user-only — never " +
+      "claim to change it yourself.",
   );
   return lines.join("\n");
 }
@@ -199,18 +227,18 @@ Your job — interview the user, then create the agent:
 1. Find out what the user wants the agent to do. Ask short follow-up questions with
    request_structured_input forms (2-4 fields, simple language). If their first message is
    already specific, confirm the scope in one form instead of interrogating them.
-2. Suggest add-ons: call search_skills and search_connectors for capabilities that match the
-   purpose, and show the best matches with suggest cards. Never suggest anything already
-   installed or connected.
-3. Final form: confirm the agent's name (suggest 2-3 good names), the skills/connectors to
-   include, and whether it needs local file access (read_file/write_file on the user's Mac,
-   each access user-approved) and terminal/command access.
+2. Suggest add-ons: call search_connectors for capabilities that match the purpose, and show
+   the best matches with suggest cards. Never suggest anything already connected. Skills need
+   no setup — every agent automatically discovers installed skills when it needs them, so do
+   not interview about skills.
+3. Final form: confirm the agent's name and whether it needs terminal/command access. Local
+   file access needs no permission — the agent can always work in its private workspace, and
+   the user grants extra folders in the agent's settings after creation.
 4. Call create_agent exactly once with the agreed definition, then confirm to the user that the
    agent is ready and that they can start sessions with it from the sidebar (Agents).
 
 The created agent is focused and self-contained: it runs only on its own system prompt, the
-skills and connectors chosen here, and the tools it needs. It does not share the user's
-universal memory.
+connectors chosen here, and the tools it needs. It does not share the user's universal memory.
 `.trim();
 
 function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
@@ -354,7 +382,7 @@ export class DeepAgentSession {
   ) {}
 
   static async create(opts: AgentSessionOptions): Promise<DeepAgentSession> {
-    const model = await createChatModel(opts.provider, opts.modelName);
+    const model = await createChatModel(opts.provider, opts.modelName, opts.reasoningEffort);
     const mcp = await loadMcpTools(opts.projectDir, opts.mcpNames);
     let skillFiles = await loadSkillFiles(opts.projectDir);
     if (opts.skillNames) {

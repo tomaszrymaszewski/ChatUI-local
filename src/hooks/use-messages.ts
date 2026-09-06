@@ -8,6 +8,8 @@ function storageKey(sessionId: string) {
   return `chatui:messages:${sessionId}`;
 }
 
+const MESSAGES_EVENT = "chatui:messages-changed";
+
 /** Read a session's stored messages (any session, not just the active one). */
 export function loadMessages(sessionId: string): Message[] {
   try {
@@ -53,27 +55,59 @@ export function loadMessages(sessionId: string): Message[] {
   }
 }
 
+function serializeMessages(messages: Message[]) {
+  return JSON.stringify(
+    messages.map((m) => ({
+      id: m.id,
+      role: m.role,
+      content: m.content,
+      timestamp: m.timestamp.toISOString(),
+      model: m.model,
+      attachments: m.attachments,
+      session_id: m.session_id,
+      parent_id: m.parent_id,
+      is_temporary: m.is_temporary,
+      reasoning: m.reasoning,
+      reasoningStreams: m.reasoningStreams,
+      activities: m.activities,
+      artifacts: m.artifacts,
+    })),
+  );
+}
+
 function saveMessages(sessionId: string, messages: Message[]) {
+  localStorage.setItem(storageKey(sessionId), serializeMessages(messages));
+}
+
+/**
+ * Headless (non-React) message persistence for scheduler/workflow runs, which
+ * have no hook instance. Fires the change event so an open session view can
+ * reload.
+ */
+export function appendMessageHeadless(sessionId: string, msg: Message) {
+  const next = [...loadMessages(sessionId), msg];
+  localStorage.setItem(storageKey(sessionId), serializeMessages(next));
+  window.dispatchEvent(new Event(MESSAGES_EVENT));
+  return msg;
+}
+
+export function updateMessageHeadless(
+  sessionId: string,
+  messageId: string,
+  updates: Partial<Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts">>,
+) {
+  const loaded = loadMessages(sessionId);
+  if (!loaded.some((m) => m.id === messageId)) return;
   localStorage.setItem(
     storageKey(sessionId),
-    JSON.stringify(
-      messages.map((m) => ({
-        id: m.id,
-        role: m.role,
-        content: m.content,
-        timestamp: m.timestamp.toISOString(),
-        model: m.model,
-        attachments: m.attachments,
-        session_id: m.session_id,
-        parent_id: m.parent_id,
-        is_temporary: m.is_temporary,
-        reasoning: m.reasoning,
-        reasoningStreams: m.reasoningStreams,
-        activities: m.activities,
-        artifacts: m.artifacts,
-      })),
-    ),
+    serializeMessages(loaded.map((m) => (m.id === messageId ? { ...m, ...updates } : m))),
   );
+  window.dispatchEvent(new Event(MESSAGES_EVENT));
+}
+
+export function subscribeToMessageChanges(fn: () => void): () => void {
+  window.addEventListener(MESSAGES_EVENT, fn);
+  return () => window.removeEventListener(MESSAGES_EVENT, fn);
 }
 
 export function useMessages(sessionId: string | null) {
@@ -88,6 +122,9 @@ export function useMessages(sessionId: string | null) {
     }
     setMessages(loadMessages(sessionId));
     setLoading(false);
+    // Headless runs (scheduler/workflows) persist outside any hook — the
+    // change event keeps an open session view in sync with storage.
+    return subscribeToMessageChanges(() => setMessages(loadMessages(sessionId)));
   }, [sessionId]);
 
   const addMessage = useCallback(

@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback } from "react";
-import type { ChatSession, SessionChatMode } from "@/types";
+import type { ChatSession, ReasoningEffort, SessionChatMode } from "@/types";
 
 const STORAGE_KEY = "chatui:sessions";
+const SESSIONS_EVENT = "chatui:sessions-changed";
 
 function loadSessions(): ChatSession[] {
   try {
@@ -15,6 +16,7 @@ function loadSessions(): ChatSession[] {
       type: "chat" | "agent";
       isTemporary?: boolean;
       chatMode?: SessionChatMode;
+      reasoningEffort?: ReasoningEffort;
       agentId?: string;
       isSetup?: boolean;
       movedToAgent?: boolean;
@@ -27,6 +29,7 @@ function loadSessions(): ChatSession[] {
       type: s.type,
       isTemporary: s.isTemporary,
       chatMode: s.chatMode,
+      reasoningEffort: s.reasoningEffort,
       agentId: s.agentId,
       isSetup: s.isSetup,
       movedToAgent: s.movedToAgent,
@@ -48,12 +51,40 @@ function saveSessions(sessions: ChatSession[]) {
         type: s.type,
         isTemporary: s.isTemporary,
         chatMode: s.chatMode,
+        reasoningEffort: s.reasoningEffort,
         agentId: s.agentId,
         isSetup: s.isSetup,
         movedToAgent: s.movedToAgent,
       })),
     ),
   );
+  window.dispatchEvent(new Event(SESSIONS_EVENT));
+}
+
+export function subscribeToSessionChanges(fn: () => void): () => void {
+  window.addEventListener(SESSIONS_EVENT, fn);
+  return () => window.removeEventListener(SESSIONS_EVENT, fn);
+}
+
+/**
+ * Create an agent-mode session straight from storage — used by headless runs
+ * (scheduler/workflows) which have no React tree. Fires the change event so
+ * open sidebars pick the session up.
+ */
+export function createAgentSessionHeadless(
+  title: string,
+  agentId?: string,
+): ChatSession {
+  const session: ChatSession = {
+    id: crypto.randomUUID(),
+    title,
+    updatedAt: new Date(),
+    type: "agent",
+    isTemporary: false,
+    agentId,
+  };
+  saveSessions([session, ...loadSessions()]);
+  return session;
 }
 
 export function useSessions(type: "chat" | "agent") {
@@ -61,29 +92,42 @@ export function useSessions(type: "chat" | "agent") {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const all = loadSessions();
-    // The chat tab also lists sessions moved to the Agents tab (grayed out,
-    // click → redirect notice), so they don't vanish from where they started.
-    const visible =
-      type === "chat"
-        ? all.filter((s) => s.type === "chat" || s.movedToAgent)
-        : all.filter((s) => s.type === type);
-    setSessions(visible.sort(
-      (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
-    ));
-    setLoading(false);
+    const load = () => {
+      const all = loadSessions();
+      // The chat tab also lists sessions moved to the Agents tab (grayed out,
+      // click → redirect notice), so they don't vanish from where they started.
+      const visible =
+        type === "chat"
+          ? all.filter((s) => s.type === "chat" || s.movedToAgent)
+          : all.filter((s) => s.type === type);
+      setSessions(visible.sort(
+        (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
+      ));
+      setLoading(false);
+    };
+    load();
+    // Headless runs (scheduler/workflows) create sessions outside any hook —
+    // the change event keeps the sidebar in sync with storage.
+    return subscribeToSessionChanges(load);
   }, [type]);
 
   const persistSessions = useCallback(
     (updater: (prev: ChatSession[]) => ChatSession[]) => {
       setSessions((prev) => {
         const next = updater(prev);
-        const all = loadSessions();
-        // next can contain moved (agent-type) sessions on the chat tab —
-        // de-dupe by id so they aren't written twice.
+        // Sessions that vanished from this hook's state were deleted — they
+        // must also be dropped from storage. Filtering only by the surviving
+        // ids would merge the deleted session straight back in (storage still
+        // has it, and it is no longer in `next` to exclude it).
+        const prevIds = new Set(prev.map((s) => s.id));
+        const deletedIds = new Set(
+          [...prevIds].filter((id) => !next.some((s) => s.id === id)),
+        );
         const nextIds = new Set(next.map((s) => s.id));
-        const others = all.filter((s) => !nextIds.has(s.id));
-        saveSessions([...others, ...next]);
+        const all = loadSessions().filter((s) => !deletedIds.has(s.id));
+        // `next` wins over its own stored copies (updates); other-tab
+        // sessions survive the merge untouched.
+        saveSessions([...all.filter((s) => !nextIds.has(s.id)), ...next]);
         return next;
       });
     },
@@ -124,6 +168,7 @@ export function useSessions(type: "chat" | "agent") {
         title?: string;
         project_id?: string | null;
         chat_mode?: SessionChatMode;
+        reasoning_effort?: ReasoningEffort;
         agent_id?: string | null;
       },
     ) => {
@@ -139,6 +184,10 @@ export function useSessions(type: "chat" | "agent") {
                     : s.projectId,
                 chatMode:
                   updates.chat_mode !== undefined ? updates.chat_mode : s.chatMode,
+                reasoningEffort:
+                  updates.reasoning_effort !== undefined
+                    ? updates.reasoning_effort
+                    : s.reasoningEffort,
                 agentId:
                   updates.agent_id !== undefined
                     ? updates.agent_id ?? undefined

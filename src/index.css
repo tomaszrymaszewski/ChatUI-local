@@ -173,7 +173,17 @@
   #root {
     height: 100%;
   }
+  html,
+  body {
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
   body {
     @apply bg-background text-foreground;
+    /* Lock the document: the app shell (h-dvh + overflow-hidden) owns the
+       viewport and only inner panes (overflow-y-auto) scroll. Without this,
+       scroll gestures outside/below those panes rubber-band the whole window. */
+    position: fixed;
+    inset: 0;
   }
 }

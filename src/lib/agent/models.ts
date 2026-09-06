@@ -1,5 +1,5 @@
 import { ChatOpenAI } from "@langchain/openai";
-import type { Provider } from "@/types";
+import type { Provider, ReasoningEffort } from "@/types";
 import { getProviderApiKey } from "@/lib/llm";
 import { getModelOutputLimit } from "@/lib/model-capabilities";
 
@@ -40,6 +40,7 @@ const corsSafeFetch: typeof fetch = (input, init) => {
 export async function createChatModel(
   provider: Provider,
   modelName: string,
+  reasoningEffort?: ReasoningEffort,
 ): Promise<ChatOpenAI> {
   const apiKey = await getProviderApiKey(provider.id);
   const outputLimit = await getModelOutputLimit(provider, modelName).catch(() => null);
@@ -51,6 +52,11 @@ export async function createChatModel(
       fetch: corsSafeFetch,
     },
     maxTokens: outputLimit ?? FALLBACK_MAX_TOKENS,
+    // Reasoning-capable models only; providers without support reject the
+    // unknown field's semantics but tolerate the parameter or ignore it.
+    ...(reasoningEffort && reasoningEffort !== "default"
+      ? { reasoningEffort: reasoningEffort as "low" | "medium" | "high" }
+      : {}),
     maxRetries: 1,
     timeout: 300_000,
   });

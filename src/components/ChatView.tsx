@@ -28,12 +28,16 @@ import {
   Globe,
   GraduationCap,
   UsersRound,
+  SignalHigh,
+  SignalMedium,
+  SignalLow,
 } from "lucide-react";
 import { toast } from "sonner";
-import { AppSidebar } from "@/components/app-sidebar";
+import { AppSidebar, type AgentConsoleTab } from "@/components/app-sidebar";
 import { ApprovalCard } from "@/components/approval-card";
 import { AgentAvatar } from "@/components/agent-avatar";
 import { AgentConsole } from "@/components/agent-console";
+import { AgentDashboard, type DashboardComposeMode } from "@/components/agent-dashboard";
 import { AgentSettingsDialog } from "@/components/agent-settings-dialog";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { MessageStream } from "@/components/message-stream";
@@ -46,6 +50,8 @@ import { type Artifact } from "@/lib/artifacts";
 import { checkForUpdate, loadUpdateSettings, isUpdaterAvailable } from "@/lib/updater";
 import { detectModeTrigger } from "@/lib/mode-triggers";
 import { modelLabel } from "@/lib/model-display";
+import { ProviderLogo } from "@/components/provider-logos";
+import { getProviderMeta } from "@/lib/provider-meta";
 import { OpenCodeProvider } from "@/lib/opencode-context";
 import {
   Attachment,
@@ -109,13 +115,6 @@ import {
   MessageScrollerViewport,
 } from "@/components/ui/message-scroller";
 import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
   SidebarInset,
   SidebarProvider,
   SidebarTrigger,
@@ -127,6 +126,7 @@ import type {
   MessageAttachment,
   AgentConfigPatch,
   AgentDefinition,
+  ReasoningEffort,
 } from "@/types";
 import { useSessions, getSessionChatMode } from "@/hooks/use-sessions";
 import { useMessages, loadMessages } from "@/hooks/use-messages";
@@ -135,6 +135,7 @@ import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { useAgents } from "@/hooks/use-agents";
 import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController } from "@/hooks/use-deep-agent";
+import { useScheduler } from "@/hooks/use-scheduler";
 import type { AgentMode, AgentRunResult } from "@/lib/agent/types";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { ensureAgentWorkspace, removeAgentWorkspace } from "@/lib/agent/sandbox";
@@ -238,6 +239,8 @@ export function ChatView() {
   const { messages, addMessage, updateMessage, deleteMessage, deleteTemporaryMessages } = useMessages(activeSessionId);
   const agent = useAgentController(activeSessionId);
   const runningIds = useRunningSessionIds();
+  // Fires due agent schedules (scheduler/workflows) while the app is open.
+  useScheduler();
   // Maps sessionId → in-progress assistant message id so the persisted message can
   // be hidden from the tree while its live streaming bubble is shown instead.
   const inProgressMsgIds = useRef<Map<string, string>>(new Map());
@@ -262,6 +265,18 @@ export function ChatView() {
   const [agentSettingsId, setAgentSettingsId] = useState<string | null>(null);
   // Agent whose console is open (clicking the agent in the sidebar).
   const [activeAgentConsoleId, setActiveAgentConsoleId] = useState<string | null>(null);
+  // Panel shown in the agent console's main area — owned by the sidebar.
+  const [agentConsoleTab, setAgentConsoleTab] = useState<AgentConsoleTab>("general");
+  // New-session compose mode inside the agent console — the sidebar and the
+  // console's start button both enter it; sending or navigating away exits.
+  const [agentConsoleComposing, setAgentConsoleComposing] = useState(false);
+  // What the console's main area shows when a session is open: the session
+  // itself, or the sidebar-selected Preferences panel. Clicking a session
+  // focuses it; clicking a Preferences tab focuses the panel.
+  const [agentConsoleFocus, setAgentConsoleFocus] = useState<"session" | "panel">("session");
+  // The Agents tab's default view: the fleet dashboard (agent grid + smart
+  // composer). "New Task"/"New Agent" swap it for the plain composer.
+  const [agentDashboardOpen, setAgentDashboardOpen] = useState(true);
   const [view, setView] = useState<"chat" | "settings" | "projects" | "history">("chat");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const openSettings = () => setView("settings");
@@ -275,6 +290,10 @@ export function ChatView() {
   const [movedNoticeId, setMovedNoticeId] = useState<string | null>(null);
   const [projectInputText, setProjectInputText] = useState("");
   const [selectedModel, setSelectedModel] = useState<string>("");
+  // Reasoning effort for the current session ("default" sends nothing).
+  // Seeded from the active session when switching chats; changes persist to
+  // the session so they survive reloads.
+  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("default");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [selectedChildMap, setSelectedChildMap] = useState<
@@ -369,6 +388,7 @@ export function ChatView() {
       providerId: p.id,
       providerName: p.name,
       baseUrl: p.baseUrl,
+      builtinKey: p.builtinKey,
     }))
   );
 
@@ -376,6 +396,12 @@ export function ChatView() {
     (session) => session.id === activeSessionId,
   );
   const activeProject = projects.find((p) => p.id === activeProjectId);
+
+  // Seed the composer's reasoning effort from the active session when
+  // switching between chats; a fresh session starts at "default".
+  useEffect(() => {
+    setReasoningEffort(activeSession?.reasoningEffort ?? "default");
+  }, [activeSession?.id]);
   const currentProjectId =
     activeSession?.projectId ?? pendingProjectId ?? undefined;
   const currentProjectName = projects.find(
@@ -395,10 +421,21 @@ export function ChatView() {
     ? agents.find((a) => a.id === pendingAgentId)?.name
     : undefined;
   // The console only lives on the Agents tab; sessions and projects win over
-  // it in the render chain below.
+  // it in the render chain below. A session with an agent assigned always
+  // lives in that agent's console, no matter where it was opened from.
   const activeAgentConsole = isAgentTab
-    ? agents.find((a) => a.id === activeAgentConsoleId)
+    ? agents.find((a) => a.id === (activeSession?.agentId ?? activeAgentConsoleId))
     : undefined;
+  // This agent's sessions for the console sidebar, newest first.
+  const activeAgentSessions = useMemo(
+    () =>
+      activeAgentConsole
+        ? sessions
+            .filter((s) => s.agentId === activeAgentConsole.id)
+            .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())
+        : [],
+    [sessions, activeAgentConsole],
+  );
 
   /**
    * Agent-mode run context for a session in the Agents tab: standalone tasks
@@ -465,8 +502,12 @@ export function ChatView() {
       taskProfile: {
         toolProfile: (desc.isSetup ? "setup" : "task") as "task" | "setup",
         enableCommandTools: agentDef ? agentDef.capabilities.terminal : true,
-        enableFileTools: agentDef ? (agentDef.capabilities.files ?? false) : false,
-        skillNames: agentDef ? agentDef.skills : undefined,
+        // Folders-only access model: saved agents always get the file tools;
+        // the sandbox (workspace + granted folders + granted projects) is the
+        // authorization — granted folders are trusted, no approval cards.
+        enableFileTools: !!agentDef,
+        // Skills are auto-discovered: every agent sees all installed skills
+        // and pulls them in via search_skills when needed.
         mcpNames: agentDef ? agentDef.connectors : undefined,
         sandbox,
       },
@@ -680,7 +721,11 @@ export function ChatView() {
     return providers.find((p) => p.id === model.providerId) ?? null;
   };
 
-  const handleSend = async (overrideText?: string) => {
+  const handleSend = async (
+    overrideText?: string,
+    /** Agent-context overrides for sends that bypass the pending states — the fleet dashboard's composer. */
+    overrides?: { agentId?: string | null; setup?: boolean },
+  ) => {
     const text = (overrideText ?? inputText).trim();
     if ((!text && files.length === 0) || agent?.isRunning) return;
 
@@ -688,8 +733,13 @@ export function ChatView() {
     // research/council pipelines and never see the chat-tab modes.
     const arc = isAgentTab
       ? await agentRunContext({
-          agentId: pendingAgentId ?? activeSession?.agentId,
-          isSetup: pendingSetup || activeSession?.isSetup === true,
+          agentId:
+            overrides?.agentId !== undefined
+              ? (overrides.agentId ?? undefined)
+              : (pendingAgentId ?? activeSession?.agentId ?? activeAgentConsole?.id),
+          isSetup: overrides
+            ? !!overrides.setup
+            : pendingSetup || activeSession?.isSetup === true,
         })
       : null;
     // Saved agents may pin their own model; otherwise the composer's model.
@@ -741,11 +791,21 @@ export function ChatView() {
         instantChatTitle(text || "Attachments"),
         pendingProjectId ?? undefined,
         isAgentTab
-          ? { agentId: pendingAgentId ?? undefined, isSetup: pendingSetup || undefined }
+          ? {
+              agentId:
+                overrides?.agentId !== undefined
+                  ? (overrides.agentId ?? undefined)
+                  : (pendingAgentId ?? activeAgentConsole?.id ?? undefined),
+              isSetup:
+                (overrides ? !!overrides.setup : pendingSetup) || undefined,
+            }
           : undefined,
       );
       sessionId = newSession.id;
       setActiveSessionId(newSession.id);
+      // A freshly sent session opens focused — even one born in a console
+      // that was showing a Preferences panel.
+      setAgentConsoleFocus("session");
       setPendingProjectId(null);
       setPendingAgentId(null);
       setPendingSetup(false);
@@ -1077,6 +1137,7 @@ export function ChatView() {
         result = await ctrl.run({
           provider,
           modelName: runModelName,
+          reasoningEffort,
           messages: completionMessages,
           instructions: arc ? arc.instructions : currentProjectInstructions || undefined,
           mode: arc?.mode,
@@ -1167,6 +1228,7 @@ export function ChatView() {
         result = await ctrl.run({
           provider,
           modelName: runModelName,
+          reasoningEffort,
           messages: completionMessages,
           instructions: arc ? arc.instructions : currentProjectInstructions || undefined,
           mode: arc?.mode,
@@ -1270,6 +1332,8 @@ export function ChatView() {
     // one (e.g. from an open agent console or "New session").
     setPendingAgentId(null);
     setPendingSetup(false);
+    setAgentConsoleComposing(false);
+    setAgentConsoleFocus("session");
     applySessionChatMode(id);
     setView("chat");
   };
@@ -1328,6 +1392,7 @@ export function ChatView() {
     setPendingAgentId(null);
     setPendingSetup(false);
     setActiveTab("agent");
+    setAgentConsoleFocus("session");
     setView("chat");
     toast.success("Conversation moved to the Agents tab");
   };
@@ -1345,6 +1410,7 @@ export function ChatView() {
     setPendingAgentId(null);
     setPendingSetup(false);
     setActiveTab("agent");
+    setAgentConsoleFocus("session");
     setChatMode("none");
     autoModeRef.current = "none";
     setView("chat");
@@ -1358,56 +1424,43 @@ export function ChatView() {
     setPendingAgentId(null);
     setPendingSetup(false);
     setActiveTab(tab);
+    setAgentConsoleFocus("session");
+    setAgentDashboardOpen(tab === "agent");
     // Each tab keeps its own active session; restore that session's mode.
     applySessionChatMode(activeSessionByTab[tab] ?? null);
     setView("chat");
   };
 
-  const handleNewTask = () => {
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionId(null);
-    setActiveProjectId(null);
-    setPendingProjectId(null);
-    setPendingAgentId(null);
-    setPendingSetup(false);
-    setActiveAgentConsoleId(null);
-    applySessionChatMode(null);
-    setView("chat");
-  };
-
-  const handleNewAgentSetup = () => {
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionId(null);
-    setActiveProjectId(null);
-    setPendingProjectId(null);
-    setPendingAgentId(null);
-    setPendingSetup(true);
-    setActiveAgentConsoleId(null);
-    applySessionChatMode(null);
-    setView("chat");
-  };
-
+  /**
+   * Start a new session with an agent (sidebar agent → ⋯ → New session):
+   * opens the agent's console on its new-session page. The first send
+   * creates the session there.
+   */
   const handleStartAgentSession = (agentId: string) => {
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionId(null);
-    setActiveProjectId(null);
-    setPendingProjectId(null);
-    setPendingAgentId(agentId);
-    setPendingSetup(false);
-    setActiveAgentConsoleId(null);
-    applySessionChatMode(null);
-    setView("chat");
+    handleOpenAgentConsole(agentId);
+    setAgentConsoleComposing(true);
   };
 
   /**
-   * Open an agent's console (clicking the agent in the sidebar): sessions and
-   * the composer in the middle, instructions/preferences/access on the right.
+   * Enter the open console's new-session page. Works from anywhere in the
+   * console — even mid-session: the session is left (it keeps running) and
+   * the next send is wired to this agent.
+   */
+  const enterAgentCompose = () => {
+    if (!activeAgentConsole) return;
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionId(null);
+    setPendingAgentId(activeAgentConsole.id);
+    setPendingSetup(false);
+    setAgentConsoleComposing(true);
+  };
+
+  /**
+   * Open an agent's console (clicking the agent in the sidebar): the sidebar
+   * switches to the agent's detail view (Back to agents, Preferences tabs,
+   * Sessions) and the main area shows the selected panel plus a composer.
    * The composer sends with this agent, so the first send opens a session.
    */
   const handleOpenAgentConsole = (agentId: string) => {
@@ -1420,14 +1473,48 @@ export function ChatView() {
     setPendingAgentId(agentId);
     setPendingSetup(false);
     setActiveAgentConsoleId(agentId);
+    setAgentDashboardOpen(false);
+    setAgentConsoleTab("general");
+    setAgentConsoleComposing(false);
+    setAgentConsoleFocus("panel");
     applySessionChatMode(null);
     setView("chat");
   };
 
-  /** Leave the agent console back to the Agents-tab empty state. */
+  /**
+   * Leave the agent console back to the fleet dashboard. An open agent
+   * session does not survive this — the dashboard opens instead of the
+   * session, since agent sessions only live inside their console.
+   */
   const closeAgentConsole = () => {
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionId(null);
     setActiveAgentConsoleId(null);
     setPendingAgentId(null);
+    setPendingSetup(false);
+    setAgentConsoleComposing(false);
+    setAgentConsoleFocus("session");
+    setAgentDashboardOpen(true);
+    applySessionChatMode(null);
+    setView("chat");
+  };
+
+  /** Return to the fleet dashboard from wherever we are on the Agents tab. */
+  const handleOpenDashboard = () => {
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionId(null);
+    setActiveProjectId(null);
+    setPendingProjectId(null);
+    setPendingAgentId(null);
+    setPendingSetup(false);
+    setActiveAgentConsoleId(null);
+    setAgentDashboardOpen(true);
+    applySessionChatMode(null);
+    setView("chat");
   };
 
   const handleDeleteAgent = (id: string) => {
@@ -1498,38 +1585,93 @@ export function ChatView() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  const modelSelectContent = (
-    <SelectContent className="min-w-56">
-      {allModels.length === 0 ? (
-        <SelectItem value="__no_models__" disabled>
-          No models — add a provider in Settings
-        </SelectItem>
-      ) : (
-        allModels.map((m) => (
-          <SelectItem key={m.id} value={m.name}>
-            {modelLabel(m)} ({m.providerName})
-          </SelectItem>
-        ))
-      )}
-    </SelectContent>
-  );
-
   const selectedModelLabel = allModels.find((m) => m.name === selectedModel);
 
+  const logoKeyFor = (m: (typeof allModels)[number]) =>
+    getProviderMeta(m.builtinKey ?? "custom")?.logoKey ?? "custom";
+
+  const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
+    { value: "default", label: "Default" },
+    { value: "low", label: "Low" },
+    { value: "medium", label: "Medium" },
+    { value: "high", label: "High" },
+  ];
+
   const modelSelect = () => (
-    <Select value={selectedModel} onValueChange={setSelectedModel}>
-      <SelectTrigger
-        size="sm"
-        className="border-0 bg-transparent shadow-none dark:bg-transparent"
-      >
-        <SelectValue placeholder="Select model">
-          {selectedModelLabel
-            ? modelLabel(selectedModelLabel)
-            : "Select model"}
-        </SelectValue>
-      </SelectTrigger>
-      {modelSelectContent}
-    </Select>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          className="flex h-8 items-center gap-1.5 rounded-lg px-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus:outline-none disabled:pointer-events-none disabled:opacity-50"
+          disabled={allModels.length === 0}
+        >
+          {selectedModelLabel && (
+            <ProviderLogo
+              logoKey={logoKeyFor(selectedModelLabel)}
+              className="size-3.5 shrink-0"
+            />
+          )}
+          <span className="max-w-48 truncate">
+            {selectedModelLabel
+              ? modelLabel(selectedModelLabel)
+              : "Select model"}
+          </span>
+          {reasoningEffort === "high" && (
+            <SignalHigh className="size-3.5 shrink-0 text-red-500" />
+          )}
+          {reasoningEffort === "medium" && (
+            <SignalMedium className="size-3.5 shrink-0 text-yellow-500" />
+          )}
+          {reasoningEffort === "low" && (
+            <SignalLow className="size-3.5 shrink-0 text-green-500" />
+          )}
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="min-w-56">
+        {allModels.length === 0 ? (
+          <DropdownMenuItem disabled>
+            No models — add a provider in Settings
+          </DropdownMenuItem>
+        ) : (
+          allModels.map((m) => (
+            <DropdownMenuItem key={m.id} onSelect={() => setSelectedModel(m.name)}>
+              <ProviderLogo
+                logoKey={logoKeyFor(m)}
+                className="size-3.5 shrink-0 text-muted-foreground"
+              />
+              <span className="truncate">{modelLabel(m)}</span>
+              {m.name === selectedModel && (
+                <Check className="ml-auto size-3.5" />
+              )}
+            </DropdownMenuItem>
+          ))
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuSub>
+          <DropdownMenuSubTrigger>
+            <span>Thinking</span>
+          </DropdownMenuSubTrigger>
+          <DropdownMenuSubContent>
+            {reasoningOptions.map((opt) => (
+              <DropdownMenuItem
+                key={opt.value}
+                onSelect={() => {
+                  setReasoningEffort(opt.value);
+                  if (activeSessionId) {
+                    void updateSession(activeSessionId, { reasoning_effort: opt.value });
+                  }
+                }}
+              >
+                <span>{opt.label}</span>
+                {reasoningEffort === opt.value && (
+                  <Check className="ml-auto size-3.5" />
+                )}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuSubContent>
+        </DropdownMenuSub>
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 
   const modeToggle = (
@@ -1856,8 +1998,7 @@ export function ChatView() {
         onHistory={() => setView("history")}
         onComingSoon={comingSoon}
         onTabChange={switchTab}
-        onNewTask={handleNewTask}
-        onNewAgent={handleNewAgentSetup}
+        onOpenDashboard={handleOpenDashboard}
         onSwitchToAgent={switchToAgentMode}
         agents={agents}
         onOpenAgentConsole={handleOpenAgentConsole}
@@ -1866,6 +2007,19 @@ export function ChatView() {
         onOpenAgentSettings={setAgentSettingsId}
         projects={projects}
         runningIds={runningIds}
+        activeAgentConsole={activeAgentConsole}
+        agentConsoleTab={agentConsoleTab}
+        onAgentConsoleTabChange={(tab) => {
+          setAgentConsoleTab(tab);
+          setAgentConsoleComposing(false);
+          // The panel takes over the main area even with a session open —
+          // the session keeps running and stays one click away.
+          setAgentConsoleFocus("panel");
+        }}
+        onExitAgentConsole={closeAgentConsole}
+        agentSessions={activeAgentSessions}
+        agentConsoleComposing={agentConsoleComposing}
+        onNewAgentSession={activeAgentConsole ? enterAgentCompose : undefined}
       />
 
       <SidebarTrigger
@@ -2216,10 +2370,13 @@ export function ChatView() {
           </div>
         ) : (
         <div className="relative flex min-h-0 flex-1 flex-col">
-        {/* The pattern belongs to the chat/session area only: the project and
-            agent consoles render it inside their chat column, and the options
-            panel stays plain. Here it covers just the composer empty state. */}
-        {!activeSession && !activeProject && !activeAgentConsole && (
+        {/* Column-level pattern: the chat empty state and the agent dashboard
+            share it so it starts behind the header at the very top, while the
+            project view and agent console render their own inside their chat
+            column instead. */}
+        {(isAgentTab && agentDashboardOpen
+          ? !activeSession
+          : !activeSession && !activeProject && !activeAgentConsole) && (
           <PatternBackground pattern={settings.backgroundPattern} />
         )}
         <header
@@ -2227,13 +2384,11 @@ export function ChatView() {
           onMouseDown={startDrag}
           className="relative flex h-10 shrink-0 select-none items-center px-4"
         >
-          {(activeProject || (activeAgentConsole && !activeSession)) && (
+          {activeProject && (
             <Button
               variant="ghost"
               size="icon-sm"
-              onClick={() =>
-                activeProject ? setActiveProjectId(null) : closeAgentConsole()
-              }
+              onClick={() => setActiveProjectId(null)}
               onMouseDown={(e) => e.stopPropagation()}
               aria-label="Back to chat"
               className="shrink-0"
@@ -2319,7 +2474,7 @@ export function ChatView() {
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col">
-        {activeSession ? (
+        {(activeSession && (!isAgentTab || agentConsoleFocus === "session")) ? (
           <div ref={sessionContainerRef} className="relative flex min-h-0 flex-1 gap-2 overflow-hidden p-2">
             <div className={`relative flex min-h-0 min-w-0 flex-1 flex-col transition-[flex] duration-300 ease-out${artifactWindowMode === "expanded" ? " hidden" : ""}`}>
             <MessageScrollerProvider
@@ -2894,23 +3049,42 @@ export function ChatView() {
                }}
              />
            </div>
-        ) : activeAgentConsole ? (
-          <AgentConsole
-            agent={activeAgentConsole}
-            sessions={sessions
-              .filter((s) => s.agentId === activeAgentConsole.id)
-              .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())}
-            projects={projects}
-            models={allModels}
-            sendOnEnter={settings.sendOnEnter}
-            runningIds={runningIds}
-            backgroundPattern={settings.backgroundPattern}
-            modelSelect={modelSelect()}
-            onUpdateAgent={updateAgent}
-            onSelectSession={selectSession}
-            onSend={(text) => { void handleSend(text); }}
-          />
-        ) : (
+         ) : activeAgentConsole ? (
+           <AgentConsole
+             agent={activeAgentConsole}
+             agents={agents}
+             sessions={activeAgentSessions}
+             projects={projects}
+             models={allModels}
+             sendOnEnter={settings.sendOnEnter}
+             backgroundPattern={settings.backgroundPattern}
+             modelSelect={modelSelect()}
+             tab={agentConsoleTab}
+             composing={agentConsoleComposing}
+             onComposingChange={(composing) => {
+               if (composing) enterAgentCompose();
+               else setAgentConsoleComposing(false);
+             }}
+             onUpdateAgent={updateAgent}
+             onSend={(text) => { void handleSend(text); }}
+           />
+         ) : isAgentTab && agentDashboardOpen ? (
+           <AgentDashboard
+             agents={agents}
+             sessions={sessions}
+             runningIds={runningIds}
+             sendOnEnter={settings.sendOnEnter}
+             modelSelect={modelSelect()}
+             onOpenAgentConsole={handleOpenAgentConsole}
+             onSelectSession={selectSession}
+             onSend={(mode: DashboardComposeMode, agentId, text) => {
+               void handleSend(text, {
+                 agentId: mode === "session" ? agentId : undefined,
+                 setup: mode === "agent",
+               });
+             }}
+           />
+         ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-4 pb-8">
             <h1 className="select-none cursor-default relative z-10 mb-12 text-center text-4xl font-semibold tracking-tight welcome-fade-in">
               {emptyStateHeading}
@@ -3306,6 +3480,7 @@ export function ChatView() {
         result = await ctrl.run({
           provider,
           modelName: selectedModel,
+          reasoningEffort,
           messages: [{ role: "user" as const, content: outgoingContent }],
           instructions: effectiveInstructions,
           mode,

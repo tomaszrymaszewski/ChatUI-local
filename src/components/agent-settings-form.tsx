@@ -1,11 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { open as openDirectoryPicker } from "@tauri-apps/plugin-dialog";
-import { toast } from "sonner";
-import { Check, ChevronDown, FileText, FolderPlus, Image as ImageIcon, Pencil, Plug, Sparkles, X } from "lucide-react";
+import { Check, ChevronDown, FileText, Image as ImageIcon, Pencil, X } from "lucide-react";
 import type { AgentAttachment, AgentDefinition, Project } from "@/types";
 import type { AgentUpdatePatch } from "@/lib/agents";
-import { listInstalledSkills } from "@/lib/skills-library";
-import { MCP_CATALOG } from "@/lib/mcp-catalog";
 import { deleteFileBlob, getFileBlob, putFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
 import { modelLabel } from "@/lib/model-display";
@@ -19,7 +15,6 @@ import {
   AttachmentMedia,
   AttachmentTitle,
 } from "@/components/ui/attachment";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Collapsible,
@@ -110,7 +105,6 @@ export function AgentSettingsForm({
   const [instructionsDraft, setInstructionsDraft] = useState(agent.systemPrompt);
   const [editingInstructions, setEditingInstructions] = useState(false);
   const [preferencesOpen, setPreferencesOpen] = useState(false);
-  const [installedSkills, setInstalledSkills] = useState<Array<{ name: string; path: string }>>([]);
   const [imageUrls, setImageUrls] = useState<Record<string, string>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   const createdUrlsRef = useRef<Set<string>>(new Set());
@@ -124,10 +118,6 @@ export function AgentSettingsForm({
     setPurposeDraft(agent.purpose);
     setInstructionsDraft(agent.systemPrompt);
   }, [agent]);
-
-  useEffect(() => {
-    void listInstalledSkills("global").then(setInstalledSkills).catch(() => setInstalledSkills([]));
-  }, []);
 
   // Rehydrate image previews from the persistent file store (skip ones we
   // already have previews for — freshly-added files keep theirs while their
@@ -170,13 +160,6 @@ export function AgentSettingsForm({
     return Array.from(map.entries());
   }, [models]);
 
-  // Installed skills plus any saved-but-uninstalled names (so they stay visible/removable).
-  const skillRows = useMemo(() => {
-    const names = new Set(installedSkills.map((s) => s.name));
-    const extra = agent.skills.filter((n) => !names.has(n)).map((n) => ({ name: n, path: "" }));
-    return [...installedSkills, ...extra];
-  }, [installedSkills, agent.skills]);
-
   const toggleListValue = (list: string[], value: string, patch: (next: string[]) => void) => {
     patch(list.includes(value) ? list.filter((v) => v !== value) : [...list, value]);
   };
@@ -195,20 +178,6 @@ export function AgentSettingsForm({
 
   const commitInstructions = () => {
     if (instructionsDraft !== agent.systemPrompt) update({ systemPrompt: instructionsDraft });
-  };
-
-  const addFolder = async () => {
-    try {
-      const dir = await openDirectoryPicker({
-        directory: true,
-        title: "Add a folder this agent may access",
-      });
-      if (typeof dir === "string" && !(agent.allowedFolders ?? []).includes(dir)) {
-        update({ allowedFolders: [...(agent.allowedFolders ?? []), dir] });
-      }
-    } catch {
-      toast.error("Folder picker is only available in the desktop app");
-    }
   };
 
   const handleFilesPicked = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -367,74 +336,6 @@ export function AgentSettingsForm({
             </SelectContent>
           </Select>
         </div>
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-1.5">
-            <Sparkles className="size-3.5 text-muted-foreground" />
-            <span className="text-sm font-medium">Skills</span>
-          </div>
-          {skillRows.length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              No installed skills yet — install some in Settings → Skills.
-            </p>
-          ) : (
-            <div className="flex flex-col gap-1.5">
-              {skillRows.map((skill) => (
-                <div
-                  key={skill.name}
-                  className="flex items-center justify-between gap-3 rounded-lg border p-2.5"
-                >
-                  <span className="truncate font-mono text-xs">{skill.name}</span>
-                  <Switch
-                    checked={agent.skills.includes(skill.name)}
-                    onCheckedChange={() =>
-                      toggleListValue(agent.skills, skill.name, (skills) => update({ skills }))
-                    }
-                  />
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-1.5">
-            <Plug className="size-3.5 text-muted-foreground" />
-            <span className="text-sm font-medium">Connectors</span>
-          </div>
-          <div className="flex max-h-44 flex-col gap-1.5 overflow-y-auto rounded-lg border p-2">
-            {MCP_CATALOG.map((entry) => (
-              <div
-                key={entry.id}
-                className="flex items-center justify-between gap-3 p-1"
-              >
-                <div className="flex min-w-0 flex-col gap-0.5">
-                  <span className="truncate text-sm font-medium">{entry.name}</span>
-                  <span className="truncate text-xs text-muted-foreground">
-                    {entry.tagline}
-                  </span>
-                </div>
-                <Switch
-                  checked={agent.connectors.includes(entry.id)}
-                  onCheckedChange={() =>
-                    toggleListValue(agent.connectors, entry.id, (connectors) => update({ connectors }))
-                  }
-                />
-              </div>
-            ))}
-            {agent.connectors
-              .filter((id) => !MCP_CATALOG.some((c) => c.id === id))
-              .map((id) => (
-                <div key={id} className="flex items-center justify-between gap-3 p-1">
-                  <span className="truncate font-mono text-xs">{id}</span>
-                  <Switch
-                    checked={agent.connectors.includes(id)}
-                    onCheckedChange={() =>
-                      toggleListValue(agent.connectors, id, (connectors) => update({ connectors }))
-                    }
-                  />
-                </div>
-              ))}
-          </div>
-        </div>
         </CollapsibleContent>
       </Collapsible>
 
@@ -445,20 +346,14 @@ export function AgentSettingsForm({
         <SectionTitle>Access</SectionTitle>
         <p className="text-xs text-muted-foreground">
           Sandboxed by default: the agent can only touch its private workspace
-          plus the folders and projects you grant here. Every local action
-          still shows an approve/deny card.
+          plus the folders and projects you grant here. Granted folders are
+          trusted — file access inside them runs without approval cards.
         </p>
         <PermissionRow
           label="Web access"
           description="Search and fetch the web"
           checked={agent.capabilities.web}
           onCheckedChange={(web) => update({ capabilities: { web } })}
-        />
-        <PermissionRow
-          label="Local files"
-          description="Read/write files in its workspace and the folders below — each access approved"
-          checked={agent.capabilities.files}
-          onCheckedChange={(files) => update({ capabilities: { files } })}
         />
         <PermissionRow
           label="Terminal & coding"
@@ -472,39 +367,10 @@ export function AgentSettingsForm({
           checked={agent.readChats ?? false}
           onCheckedChange={(readChats) => update({ readChats })}
         />
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
-            <Label>Folders</Label>
-            <Button variant="outline" size="sm" onClick={() => void addFolder()}>
-              <FolderPlus className="size-4" />
-              Add folder
-            </Button>
-          </div>
-          {(agent.allowedFolders ?? []).length === 0 ? (
-            <p className="text-xs text-muted-foreground">
-              No folders granted yet.
-            </p>
-          ) : (
-            <div className="flex flex-wrap gap-1.5">
-              {(agent.allowedFolders ?? []).map((folder) => (
-                <Badge key={folder} variant="secondary" className="gap-1 pr-1 font-mono text-[11px]">
-                  <span className="max-w-64 truncate">{folder}</span>
-                  <button
-                    aria-label={`Remove ${folder}`}
-                    className="rounded-full p-0.5 hover:bg-accent"
-                    onClick={() =>
-                      update({
-                        allowedFolders: (agent.allowedFolders ?? []).filter((f) => f !== folder),
-                      })
-                    }
-                  >
-                    <X className="size-3" />
-                  </button>
-                </Badge>
-              ))}
-            </div>
-          )}
-        </div>
+        <p className="text-xs text-muted-foreground">
+          Folders are managed on the agent console's Folders card — granted
+          folders are trusted for file access without approval cards.
+        </p>
         <div className="flex flex-col gap-2">
           <Label>Projects</Label>
           {projects.length === 0 ? (

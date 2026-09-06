@@ -24,6 +24,14 @@ function loadProjects(): StoredProject[] {
   }
 }
 
+/**
+ * Project ids + linked folders, straight from storage — headless runs
+ * (scheduler/workflows) resolve sandboxes without a hook instance.
+ */
+export function loadProjectDirectories(): Array<{ id: string; directory?: string | null }> {
+  return loadProjects().map((p) => ({ id: p.id, directory: (p as { directory?: string | null }).directory }));
+}
+
 function saveProjects(projects: StoredProject[]) {
   localStorage.setItem(
     STORAGE_KEY,

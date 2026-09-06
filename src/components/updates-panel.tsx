@@ -161,7 +161,7 @@ export function UpdatesPanel() {
             <CardContent className="flex items-center gap-3 py-4">
               <Check className="size-5 text-green-500" />
               <span className="text-sm font-medium">
-                You're up to date — version {currentVersion}.
+                You're up to date (version {currentVersion})
               </span>
             </CardContent>
           </Card>

@@ -1,14 +1,6 @@
 import { useState } from "react";
-import { KeyRound, Loader2 } from "lucide-react";
+import { Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -71,21 +63,8 @@ export function ProviderForm({ provider, onSave, onCancel }: ProviderFormProps) 
   };
 
   return (
-    <Card className="w-full">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <KeyRound className="size-4" />
-          {isEditing ? "Edit Provider" : "Add Provider"}
-        </CardTitle>
-        <CardDescription>
-          {isEditing
-            ? "Update your provider configuration. Leave API key blank to keep the existing key."
-            : "Choose a built-in provider or add a custom OpenAI-compatible endpoint."}
-        </CardDescription>
-      </CardHeader>
-      <form onSubmit={handleSubmit}>
-        <CardContent className="flex flex-col gap-4">
-          <div className="flex flex-col gap-2">
+    <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+      <div className="flex flex-col gap-2">
             <Label htmlFor="provider-type">Provider Type</Label>
             <Select
               value={selectedBuiltin}
@@ -177,17 +156,15 @@ export function ProviderForm({ provider, onSave, onCancel }: ProviderFormProps) 
               running before fetching models.
             </p>
           )}
-        </CardContent>
-        <CardFooter className="flex justify-end gap-2">
-          <Button type="button" variant="outline" onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button type="submit" disabled={saving}>
-            {saving && <Loader2 className="size-4 animate-spin" />}
-            {isEditing ? "Save Changes" : "Add Provider"}
-          </Button>
-        </CardFooter>
-      </form>
-    </Card>
+      <div className="flex justify-end gap-2">
+        <Button type="button" variant="outline" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button type="submit" disabled={saving}>
+          {saving && <Loader2 className="size-4 animate-spin" />}
+          {isEditing ? "Save Changes" : "Add Provider"}
+        </Button>
+      </div>
+    </form>
   );
 }

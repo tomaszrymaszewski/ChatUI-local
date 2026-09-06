@@ -66,6 +66,12 @@ export type SessionChatMode =
   | "research"
   | "council";
 
+/**
+ * Reasoning effort sent as reasoning_effort on chat-completions requests for
+ * reasoning-capable models. "default" sends nothing (provider default).
+ */
+export type ReasoningEffort = "default" | "low" | "medium" | "high";
+
 export interface ChatSession {
   id: string;
   title: string;
@@ -75,6 +81,8 @@ export interface ChatSession {
   isTemporary?: boolean;
   /** Composer mode persisted per chat — learn mode stays on until turned off. */
   chatMode?: SessionChatMode;
+  /** Reasoning effort persisted per chat — used for the session's runs. */
+  reasoningEffort?: ReasoningEffort;
   /** The saved agent this session belongs to (type "agent" only; undefined = standalone task). */
   agentId?: string;
   /** True while this session is an agent-builder setup interview. */
@@ -90,8 +98,8 @@ export interface ChatSession {
 export interface AgentCapabilities {
   /** May run shell commands and delegate coding tasks (run_command / run_coding_task). */
   terminal: boolean;
-  /** May read/write local files via read_file/write_file (each access user-approved). */
-  files: boolean;
+  /** Deprecated: superseded by folder-based access (allowedFolders). Kept so legacy records parse. */
+  files?: boolean;
   /** May use web search/fetch. */
   web: boolean;
   /** Reserved for the computer-use phase (not implemented yet). */
@@ -173,6 +181,56 @@ export type BackgroundPattern = "none" | "lines" | "plus" | "dots";
 
 /** How agent-mode tasks may run terminal commands on the user's machine. */
 export type TerminalApproval = "ask" | "task" | "auto";
+
+/** When a scheduled run fires. */
+export type ScheduleCadence = {
+  kind: "daily" | "weekly" | "interval" | "once";
+  /** "HH:MM" local time — daily/weekly fires at this time. */
+  timeHHMM?: string;
+  /** 0–6 (Sunday–Saturday) — weekly only. */
+  weekdays?: number[];
+  /** Minutes between runs — interval only. */
+  intervalMinutes?: number;
+  /** ISO timestamp — once only. */
+  runAt?: string;
+};
+
+/** A scheduled prompt or workflow that runs an agent headlessly while the app is open. */
+export interface AgentSchedule {
+  id: string;
+  name: string;
+  /** The agent that runs this schedule; undefined = standalone task agent. */
+  agentId?: string;
+  /** The workflow to run; takes precedence over prompt when set. */
+  workflowId?: string;
+  /** The prompt sent to the agent (plain schedules only). */
+  prompt?: string;
+  cadence: ScheduleCadence;
+  enabled: boolean;
+  /** ISO timestamp of the next scheduled run; null when nothing is scheduled (a fired "once"). */
+  nextRun: string | null;
+  /** ISO timestamp of the last completed run. */
+  lastRun?: string;
+  /** Session holding the last run's transcript (agent tab, openable like any chat). */
+  lastSessionId?: string;
+  lastStatus?: "ok" | "error" | "missed";
+}
+
+/** One step of a workflow — a prompt run by an agent (or the standalone task agent). */
+export interface WorkflowStep {
+  /** Agent that runs the step; undefined = standalone task agent. */
+  agentId?: string;
+  /** The prompt for this step. `{{previous}}` injects the prior step's output. */
+  prompt: string;
+}
+
+/** A linear agent workflow: steps run in order, each may reference the previous output. */
+export interface AgentWorkflow {
+  id: string;
+  name: string;
+  steps: WorkflowStep[];
+  createdAt: string;
+}
 
 export interface UserSettings {
   defaultModel: string | null;
