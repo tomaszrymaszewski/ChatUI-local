@@ -184,8 +184,31 @@ async function pool<T, R>(
 }
 
 /**
+ * Models regularly hit the output token limit (finish_reason "length") on long
+ * findings/reports, which used to leave the reply cut off mid-thought. When the
+ * final model message of a pass is truncated, the conversation is replayed with
+ * a continue instruction so the reply finishes (bounded number of passes).
+ */
+const MAX_REPLY_CONTINUATIONS = 2;
+
+const CONTINUE_INSTRUCTION =
+  "Your previous reply hit the output token limit and was cut off. Continue from EXACTLY " +
+  "the character where it stopped — mid-sentence if necessary. Do not repeat, restate, or " +
+  "summarize any text already written. Finish the reply, including any sections it had not " +
+  "reached yet (such as ### Sources).";
+
+/** Read the finish_reason from a streamed message's assembled AIMessage, if any. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function finishReasonOf(finalMessage: any): string | undefined {
+  const reason = finalMessage?.response_metadata?.finish_reason;
+  return typeof reason === "string" ? reason : undefined;
+}
+
+/**
  * Run an agent with streamEvents v3, emitting reasoning tokens to the UI
- * while accumulating text internally. Returns the full text content.
+ * while accumulating text internally. If the final model message was truncated
+ * by the output token limit, the agent is asked to continue exactly where it
+ * stopped (up to MAX_REPLY_CONTINUATIONS extra passes). Returns the full text.
  */
 async function streamAgentWithReasoning(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -197,26 +220,48 @@ async function streamAgentWithReasoning(
   signal: AbortSignal,
 ): Promise<string> {
   let content = "";
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const stream = await agent.streamEvents(input, { version: "v3", signal });
-  for await (const msg of stream.messages) {
-    await Promise.all([
-      (async () => {
-        for await (const token of msg.text) {
-          content += token;
+  let messages = (input.messages ?? []) as Array<{ role: string; content: unknown }>;
+  for (let pass = 0; pass <= MAX_REPLY_CONTINUATIONS; pass++) {
+    let finishReason: string | undefined;
+    let lastMessageText = "";
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const stream = await agent.streamEvents({ ...input, messages }, { version: "v3", signal });
+    for await (const msg of stream.messages) {
+      let messageText = "";
+      await Promise.all([
+        (async () => {
+          for await (const token of msg.text) {
+            messageText += token;
+            content += token;
+          }
+        })(),
+        (async () => {
+          for await (const token of msg.reasoning) {
+            emit({ type: "reasoning", text: token, id: reasoningId, label: reasoningLabel });
+          }
+        })(),
+      ]);
+      try {
+        const reason = finishReasonOf(await msg.output);
+        if (reason) {
+          finishReason = reason;
+          lastMessageText = messageText;
         }
-      })(),
-      (async () => {
-        for await (const token of msg.reasoning) {
-          emit({ type: "reasoning", text: token, id: reasoningId, label: reasoningLabel });
-        }
-      })(),
-    ]);
-  }
-  try {
-    await stream.output;
-  } catch {
-    // stream may end via abort
+      } catch {
+        // no final message (e.g. aborted mid-stream)
+      }
+    }
+    try {
+      await stream.output;
+    } catch {
+      // stream may end via abort
+    }
+    if (signal.aborted || finishReason !== "length" || !lastMessageText.trim()) break;
+    messages = [
+      ...messages,
+      { role: "assistant", content: lastMessageText },
+      { role: "user", content: CONTINUE_INSTRUCTION },
+    ];
   }
   return content;
 }
@@ -738,70 +783,125 @@ Rules:
 
   // The synthesis call is the largest request in the pipeline and can stall if
   // the provider buffers or drops it. Watch for an idle stream and abort so the
-  // run always terminates (the findings above are already persisted).
-  const synthAbort = new AbortController();
-  let idleTimedOut = false;
-  const onParentAbort = () => synthAbort.abort();
-  signal.addEventListener("abort", onParentAbort);
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-  const resetIdle = () => {
-    if (idleTimer) clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => {
-      idleTimedOut = true;
-      synthAbort.abort();
-    }, 60000);
-  };
-  resetIdle();
+  // run always terminates (the findings above are already persisted). A pass
+  // that was cut off mid-report — output token limit, idle abort, or a transient
+  // stream error after some text arrived — is continued in a follow-up pass so
+  // the report never ends mid-thought.
+  const SYNTHESIS_IDLE_TIMEOUT_MS = 120_000;
+  const MAX_SYNTHESIS_CONTINUATIONS = 3;
+  const synthesisPrompt = `Write a comprehensive research report based on the following findings from multiple research sub-agents.\n\n${allFindings}\n\nWrite the report as your reply.`;
+  const synthesisAgent = createAgent({
+    model,
+    systemPrompt: SYNTHESIS_INSTRUCTIONS,
+  });
 
-  try {
-    const synthesisAgent = createAgent({
-      model,
-      systemPrompt: SYNTHESIS_INSTRUCTIONS,
-    });
-
-    const stream = await synthesisAgent.streamEvents(
-      {
-        messages: [
-          {
-            role: "user",
-            content: `Write a comprehensive research report based on the following findings from multiple research sub-agents.\n\n${allFindings}\n\nWrite the report as your reply.`,
-          },
-        ],
-      },
-      { version: "v3", signal: synthAbort.signal },
-    );
-
-    for await (const msg of stream.messages) {
-      await Promise.all([
-        (async () => {
-          for await (const token of msg.text) {
-            resetIdle();
-            reportContent += token;
-          }
-        })(),
-        (async () => {
-          for await (const token of msg.reasoning) {
-            resetIdle();
-            emit({ type: "reasoning", text: token, id: "stage-synthesize", label: "Synthesis" });
-          }
-        })(),
-      ]);
-    }
+  /** Stream one synthesis pass into reportContent; returns why it ended. */
+  const runSynthesisPass = async (
+    messages: Array<{ role: string; content: string }>,
+    reasoningLabel: string,
+  ): Promise<{ ended: "complete" | "length" | "idle" | "error"; produced: number }> => {
+    const synthAbort = new AbortController();
+    let idleTimedOut = false;
+    let streamFailed = false;
+    let produced = 0;
+    let finishReason: string | undefined;
+    const onParentAbort = () => synthAbort.abort();
+    signal.addEventListener("abort", onParentAbort);
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const resetIdle = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleTimedOut = true;
+        synthAbort.abort();
+      }, SYNTHESIS_IDLE_TIMEOUT_MS);
+    };
+    resetIdle();
 
     try {
-      await stream.output;
-    } catch {
-      // stream may end via abort
-    }
-  } catch {
-    if (!signal.aborted) {
-      if (idleTimedOut && reportContent.length === 0) {
-        emit({ type: "token", text: "*Research synthesis timed out — the sub-agent findings above were preserved.*" });
+      const stream = await synthesisAgent.streamEvents(
+        { messages },
+        { version: "v3", signal: synthAbort.signal },
+      );
+
+      for await (const msg of stream.messages) {
+        await Promise.all([
+          (async () => {
+            for await (const token of msg.text) {
+              resetIdle();
+              produced += token.length;
+              reportContent += token;
+            }
+          })(),
+          (async () => {
+            for await (const token of msg.reasoning) {
+              resetIdle();
+              emit({ type: "reasoning", text: token, id: "stage-synthesize", label: reasoningLabel });
+            }
+          })(),
+        ]);
+        try {
+          const reason = finishReasonOf(await msg.output);
+          if (reason) finishReason = reason;
+        } catch {
+          // no final message (e.g. aborted mid-stream)
+        }
       }
+
+      try {
+        await stream.output;
+      } catch {
+        // stream may end via abort
+      }
+    } catch {
+      // classified below: idle abort, user abort, or provider error
+      streamFailed = true;
+    } finally {
+      if (idleTimer) clearTimeout(idleTimer);
+      signal.removeEventListener("abort", onParentAbort);
     }
-  } finally {
-    if (idleTimer) clearTimeout(idleTimer);
-    signal.removeEventListener("abort", onParentAbort);
+
+    if (idleTimedOut) return { ended: "idle", produced };
+    if (streamFailed && !signal.aborted) return { ended: "error", produced };
+    if (finishReason === "length") return { ended: "length", produced };
+    return { ended: "complete", produced };
+  };
+
+  let passMessages: Array<{ role: string; content: string }> = [
+    { role: "user", content: synthesisPrompt },
+  ];
+  for (let pass = 0; pass <= MAX_SYNTHESIS_CONTINUATIONS; pass++) {
+    if (signal.aborted) break;
+    const outcome = await runSynthesisPass(
+      passMessages,
+      pass === 0 ? "Synthesis" : "Synthesis (continued)",
+    );
+    if (signal.aborted || outcome.ended === "complete") break;
+    if (reportContent.length === 0) {
+      // Nothing was produced — surface it instead of ending the run silently
+      // (the sub-agent findings above are already persisted).
+      emit({
+        type: "token",
+        text:
+          outcome.ended === "idle"
+            ? "*Research synthesis timed out — the sub-agent findings above were preserved.*"
+            : "*Research synthesis failed — the sub-agent findings above were preserved.*",
+      });
+      break;
+    }
+    if (outcome.produced === 0) break; // pass stalled without new text — keep the partial report
+    passMessages = [
+      { role: "user", content: synthesisPrompt },
+      { role: "assistant", content: reportContent },
+      {
+        role: "user",
+        content:
+          "Your report was cut off before it was finished. Continue the report from EXACTLY the " +
+          "character where you stopped — mid-sentence if necessary. Do not repeat, restate, or " +
+          "summarize any text already written, and do not restart sections. Keep the same " +
+          "structure, style, and citation numbering, and finish the report (including the Open " +
+          "Questions and Sources sections if they were not reached).",
+      },
+    ];
   }
 
   // Emit the artifact programmatically after streaming completes.

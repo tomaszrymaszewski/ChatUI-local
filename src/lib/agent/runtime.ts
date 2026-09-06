@@ -3,6 +3,7 @@ import { todoListMiddleware } from "langchain";
 import { MemorySaver } from "@langchain/langgraph";
 import type { Provider, ReasoningEffort } from "@/types";
 import type { ContentPart } from "@/lib/llm";
+import type { Artifact } from "@/lib/artifacts";
 import { buildSystemPrompt } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
 import { buildAgentTools, type ToolProfile } from "@/lib/agent/tools";
@@ -15,8 +16,10 @@ import {
   truncateMessagesToBudget,
 } from "@/lib/agent/history";
 import type {
+  ActivityItem,
   AgentEvent,
   AgentMode,
+  ReasoningStream,
   StructuredInputRequest,
   TodoItem,
 } from "@/lib/agent/types";
@@ -46,9 +49,26 @@ for (const providerHint of ["openai", "anthropic", "google"]) {
   });
 }
 
+/**
+ * Run metadata stored on an assistant message: the thought process, sub-agent
+ * outputs, and artifacts the run produced. These are shown in the UI but are
+ * not part of the message text — without them, a follow-up prompt ("continue
+ * the report", "dig deeper into X") reaches the model with only the short
+ * visible reply. History replay folds them back into the context as a capped
+ * digest (see buildRunDigest in history.ts).
+ */
+export interface AgentMessageRunMeta {
+  reasoning?: string;
+  reasoningStreams?: ReasoningStream[];
+  activities?: ActivityItem[];
+  artifacts?: Artifact[];
+}
+
 export interface AgentMessage {
   role: "user" | "assistant" | "system";
   content: string | ContentPart[];
+  /** Assistant-only: metadata from the run that produced this message. */
+  meta?: AgentMessageRunMeta;
 }
 
 export interface AgentSessionOptions {

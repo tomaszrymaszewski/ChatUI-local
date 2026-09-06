@@ -1,10 +1,22 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildRunDigest,
   estimateMessageTokens,
+  toHistoryMessage,
   truncateMessagesToBudget,
 } from "./history";
+import type { AgentMessage } from "./runtime";
+import type { Message } from "@/types";
 
 const msg = (chars: number) => ({ role: "user" as const, content: "x".repeat(chars) });
+
+const storedMsg = (over: Partial<Message>): Message => ({
+  id: "m1",
+  role: "assistant",
+  content: "summary",
+  timestamp: new Date(),
+  ...over,
+});
 
 describe("estimateMessageTokens", () => {
   it("estimates ~4 chars per token plus overhead", () => {
@@ -47,5 +59,149 @@ describe("truncateMessagesToBudget", () => {
 
   it("handles empty history", () => {
     expect(truncateMessagesToBudget([], 100)).toHaveLength(0);
+  });
+
+  it("folds assistant run metadata into the replayed content", () => {
+    const messages: AgentMessage[] = [
+      {
+        role: "assistant",
+        content: "summary",
+        meta: {
+          activities: [
+            {
+              id: "researcher-0",
+              kind: "subagent",
+              name: "Research: topic",
+              status: "done",
+              output: "y".repeat(8000),
+            },
+          ],
+        },
+      },
+      { role: "user", content: "continue" },
+    ];
+    const out = truncateMessagesToBudget(messages, 5000);
+    expect(out).toHaveLength(2);
+    expect(String(out[0].content)).toContain("summary");
+    expect(String(out[0].content)).toContain("Sub-agent findings:");
+    expect(String(out[0].content)).toContain("y".repeat(100));
+  });
+
+  it("falls back to the plain assistant message when the digest does not fit", () => {
+    const messages: AgentMessage[] = [
+      {
+        role: "assistant",
+        content: "summary",
+        meta: {
+          activities: [
+            {
+              id: "researcher-0",
+              kind: "subagent",
+              name: "Research: topic",
+              status: "done",
+              output: "y".repeat(8000),
+            },
+          ],
+        },
+      },
+      { role: "user", content: "continue" },
+    ];
+    // expanded assistant is ~1.6k tokens; plain is ~6 — budget only fits the plain one
+    const out = truncateMessagesToBudget(messages, 200);
+    expect(out).toHaveLength(2);
+    expect(out[0].content).toBe("summary");
+  });
+
+  it("drops the assistant message entirely when even the plain form does not fit", () => {
+    const messages: AgentMessage[] = [
+      { role: "assistant", content: "z".repeat(4000), meta: { reasoning: "thought" } },
+      { role: "user", content: "continue" },
+    ];
+    const out = truncateMessagesToBudget(messages, 10);
+    expect(out).toHaveLength(1);
+    expect(out[0].content).toBe("continue");
+  });
+});
+
+describe("buildRunDigest", () => {
+  it("returns empty string when there is nothing to replay", () => {
+    expect(buildRunDigest({})).toBe("");
+    expect(buildRunDigest({ reasoning: "   " })).toBe("");
+    expect(
+      buildRunDigest({
+        activities: [
+          { id: "t", kind: "tool", name: "web_search", status: "done" },
+          { id: "s", kind: "subagent", name: "R", status: "error", output: "failed" },
+        ],
+      }),
+    ).toBe("");
+  });
+
+  it("includes labeled reasoning streams", () => {
+    const digest = buildRunDigest({
+      reasoningStreams: [
+        { id: "stage-plan", label: "Planner", text: "planning thoughts" },
+        { id: "researcher-0", label: "Researcher 1", text: "search thoughts" },
+      ],
+    });
+    expect(digest).toContain("Thought process:");
+    expect(digest).toContain("[Planner]\nplanning thoughts");
+    expect(digest).toContain("[Researcher 1]\nsearch thoughts");
+  });
+
+  it("falls back to bare reasoning when there are no streams", () => {
+    const digest = buildRunDigest({ reasoning: "plain thought" });
+    expect(digest).toContain("Thought process:\nplain thought");
+  });
+
+  it("includes sub-agent findings but skips errored and empty ones", () => {
+    const digest = buildRunDigest({
+      activities: [
+        { id: "r0", kind: "subagent", name: "Research: A", status: "done", output: "findings A" },
+        { id: "r1", kind: "subagent", name: "Research: B", status: "error", output: "boom" },
+        { id: "r2", kind: "subagent", name: "Research: C", status: "done", output: "  " },
+      ],
+    });
+    expect(digest).toContain("## Research: A\nfindings A");
+    expect(digest).not.toContain("Research: B");
+    expect(digest).not.toContain("Research: C");
+  });
+
+  it("clips long findings keeping head and tail", () => {
+    const output = "H".repeat(5000) + "M".repeat(3000) + "T".repeat(1500);
+    const digest = buildRunDigest({
+      activities: [{ id: "r0", kind: "subagent", name: "R", status: "done", output }],
+    });
+    expect(digest).toContain("H".repeat(100)); // head kept
+    expect(digest).toContain("T".repeat(100)); // tail kept (where a cut-off reply stopped)
+    expect(digest).not.toContain("M".repeat(1000)); // middle dropped
+    expect(digest).toContain("[…truncated…]");
+  });
+
+  it("includes artifact titles and content", () => {
+    const digest = buildRunDigest({
+      artifacts: [{ id: "a1", title: "Research Report", language: "markdown", content: "# Report\nbody", index: 0 }],
+    });
+    expect(digest).toContain("## Research Report (markdown)");
+    expect(digest).toContain("# Report\nbody");
+  });
+});
+
+describe("toHistoryMessage", () => {
+  it("attaches run metadata for assistant messages that have it", () => {
+    const out = toHistoryMessage(storedMsg({ reasoning: "thought", content: "answer" }));
+    expect(out.role).toBe("assistant");
+    expect(out.content).toBe("answer");
+    expect(out.meta?.reasoning).toBe("thought");
+  });
+
+  it("leaves meta off user messages and metadata-free assistant messages", () => {
+    expect(toHistoryMessage(storedMsg({ role: "user" })).meta).toBeUndefined();
+    expect(toHistoryMessage(storedMsg({})).meta).toBeUndefined();
+  });
+
+  it("lets rebuilt content override the stored text", () => {
+    const out = toHistoryMessage(storedMsg({ role: "user", content: "hi" }), "hi [file attached]");
+    expect(out.content).toBe("hi [file attached]");
   });
 });

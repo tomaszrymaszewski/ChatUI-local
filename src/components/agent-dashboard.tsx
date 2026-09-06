@@ -130,9 +130,6 @@ export function AgentDashboard({
                 </div>
                 <div className="flex min-w-0 flex-col">
                   <span className="text-sm font-medium">Create your first agent</span>
-                  <span className="text-xs text-muted-foreground">
-                    Describe the job below — the agent sets itself up and appears here.
-                  </span>
                 </div>
               </button>
             ) : (

@@ -175,7 +175,7 @@ export function NavAgents({
           ))}
           {agents.length === 0 && (
             <span className="px-2 text-xs text-muted-foreground">
-              No agents yet — describe one in the dashboard composer to set it up.
+              No agents yet
             </span>
           )}
         </SidebarMenu>
@@ -237,7 +237,7 @@ export function NavAgents({
           })}
           {sessions.length === 0 && (
             <span className="px-2 text-xs text-muted-foreground">
-              No tasks yet — start one from the dashboard composer.
+              No tasks yet
             </span>
           )}
         </SidebarMenu>

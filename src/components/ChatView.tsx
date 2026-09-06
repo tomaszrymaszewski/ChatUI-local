@@ -148,6 +148,7 @@ import {
 } from "@/lib/learn-mode";
 import { generateChatTitle, instantChatTitle, type ContentPart } from "@/lib/llm";
 import type { AgentMessage } from "@/lib/agent/runtime";
+import { toHistoryMessage } from "@/lib/agent/history";
 import {
   buildMessageTree,
   getActivePath,
@@ -912,9 +913,9 @@ export function ChatView() {
       for (const n of activePath) {
         if (n.message.role === "user" && (n.message.attachments?.length ?? 0) > 0) {
           const rebuilt = await rebuildAttachmentContent(n.message, provider, runModelName);
-          historyMessages.push({ role: "user", content: rebuilt ?? n.message.content });
+          historyMessages.push(toHistoryMessage(n.message, rebuilt ?? undefined));
         } else {
-          historyMessages.push({ role: n.message.role, content: n.message.content });
+          historyMessages.push(toHistoryMessage(n.message));
         }
       }
 
@@ -1105,9 +1106,9 @@ export function ChatView() {
       for (const n of pathToParent) {
         if (n.message.role === "user" && (n.message.attachments?.length ?? 0) > 0) {
           const rebuilt = await rebuildAttachmentContent(n.message, provider, runModelName);
-          completionMessages.push({ role: "user", content: rebuilt ?? n.message.content });
+          completionMessages.push(toHistoryMessage(n.message, rebuilt ?? undefined));
         } else {
-          completionMessages.push({ role: n.message.role, content: n.message.content });
+          completionMessages.push(toHistoryMessage(n.message));
         }
       }
       completionMessages.push({ role: "user" as const, content: text });
@@ -1197,9 +1198,9 @@ export function ChatView() {
       for (const n of pathToParent) {
         if (n.message.role === "user" && (n.message.attachments?.length ?? 0) > 0) {
           const rebuilt = await rebuildAttachmentContent(n.message, provider, runModelName);
-          completionMessages.push({ role: "user", content: rebuilt ?? n.message.content });
+          completionMessages.push(toHistoryMessage(n.message, rebuilt ?? undefined));
         } else {
-          completionMessages.push({ role: n.message.role, content: n.message.content });
+          completionMessages.push(toHistoryMessage(n.message));
         }
       }
 
