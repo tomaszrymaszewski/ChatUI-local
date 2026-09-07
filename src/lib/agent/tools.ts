@@ -17,6 +17,7 @@ import {
 } from "@/lib/agents";
 import {
   isPathAllowed,
+  isSessionReadable,
   sandboxDeniedMessage,
   ensureAgentWorkspace,
   type AgentSandbox,
@@ -26,6 +27,7 @@ import { getRunContext, getRetrievedDocIds, type RunContext } from "@/lib/agent/
 import { webSearch } from "@/lib/agent/web-search";
 import { CURATED_SKILLS, listBundledSkills, listInstalledSkills } from "@/lib/skills-library";
 import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { hasToken, readMcpAuth } from "@/lib/mcp-auth";
 import { isConnected } from "@/lib/mcp-store";
 import { loadUserSettings } from "@/hooks/use-user-settings";
 import {
@@ -351,6 +353,9 @@ export function buildAgentTools(
     tool(
       async ({ query }: { query: string }) => {
         const q = query.toLowerCase().trim();
+        // OAuth connectors only count as connected once the native sign-in
+        // has stored a token — an added-but-unsigned entry has no usable tools.
+        const authData = await readMcpAuth().catch(() => ({}));
         const scored = MCP_CATALOG.map((c) => {
           const haystack = `${c.name} ${c.tagline} ${c.category} ${(c.keywords ?? []).join(" ")}`.toLowerCase();
           let score = 0;
@@ -362,13 +367,17 @@ export function buildAgentTools(
             const hits = terms.filter((t) => haystack.includes(t)).length;
             if (hits > 0) score = hits * 15;
           }
+          const added = isConnected(c.id);
+          const connected =
+            c.auth === "oauth" ? added && hasToken(authData, c.id) : added;
           return {
             id: c.id,
             name: c.name,
             tagline: c.tagline,
             category: c.category,
             auth: c.auth,
-            connected: isConnected(c.id),
+            connected,
+            needsSignIn: added && !connected,
             score,
           };
         })
@@ -382,7 +391,7 @@ export function buildAgentTools(
 
         const lines = scored.map(
           (c, i) =>
-            `[${i + 1}] ${c.name}${c.connected ? " [CONNECTED]" : ""}\n    ${c.tagline}\n    Category: ${c.category} · Auth: ${c.auth}`,
+            `[${i + 1}] ${c.name}${c.connected ? " [CONNECTED]" : c.needsSignIn ? " [ADDED — needs sign-in]" : ""}\n    ${c.tagline}\n    Category: ${c.category} · Auth: ${c.auth}`,
         );
         return `Found ${scored.length} connector(s) for "${query}":\n\n${lines.join("\n\n")}`;
       },
@@ -612,13 +621,15 @@ export function buildAgentTools(
       );
     }
 
-    if (sandbox?.readChats) {
+    const hasChatAccess = !!sandbox && (!!sandbox.readChats || !!sandbox.externalChats);
+    if (hasChatAccess) {
       tools.push(
         tool(
           async ({ query, session_id }: { query?: string; session_id?: string }) => {
             interface StoredSession {
               id: string;
               title: string;
+              agentId?: string;
               updatedAt?: string;
               isTemporary?: boolean;
             }
@@ -628,7 +639,10 @@ export function buildAgentTools(
             } catch {
               return "Could not read the chat history.";
             }
-            sessions = sessions.filter((s) => s && !s.isTemporary);
+            const sandboxRef = sandbox!;
+            sessions = sessions.filter(
+              (s) => s && isSessionReadable(s, sandboxRef),
+            );
 
             // Read one session in full.
             if (session_id) {
@@ -696,7 +710,8 @@ export function buildAgentTools(
           {
             name: "search_chats",
             description:
-              "Search the user's past chat sessions by keyword, or read one chat in full by its id. " +
+              "Search the chat sessions you have access to by keyword, or read one in full by its id — " +
+              "your own past sessions plus any chats and tasks the user has granted you. " +
               "Use it when the user refers to an earlier conversation ('what did we decide about X?', " +
               "'find that chat about the apartment'). First search with a query to get session ids + " +
               "snippets, then call again with session_id to read the full conversation.",

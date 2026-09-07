@@ -6,12 +6,12 @@ import {
   BarChart3,
   CalendarClock,
   Check,
+  Folder,
   FolderPlus,
+  HardDrive,
   Pencil,
-  Plug,
   Plus,
   Settings2,
-  Sparkles,
   Workflow as WorkflowIcon,
   X,
 } from "lucide-react";
@@ -20,8 +20,7 @@ import type { AgentUpdatePatch } from "@/lib/agents";
 import { modelLabel } from "@/lib/model-display";
 import { describeCadence, deleteSchedule, loadSchedules, subscribeToSchedules, updateSchedule } from "@/lib/schedules";
 import { deleteWorkflow, loadWorkflows, subscribeToWorkflows } from "@/lib/workflows";
-import { listInstalledSkills } from "@/lib/skills-library";
-import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { ensureAgentWorkspace } from "@/lib/agent/sandbox";
 import { AgentAvatar } from "@/components/agent-avatar";
 import type { AgentConsoleTab } from "@/components/app-sidebar";
 import { AgentUsageChart } from "@/components/agent-usage-chart";
@@ -29,7 +28,10 @@ import { ScheduleDialog } from "@/components/schedule-dialog";
 import { WorkflowDialog } from "@/components/workflow-dialog";
 import { PatternBackground } from "@/components/background-pattern";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
-import { skillIcon } from "@/components/skills-panel";
+import {
+  FolderViewerDialog,
+  type FolderViewerTarget,
+} from "@/components/folder-viewer-dialog";
 import {
   InputGroup,
   InputGroupAddon,
@@ -40,20 +42,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectLabel,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-
-const DEFAULT_MODEL_VALUE = "__default__";
 
 function CardTitleRow({
   icon,
@@ -115,20 +107,111 @@ function PermissionRow({
 }
 
 /**
+ * A clickable folder tile (Access tab). Opens the read-only folder viewer on
+ * click; granted folders reveal a revoke X on hover.
+ */
+function FolderBox({
+  title,
+  displayPath,
+  workspace,
+  onOpen,
+  onRevoke,
+}: {
+  title: string;
+  displayPath: string;
+  workspace?: boolean;
+  onOpen: () => void;
+  onRevoke?: () => void;
+}) {
+  return (
+    <div
+      role="button"
+      tabIndex={0}
+      className="group relative flex cursor-pointer flex-col gap-1.5 rounded-xl border p-3 transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+      onClick={onOpen}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+    >
+      {workspace ? (
+        <HardDrive className="size-5 shrink-0 text-muted-foreground" />
+      ) : (
+        <Folder className="size-5 shrink-0 text-muted-foreground" />
+      )}
+      <span className="truncate text-xs font-medium">{title}</span>
+      <span className="truncate font-mono text-[10px] text-muted-foreground">
+        {displayPath}
+      </span>
+      {onRevoke && (
+        <button
+          aria-label={`Revoke ${title}`}
+          className="absolute right-1.5 top-1.5 rounded-full p-0.5 text-muted-foreground opacity-0 transition-opacity hover:bg-accent hover:text-destructive focus-visible:opacity-100 group-hover:opacity-100"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRevoke();
+          }}
+        >
+          <X className="size-3" />
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Segmented Off / All / Selected control for the external chats scope. */
+function ScopeControl({
+  value,
+  onChange,
+}: {
+  value: "off" | "all" | "selected";
+  onChange: (value: "off" | "all" | "selected") => void;
+}) {
+  const options: Array<{ key: "off" | "all" | "selected"; label: string }> = [
+    { key: "off", label: "Off" },
+    { key: "all", label: "All" },
+    { key: "selected", label: "Selected" },
+  ];
+  return (
+    <div className="flex shrink-0 gap-0.5 rounded-lg bg-muted/70 p-1">
+      {options.map((opt) => (
+        <button
+          key={opt.key}
+          type="button"
+          aria-pressed={value === opt.key}
+          onClick={() => onChange(opt.key)}
+          className={cn(
+            "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
+            value === opt.key
+              ? "bg-background text-foreground shadow-sm"
+              : "text-muted-foreground hover:text-foreground",
+          )}
+        >
+          {opt.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
  * The agent page (sidebar agent click): header + the panel selected in the
- * sidebar (General / Permissions / Automations / Connections) above a
- * composer pinned to the bottom (like the dashboard).
- * - General: identity (name, purpose, system prompt), model, token usage.
- * - Permissions: local folders, internet/compiler access, visible
- *   chats & projects.
+ * sidebar (General / Access / Automations) above a composer pinned to the
+ * bottom (like the dashboard).
+ * - General: the agent's profile — avatar, name, purpose, system prompt
+ *   (first lines + fade, expandable to edit), token usage.
+ * - Access: local folders (boxes + read-only file viewer modal), internet /
+ *   terminal capabilities, visible chats & projects.
  * - Automations: schedules and workflows.
- * - Connections: activated skills and apps/connectors.
  * Past sessions live in the sidebar's Sessions section.
  */
 export function AgentConsole({
   agent,
   agents,
   sessions,
+  allSessions,
   projects,
   models,
   sendOnEnter,
@@ -145,6 +228,8 @@ export function AgentConsole({
   agents: AgentDefinition[];
   /** This agent's sessions, newest first. */
   sessions: ChatSession[];
+  /** Every session in the app — the external chats/tasks picker. */
+  allSessions: ChatSession[];
   projects: Project[];
   models: Array<{
     id: string;
@@ -167,13 +252,14 @@ export function AgentConsole({
   onSend: (text: string) => void;
 }) {
   const [inputText, setInputText] = useState("");
-  const [installedSkills, setInstalledSkills] = useState<Array<{ name: string; path: string }>>([]);
   const [schedules, setSchedules] = useState<AgentSchedule[]>(loadSchedules());
   const [workflows, setWorkflows] = useState<AgentWorkflow[]>(loadWorkflows());
   const [scheduleDialogOpen, setScheduleDialogOpen] = useState(false);
   const [editingSchedule, setEditingSchedule] = useState<AgentSchedule | null>(null);
   const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
   const [editingWorkflow, setEditingWorkflow] = useState<AgentWorkflow | null>(null);
+  const [viewerOpen, setViewerOpen] = useState(false);
+  const [viewerTarget, setViewerTarget] = useState<FolderViewerTarget | null>(null);
 
   // Identity drafts (General tab) — resync when the record changes
   // externally (e.g. the agent editing itself mid-chat).
@@ -181,10 +267,6 @@ export function AgentConsole({
   const [purposeDraft, setPurposeDraft] = useState(agent.purpose);
   const [instructionsDraft, setInstructionsDraft] = useState(agent.systemPrompt);
   const [editingInstructions, setEditingInstructions] = useState(false);
-
-  useEffect(() => {
-    void listInstalledSkills("global").then(setInstalledSkills).catch(() => setInstalledSkills([]));
-  }, []);
 
   useEffect(() => {
     const sync = () => {
@@ -220,16 +302,6 @@ export function AgentConsole({
     ? models.find((m) => m.name === agent.model)
     : undefined;
 
-  const groupedModels = useMemo(() => {
-    const map = new Map<string, typeof models>();
-    for (const m of models) {
-      const list = map.get(m.providerName) ?? [];
-      list.push(m);
-      map.set(m.providerName, list);
-    }
-    return Array.from(map.entries());
-  }, [models]);
-
   const agentSchedules = useMemo(
     () =>
       schedules
@@ -243,9 +315,14 @@ export function AgentConsole({
     [workflows, agent.id],
   );
 
-  const customConnectors = useMemo(
-    () => agent.connectors.filter((id) => !MCP_CATALOG.some((c) => c.id === id)),
-    [agent.connectors],
+  // Candidate sessions for the external chats/tasks picker: everything in
+  // the app that isn't this agent's own and isn't a throwaway chat.
+  const externalCandidates = useMemo(
+    () =>
+      allSessions.filter(
+        (s) => !s.isTemporary && s.agentId !== agent.id && !s.isSetup,
+      ),
+    [allSessions, agent.id],
   );
 
   const commitName = () => {
@@ -280,6 +357,20 @@ export function AgentConsole({
     } catch {
       toast.error("Folder picker is only available in the desktop app");
     }
+  };
+
+  const openFolderViewer = (target: FolderViewerTarget) => {
+    setViewerTarget(target);
+    setViewerOpen(true);
+  };
+
+  const openWorkspaceViewer = async () => {
+    const workspace = await ensureAgentWorkspace(agent.id).catch(() => undefined);
+    if (!workspace) {
+      toast.error("Folder viewer is only available in the desktop app");
+      return;
+    }
+    openFolderViewer({ title: "Private workspace", path: workspace, isWorkspace: true });
   };
 
   const lastScheduleStatus = (schedule: AgentSchedule) => {
@@ -332,41 +423,44 @@ export function AgentConsole({
             <h2 className="text-xl font-semibold capitalize">{tab}</h2>
             {tab === "general" && (
               <>
-                {/* ─── Identity ─── */}
+                {/* ─── Profile header — this tab is the agent's profile ─── */}
+                <div className="flex items-center gap-4 pt-1">
+                  <AgentAvatar seed={agent.id} className="size-16 shrink-0" />
+                  <div className="flex min-w-0 flex-1 flex-col gap-1">
+                    <Input
+                      id={`agent-name-${agent.id}`}
+                      value={nameDraft}
+                      onChange={(e) => setNameDraft(e.target.value)}
+                      onBlur={commitName}
+                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commitName(); } }}
+                      placeholder="Agent name"
+                      aria-label="Agent name"
+                      className="h-auto rounded-md border-0 bg-transparent px-1.5 text-xl font-semibold shadow-none hover:bg-accent/50 focus-visible:bg-accent/50 focus-visible:ring-1"
+                    />
+                    <Input
+                      id={`agent-purpose-${agent.id}`}
+                      value={purposeDraft}
+                      onChange={(e) => setPurposeDraft(e.target.value)}
+                      onBlur={commitPurpose}
+                      onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commitPurpose(); } }}
+                      placeholder="One-line purpose shown in the sidebar"
+                      aria-label="Agent purpose"
+                      className="h-auto rounded-md border-0 bg-transparent px-1.5 text-sm font-normal text-muted-foreground shadow-none hover:bg-accent/50 focus-visible:bg-accent/50 focus-visible:ring-1"
+                    />
+                  </div>
+                </div>
+
+                {/* ─── Identity (system prompt) ─── */}
                 <SectionCard
-                  icon={<AgentAvatar seed={agent.id} className="size-3.5" />}
+                  icon={<Pencil className="size-3.5 text-muted-foreground" />}
                   title="Identity"
                 >
-                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                    <div className="flex flex-col gap-1.5">
-                      <Label htmlFor={`agent-name-${agent.id}`}>Name</Label>
-                      <Input
-                        id={`agent-name-${agent.id}`}
-                        value={nameDraft}
-                        onChange={(e) => setNameDraft(e.target.value)}
-                        onBlur={commitName}
-                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commitName(); } }}
-                        placeholder="Agent name"
-                      />
-                    </div>
-                    <div className="flex flex-col gap-1.5">
-                      <Label htmlFor={`agent-purpose-${agent.id}`}>Purpose</Label>
-                      <Input
-                        id={`agent-purpose-${agent.id}`}
-                        value={purposeDraft}
-                        onChange={(e) => setPurposeDraft(e.target.value)}
-                        onBlur={commitPurpose}
-                        onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); commitPurpose(); } }}
-                        placeholder="One-line description shown in the sidebar"
-                      />
-                    </div>
-                  </div>
                   <div className="flex flex-col gap-1.5">
                     <div className="flex items-center justify-between">
                       <Label htmlFor={`agent-instructions-${agent.id}`}>System prompt</Label>
                       <Button
-                        variant="ghost"
-                        size="icon-xs"
+                        variant="outline"
+                        size="xs"
                         onMouseDown={(e) => e.preventDefault()}
                         onClick={() => {
                           if (editingInstructions) {
@@ -379,7 +473,17 @@ export function AgentConsole({
                         }}
                         aria-label={editingInstructions ? "Save system prompt" : "Edit system prompt"}
                       >
-                        {editingInstructions ? <Check /> : <Pencil />}
+                        {editingInstructions ? (
+                          <>
+                            <Check className="size-3" />
+                            Done
+                          </>
+                        ) : (
+                          <>
+                            <Pencil className="size-3" />
+                            Edit system prompt
+                          </>
+                        )}
                       </Button>
                     </div>
                     {editingInstructions ? (
@@ -389,53 +493,21 @@ export function AgentConsole({
                         value={instructionsDraft}
                         onChange={(e) => setInstructionsDraft(e.target.value)}
                         onBlur={commitInstructions}
-                        rows={6}
+                        rows={10}
                         placeholder="The agent's own system prompt — identity, how it works, its limits…"
                       />
-                    ) : (
-                      <div className="overflow-x-auto rounded-lg border bg-muted/30 p-3">
-                        {agent.systemPrompt ? (
-                          <MarkdownRenderer content={agent.systemPrompt} className="break-words text-sm" />
-                        ) : (
-                          <p className="text-xs text-muted-foreground">
-                            (No system prompt set — click the pencil to write one)
-                          </p>
-                        )}
+                    ) : agent.systemPrompt ? (
+                      // Preview: roughly the first five lines; the rest fades
+                      // out — click "Edit system prompt" to see and edit it all.
+                      <div className="relative max-h-36 overflow-hidden rounded-lg border bg-muted/30 p-3">
+                        <MarkdownRenderer content={agent.systemPrompt} className="break-words text-sm" />
+                        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-10 bg-gradient-to-t from-card to-transparent" />
                       </div>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">
+                        (No system prompt set — click "Edit system prompt" to write one)
+                      </p>
                     )}
-                  </div>
-                </SectionCard>
-
-                {/* ─── Model ─── */}
-                <SectionCard
-                  icon={<Settings2 className="size-3.5 text-muted-foreground" />}
-                  title="Model"
-                >
-                  <div className="flex flex-col gap-1.5">
-                    <Label htmlFor={`agent-model-${agent.id}`}>Model</Label>
-                    <Select
-                      value={agent.model ?? DEFAULT_MODEL_VALUE}
-                      onValueChange={(v) => update({ model: v === DEFAULT_MODEL_VALUE ? undefined : v })}
-                    >
-                      <SelectTrigger id={`agent-model-${agent.id}`} className="w-full">
-                        <SelectValue placeholder="Default model" />
-                      </SelectTrigger>
-                      <SelectContent className="min-w-56">
-                        <SelectItem value={DEFAULT_MODEL_VALUE}>
-                          Default (app model)
-                        </SelectItem>
-                        {groupedModels.map(([providerName, list]) => (
-                          <SelectGroup key={providerName}>
-                            <SelectLabel>{providerName}</SelectLabel>
-                            {list.map((m) => (
-                              <SelectItem key={m.id} value={m.name}>
-                                {modelLabel(m)}
-                              </SelectItem>
-                            ))}
-                          </SelectGroup>
-                        ))}
-                      </SelectContent>
-                    </Select>
                   </div>
                 </SectionCard>
 
@@ -449,13 +521,13 @@ export function AgentConsole({
               </>
             )}
 
-            {tab === "permissions" && (
+            {tab === "access" && (
               <>
 
-                {/* ─── Local folders ─── */}
+                {/* ─── Folders ─── */}
                 <SectionCard
                   icon={<FolderPlus className="size-3.5 text-muted-foreground" />}
-                  title="Local folders"
+                  title="Folders"
                   action={
                     <Button variant="outline" size="xs" onClick={() => void addFolder()}>
                       <FolderPlus className="size-3" />
@@ -463,45 +535,37 @@ export function AgentConsole({
                     </Button>
                   }
                 >
-                  <p className="font-mono text-[11px] text-muted-foreground">
-                    Private workspace: ~/Documents/chatUI/agents/{agent.id} (always available)
-                  </p>
-                  {(agent.allowedFolders ?? []).length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      No extra folders granted — the agent can only write inside its workspace.
-                    </p>
-                  ) : (
-                    <div className="flex flex-col gap-1.5">
-                      {(agent.allowedFolders ?? []).map((folder) => (
-                        <div
-                          key={folder}
-                          className="flex items-center gap-2 rounded-lg border p-2"
-                        >
-                          <span className="min-w-0 flex-1 truncate font-mono text-xs">
-                            {folder.replace(/^\/Users\/[^/]+/, "~")}
-                          </span>
-                          <span className="shrink-0 text-[10px] text-muted-foreground">
-                            trusted
-                          </span>
-                          <button
-                            aria-label={`Revoke ${folder}`}
-                            className="rounded-full p-0.5 text-muted-foreground hover:bg-accent hover:text-destructive"
-                            onClick={() =>
-                              update({
-                                allowedFolders: (agent.allowedFolders ?? []).filter(
-                                  (f) => f !== folder,
-                                ),
-                              })
-                            }
-                          >
-                            <X className="size-3" />
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  )}
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                    <FolderBox
+                      title="Private workspace"
+                      displayPath={`~/Documents/chatUI/agents/${agent.id}`}
+                      workspace
+                      onOpen={() => void openWorkspaceViewer()}
+                    />
+                    {(agent.allowedFolders ?? []).map((folder) => (
+                      <FolderBox
+                        key={folder}
+                        title={folder.split("/").filter(Boolean).pop() ?? folder}
+                        displayPath={folder.replace(/^\/Users\/[^/]+/, "~")}
+                        onOpen={() =>
+                          openFolderViewer({
+                            title: folder.split("/").filter(Boolean).pop() ?? folder,
+                            path: folder,
+                          })
+                        }
+                        onRevoke={() =>
+                          update({
+                            allowedFolders: (agent.allowedFolders ?? []).filter(
+                              (f) => f !== folder,
+                            ),
+                          })
+                        }
+                      />
+                    ))}
+                  </div>
                   <p className="text-xs text-muted-foreground">
-                    Granted folders are trusted — file access inside them runs without approval cards.
+                    Granted folders are trusted — file access inside them runs without
+                    approval cards. Click a folder to browse what the agent can see.
                   </p>
                 </SectionCard>
 
@@ -531,41 +595,127 @@ export function AgentConsole({
                 >
                   <PermissionRow
                     label="Read past chats"
-                    description={`Search and read your chat history (${sessions.length} session${sessions.length === 1 ? "" : "s"} with this agent)`}
+                    description={`Search and read this agent's own sessions (${sessions.length} session${sessions.length === 1 ? "" : "s"} with ${agent.name})`}
                     checked={agent.readChats ?? false}
                     onCheckedChange={(readChats) => update({ readChats })}
                   />
-                  <div className="flex flex-col gap-1.5">
-                    <Label>Projects</Label>
-                    {projects.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">
-                        No projects yet — create one in the Projects view.
-                      </p>
-                    ) : (
+
+                  {/* External chats & tasks from the rest of the app */}
+                  <div className="flex flex-col gap-2 rounded-lg border p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <span className="text-sm font-medium">Read other chats & tasks</span>
+                        <span className="text-xs text-muted-foreground">
+                          Chats from the Chat tab and tasks from the Agents tab that aren't {agent.name}'s own
+                        </span>
+                      </div>
+                      <ScopeControl
+                        value={agent.externalChats ?? "off"}
+                        onChange={(scope) =>
+                          update({
+                            externalChats: scope === "off" ? undefined : scope,
+                          })
+                        }
+                      />
+                    </div>
+                    {(agent.externalChats ?? "off") === "selected" && (
                       <div className="flex flex-col gap-1.5">
-                        {projects.map((project) => (
-                          <div
-                            key={project.id}
-                            className="flex items-center justify-between gap-3 rounded-lg border p-2.5"
-                          >
-                            <div className="flex min-w-0 flex-col gap-0.5">
-                              <span className="truncate text-sm font-medium">{project.name}</span>
-                              <span className="truncate font-mono text-[11px] text-muted-foreground">
-                                {project.directory ?? "no folder linked"}
-                              </span>
+                        {externalCandidates.length === 0 ? (
+                          <p className="text-xs text-muted-foreground">
+                            No other chats or tasks yet.
+                          </p>
+                        ) : (
+                          <ScrollArea className="h-44 rounded-lg border p-1">
+                            <div className="flex flex-col">
+                              {externalCandidates.map((session) => {
+                                const checked = (agent.allowedExternalSessions ?? []).includes(
+                                  session.id,
+                                );
+                                return (
+                                  <button
+                                    key={session.id}
+                                    type="button"
+                                    onClick={() =>
+                                      toggleListValue(
+                                        agent.allowedExternalSessions ?? [],
+                                        session.id,
+                                        (allowedExternalSessions) =>
+                                          update({ allowedExternalSessions }),
+                                      )
+                                    }
+                                    className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent"
+                                  >
+                                    <Checkbox
+                                      checked={checked}
+                                      tabIndex={-1}
+                                      className="pointer-events-none"
+                                    />
+                                    <span className="min-w-0 flex-1 truncate text-xs">
+                                      {session.title || "untitled"}
+                                    </span>
+                                    <span className="shrink-0 rounded-full border px-1.5 py-px text-[9px] text-muted-foreground">
+                                      {session.type === "agent" ? "Task" : "Chat"}
+                                    </span>
+                                    <span className="shrink-0 text-[10px] text-muted-foreground">
+                                      {new Date(session.updatedAt).toLocaleDateString([], {
+                                        month: "short",
+                                        day: "numeric",
+                                      })}
+                                    </span>
+                                  </button>
+                                );
+                              })}
                             </div>
-                            <Switch
-                              checked={(agent.allowedProjects ?? []).includes(project.id)}
-                              onCheckedChange={() =>
-                                toggleListValue(agent.allowedProjects ?? [], project.id, (allowedProjects) =>
-                                  update({ allowedProjects }),
-                                )
-                              }
-                            />
-                          </div>
-                        ))}
+                          </ScrollArea>
+                        )}
                       </div>
                     )}
+                  </div>
+
+                  {/* Projects: all at once, or a per-project selection */}
+                  <div className="flex flex-col gap-1.5">
+                    <PermissionRow
+                      label="All projects"
+                      description="Work in every project's folder, including ones created later"
+                      checked={agent.allProjects ?? false}
+                      onCheckedChange={(allProjects) => update({ allProjects })}
+                    />
+                    {!agent.allProjects &&
+                      (projects.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">
+                          No projects yet — create one in the Projects view.
+                        </p>
+                      ) : (
+                        <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+                          {projects.map((project) => {
+                            const checked = (agent.allowedProjects ?? []).includes(project.id);
+                            return (
+                              <button
+                                key={project.id}
+                                type="button"
+                                onClick={() =>
+                                  toggleListValue(agent.allowedProjects ?? [], project.id, (allowedProjects) =>
+                                    update({ allowedProjects }),
+                                  )
+                                }
+                                className="flex items-center gap-2 rounded-lg border p-2.5 text-left transition-colors hover:bg-accent"
+                              >
+                                <Checkbox
+                                  checked={checked}
+                                  tabIndex={-1}
+                                  className="pointer-events-none"
+                                />
+                                <div className="flex min-w-0 flex-col gap-0.5">
+                                  <span className="truncate text-xs font-medium">{project.name}</span>
+                                  <span className="truncate font-mono text-[10px] text-muted-foreground">
+                                    {project.directory?.replace(/^\/Users\/[^/]+/, "~") ?? "no folder linked"}
+                                  </span>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      ))}
                   </div>
                 </SectionCard>
               </>
@@ -695,119 +845,9 @@ export function AgentConsole({
                 </SectionCard>
               </>
             )}
-
-            {tab === "connections" && (
-              <>
-                {/* ─── Skills ─── */}
-                <SectionCard
-                  icon={<Sparkles className="size-3.5 text-muted-foreground" />}
-                  title="Skills"
-                >
-                  {installedSkills.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">
-                      No skills installed — add some in Settings → Skills.
-                    </p>
-                  ) : (
-                    <div className="flex flex-col gap-1.5">
-                      {installedSkills.map((skill) => {
-                        const { Icon, tile } = skillIcon(skill.name);
-                        const enabled = (agent.skills ?? []).includes(skill.name);
-                        return (
-                          <div
-                            key={skill.name}
-                            className="flex items-center gap-2 rounded-lg border p-2"
-                          >
-                            <span className={cn("flex size-7 shrink-0 items-center justify-center rounded-md", tile)}>
-                              <Icon className="size-4" />
-                            </span>
-                            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                              <span className="truncate text-xs font-medium">{skill.name}</span>
-                              <span className="truncate font-mono text-[10px] text-muted-foreground">
-                                {skill.path}
-                              </span>
-                            </div>
-                            <Switch
-                              checked={enabled}
-                              onCheckedChange={() =>
-                                toggleListValue(agent.skills ?? [], skill.name, (skills) =>
-                                  update({ skills }),
-                                )
-                              }
-                            />
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                  <p className="text-xs text-muted-foreground">
-                    Enabled skills auto-invoke when a task needs them — nothing loads into context until then.
-                  </p>
-                </SectionCard>
-
-                {/* ─── Connectors ─── */}
-                <SectionCard
-                  icon={<Plug className="size-3.5 text-muted-foreground" />}
-                  title="Apps & connectors"
-                >
-                  <div className="flex flex-col gap-1.5">
-                    {MCP_CATALOG.map((entry) => {
-                      const enabled = agent.connectors.includes(entry.id);
-                      return (
-                        <div
-                          key={entry.id}
-                          className="flex items-center gap-2 rounded-lg border p-2"
-                        >
-                          <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                            <span className="truncate text-xs font-medium">{entry.name}</span>
-                            <span className="truncate text-[10px] text-muted-foreground">
-                              {entry.tagline}
-                            </span>
-                          </div>
-                          <Switch
-                            checked={enabled}
-                            onCheckedChange={() =>
-                              update({
-                                connectors: enabled
-                                  ? agent.connectors.filter((c) => c !== entry.id)
-                                  : [...agent.connectors, entry.id],
-                              })
-                            }
-                          />
-                        </div>
-                      );
-                    })}
-                    {customConnectors.map((id) => (
-                      <div
-                        key={id}
-                        className="flex items-center gap-2 rounded-lg border p-2"
-                      >
-                        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                          <span className="truncate font-mono text-xs font-medium">{id}</span>
-                          <span className="text-[10px] text-muted-foreground">
-                            Custom connector
-                          </span>
-                        </div>
-                        <button
-                          aria-label={`Remove ${id}`}
-                          className="rounded-full p-0.5 text-muted-foreground hover:bg-accent hover:text-destructive"
-                          onClick={() =>
-                            update({ connectors: agent.connectors.filter((c) => c !== id) })
-                          }
-                        >
-                          <X className="size-3" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Install and sign in once in Settings → Connectors.
-                  </p>
-                </SectionCard>
-              </>
-            )}
-                </div>
-              </div>
-            </div>
+                 </div>
+               </div>
+             </div>
             <div
               className={cn(
                 "grid flex-1 transition-all delay-100 duration-500",
@@ -916,6 +956,11 @@ export function AgentConsole({
         agents={agents}
         workflow={editingWorkflow}
         defaultAgentId={agent.id}
+      />
+      <FolderViewerDialog
+        open={viewerOpen}
+        onOpenChange={setViewerOpen}
+        target={viewerTarget}
       />
     </div>
   );

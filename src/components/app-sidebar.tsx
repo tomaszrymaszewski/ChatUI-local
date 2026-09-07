@@ -42,13 +42,12 @@ import type { SettingsTab } from "@/pages/settings"
 import { Spinner } from "@/components/ui/spinner"
 
 /** Main-content panel selected for the open agent console. */
-export type AgentConsoleTab = "general" | "permissions" | "automations" | "connections"
+export type AgentConsoleTab = "general" | "access" | "automations"
 
 const AGENT_TABS: Array<[AgentConsoleTab, string, React.ReactNode]> = [
   ["general", "General", <User className="size-4" />],
-  ["permissions", "Permissions", <KeyRound className="size-4" />],
+  ["access", "Access", <KeyRound className="size-4" />],
   ["automations", "Automations", <CalendarClock className="size-4" />],
-  ["connections", "Connections", <Plug className="size-4" />],
 ]
 
 const SETTINGS_TABS: Array<[SettingsTab, string, React.ReactNode]> = [

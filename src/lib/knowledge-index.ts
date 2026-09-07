@@ -23,6 +23,7 @@ import {
   listInstalledSkills,
 } from "@/lib/skills-library";
 import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { hasToken, readMcpAuth } from "@/lib/mcp-auth";
 import { ensureMcpMigrated, isConnected } from "@/lib/mcp-store";
 import { getConnectorToolInfo, type RemoteToolSummary } from "@/lib/mcp-discovery";
 import { loadAgentDefinitions } from "@/lib/agents";
@@ -590,10 +591,14 @@ async function skillDocs(): Promise<RawSourceDoc[]> {
 async function connectorDocs(): Promise<RawSourceDoc[]> {
   await ensureMcpMigrated();
   const toolInfo = await getConnectorToolInfo().catch(() => ({} as Record<string, RemoteToolSummary[]>));
+  const authData = await readMcpAuth().catch(() => ({}));
   const docs: RawSourceDoc[] = [];
   for (const e of MCP_CATALOG) {
     const keywords = e.keywords?.length ? ` Keywords: ${e.keywords.join(", ")}.` : "";
-    const connected = isConnected(e.id);
+    // OAuth entries need a stored token from the native sign-in, not just a
+    // catalog entry, before their tools are really available.
+    const connected =
+      e.auth === "oauth" ? isConnected(e.id) && hasToken(authData, e.id) : isConnected(e.id);
     const state = connected
       ? "Connected — its mcp__ tools are available to the agent."
       : "Not connected yet.";

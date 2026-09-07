@@ -131,7 +131,13 @@ export function SuggestionCard({
         onDismiss();
       }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : `Failed to connect ${catalogEntry.name}`);
+      toast.error(
+        err instanceof Error && err.message
+          ? err.message
+          : typeof err === "string" && err
+            ? err
+            : `Failed to connect ${catalogEntry.name}`,
+      );
     } finally {
       setConnecting(false);
     }

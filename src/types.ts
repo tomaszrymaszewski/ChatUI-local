@@ -131,12 +131,18 @@ export interface AgentDefinition {
   capabilities: AgentCapabilities;
   /** Model name (from the providers list) this agent always runs on. undefined = the composer/global default. */
   model?: string;
-  /** May search & read the user's past chat sessions. */
+  /** May search & read this agent's own past chat sessions. */
   readChats?: boolean;
+  /** May read sessions that are not this agent's own (chats from the Chat tab, other agents' tasks): "all" | "selected" (undefined = off). */
+  externalChats?: "all" | "selected";
+  /** Session ids the agent may read when externalChats === "selected". */
+  allowedExternalSessions?: string[];
   /** Absolute folder paths on the user's Mac this agent may access (plus its workspace). */
   allowedFolders?: string[];
-  /** Project ids whose folders this agent may work in. */
+  /** Project ids whose folders this agent may work in (ignored when allProjects). */
   allowedProjects?: string[];
+  /** May work in every project's folder, including projects created later. */
+  allProjects?: boolean;
   /** Knowledge files/images sent with every run of this agent. */
   attachments?: AgentAttachment[];
   createdAt: string;

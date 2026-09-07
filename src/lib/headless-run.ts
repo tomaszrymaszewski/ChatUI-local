@@ -81,9 +81,12 @@ export async function runHeadlessTask(opts: {
   let allowedDirectories: string[] | undefined;
   if (agentDef) {
     workspace = await ensureAgentWorkspace(agentDef.id).catch(() => undefined);
-    const projectDirs = (agentDef.allowedProjects ?? [])
-      .map((pid) => loadProjectDirectories().find((p) => p.id === pid)?.directory)
-      .filter((d): d is string => !!d);
+    const projectRecords = loadProjectDirectories();
+    const projectDirs = agentDef.allProjects
+      ? projectRecords.map((p) => p.directory).filter((d): d is string => !!d)
+      : (agentDef.allowedProjects ?? [])
+          .map((pid) => projectRecords.find((p) => p.id === pid)?.directory)
+          .filter((d): d is string => !!d);
     allowedDirectories = [
       ...(workspace ? [workspace] : []),
       ...(agentDef.allowedFolders ?? []),
@@ -146,6 +149,8 @@ export async function runHeadlessTask(opts: {
                 workspace,
                 allowedDirectories,
                 readChats: agentDef.readChats ?? false,
+                externalChats: agentDef.externalChats,
+                allowedExternalSessions: agentDef.allowedExternalSessions,
               },
             }
           : {}),

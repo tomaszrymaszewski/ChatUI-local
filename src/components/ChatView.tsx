@@ -497,9 +497,11 @@ export function ChatView() {
     let sandbox: AgentSandbox | undefined;
     if (agentDef) {
       const workspace = await ensureAgentWorkspace(agentDef.id).catch(() => undefined);
-      const projectDirs = (agentDef.allowedProjects ?? [])
-        .map((pid) => projects.find((p) => p.id === pid)?.directory)
-        .filter((d): d is string => !!d);
+      const projectDirs = agentDef.allProjects
+        ? projects.map((p) => p.directory).filter((d): d is string => !!d)
+        : (agentDef.allowedProjects ?? [])
+            .map((pid) => projects.find((p) => p.id === pid)?.directory)
+            .filter((d): d is string => !!d);
       sandbox = {
         agentId: agentDef.id,
         workspace,
@@ -509,6 +511,8 @@ export function ChatView() {
           ...projectDirs,
         ],
         readChats: agentDef.readChats ?? false,
+        externalChats: agentDef.externalChats,
+        allowedExternalSessions: agentDef.allowedExternalSessions,
       };
     }
 
@@ -2464,12 +2468,16 @@ export function ChatView() {
                   </button>
                 )
               ) : activeAgentConsole && !activeSession ? (
-                <span className="flex max-w-xs items-center gap-2 px-1 py-0.5">
-                  <AgentAvatar seed={activeAgentConsole.id} className="size-4.5" />
-                  <span className="truncate text-sm font-medium">
-                    {activeAgentConsole.name}
+                // The General tab is the agent's profile (avatar + name +
+                // purpose header), so the top-bar name is redundant there.
+                agentConsoleTab === "general" ? null : (
+                  <span className="flex max-w-xs items-center gap-2 px-1 py-0.5">
+                    <AgentAvatar seed={activeAgentConsole.id} className="size-4.5" />
+                    <span className="truncate text-sm font-medium">
+                      {activeAgentConsole.name}
+                    </span>
                   </span>
-                </span>
+                )
               ) : isEditingTitle ? (
                 <input
                   autoFocus
@@ -3081,11 +3089,12 @@ export function ChatView() {
              />
            </div>
          ) : activeAgentConsole ? (
-           <AgentConsole
-             agent={activeAgentConsole}
-             agents={agents}
-             sessions={activeAgentSessions}
-             projects={projects}
+            <AgentConsole
+              agent={activeAgentConsole}
+              agents={agents}
+              sessions={activeAgentSessions}
+              allSessions={sessions}
+              projects={projects}
              models={allModels}
              sendOnEnter={settings.sendOnEnter}
              backgroundPattern={settings.backgroundPattern}

@@ -4,10 +4,35 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { visibleMcpServers, type McpServerEntry } from "@/lib/mcp-store";
+import { getCatalogEntry } from "@/lib/mcp-catalog";
 import { getAccessToken } from "@/lib/mcp-auth";
 
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60);
+}
+
+/**
+ * Headers derived from a stored API key. API-key connectors (e.g. Exa) collect
+ * the key into `environment` at add time, but the remote endpoint expects it
+ * on the wire — the catalog's `apiKeyHeader` names the header (raw key),
+ * defaulting to `Authorization` with a Bearer prefix.
+ */
+export function apiKeyHeadersForEntry(
+  serverName: string,
+  entry: McpServerEntry,
+): Record<string, string> {
+  const values = Object.values(entry.environment ?? {})
+    .map((v) => v.trim())
+    .filter(Boolean);
+  if (values.length === 0) return {};
+  const headerName = getCatalogEntry(serverName)?.apiKeyHeader ?? "Authorization";
+  const value = values[0] as string;
+  return {
+    [headerName]:
+      headerName.toLowerCase() === "authorization" && !/^\s*bearer\s/i.test(value)
+        ? `Bearer ${value}`
+        : value,
+  };
 }
 
 async function connectClient(entry: McpServerEntry, headers: Record<string, string>): Promise<Client> {
@@ -50,12 +75,16 @@ export async function loadMcpTools(
     if (allowedServers && !allowedServers.includes(serverName)) continue;
     if (!entry.url || !/^https?:\/\//.test(entry.url)) continue;
     try {
-      // OAuth-enabled servers: attach the Bearer token from the app's token
-      // store (written by the native browser sign-in flow) unless the entry
-      // already carries an explicit auth header.
-      const headers: Record<string, string> = { ...(entry.headers ?? {}) };
+      // API-key servers: the key collected at add time goes on the wire
+      // (explicit entry headers win over the derived ones). OAuth servers:
+      // attach the token from the app's token store (written by the native
+      // browser sign-in flow) unless the entry already carries auth.
+      const headers: Record<string, string> = {
+        ...apiKeyHeadersForEntry(serverName, entry),
+        ...(entry.headers ?? {}),
+      };
       const hasAuthHeader = Object.keys(headers).some(
-        (k) => k.toLowerCase() === "authorization",
+        (k) => k.toLowerCase() === "authorization" || k.toLowerCase() === "x-api-key",
       );
       if (!hasAuthHeader) {
         const token = await getAccessToken(serverName);
@@ -122,9 +151,10 @@ export async function listRemoteToolSummaries(
   url: string,
   token: string | null,
   timeoutMs = 8000,
+  extraHeaders: Record<string, string> = {},
 ): Promise<RemoteToolSummary[] | null> {
   const entry: McpServerEntry = { type: "remote", url, addedAt: "" };
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...extraHeaders };
   if (token) headers.Authorization = `Bearer ${token}`;
   try {
     const client = await Promise.race([

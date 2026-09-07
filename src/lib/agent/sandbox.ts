@@ -16,8 +16,12 @@ export interface AgentSandbox {
   /** The agent's private workspace dir (always allowed; also in allowedDirectories). */
   workspace?: string;
   allowedDirectories?: string[];
-  /** May search & read past chat sessions (search_chats tool). */
+  /** May search & read this agent's own past chat sessions (search_chats tool). */
   readChats?: boolean;
+  /** May read sessions that are not this agent's own: "all" | "selected" (undefined = off). */
+  externalChats?: "all" | "selected";
+  /** Session ids readable when externalChats === "selected". */
+  allowedExternalSessions?: string[];
 }
 
 function isTauri(): boolean {
@@ -91,8 +95,36 @@ export function sandboxDeniedMessage(allowed: string[]): string {
   return (
     "Access denied: that path is outside your sandbox. " +
     `You may only access: ${where}. ` +
-    "Ask the user to add the folder in your agent settings (Permissions → Folders)."
+    "Ask the user to add the folder in your agent settings (Access → Folders)."
   );
+}
+
+/** Minimal session shape shared by the store and the ChatView lists. */
+export interface ReadableSession {
+  id: string;
+  agentId?: string;
+  isTemporary?: boolean;
+}
+
+/**
+ * True when the agent may read `session` via search_chats, given its sandbox:
+ * its own past sessions need readChats; everything else (chats from the Chat
+ * tab, other agents' and standalone task sessions) is external access,
+ * granted wholesale ("all") or per session id ("selected"). Temporary
+ * sessions are never readable.
+ */
+export function isSessionReadable(
+  session: ReadableSession,
+  sandbox: AgentSandbox,
+): boolean {
+  if (session.isTemporary) return false;
+  const own = !!sandbox.agentId && session.agentId === sandbox.agentId;
+  if (own) return sandbox.readChats ?? false;
+  if (sandbox.externalChats === "all") return true;
+  if (sandbox.externalChats === "selected") {
+    return (sandbox.allowedExternalSessions ?? []).includes(session.id);
+  }
+  return false;
 }
 
 /**

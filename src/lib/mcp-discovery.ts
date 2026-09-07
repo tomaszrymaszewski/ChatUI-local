@@ -5,7 +5,12 @@
 
 import { MCP_CATALOG } from "@/lib/mcp-catalog";
 import { getAccessToken } from "@/lib/mcp-auth";
-import { listRemoteToolSummaries, type RemoteToolSummary } from "@/lib/agent/mcp";
+import { loadMcpServers } from "@/lib/mcp-store";
+import {
+  apiKeyHeadersForEntry,
+  listRemoteToolSummaries,
+  type RemoteToolSummary,
+} from "@/lib/agent/mcp";
 
 export type { RemoteToolSummary };
 
@@ -75,23 +80,39 @@ export async function getConnectorToolInfo(): Promise<Record<string, RemoteToolS
     (entry): entry is typeof entry & { install: { type: "remote"; url: string } } =>
       entry.install.type === "remote",
   );
-  const stale: Array<{ id: string; url: string; token: string | null }> = [];
+  const stale: Array<{
+    id: string;
+    url: string;
+    token: string | null;
+    extraHeaders: Record<string, string>;
+  }> = [];
   for (const entry of remote) {
     const cached = cache[entry.id];
     if (cached && isFresh(cached)) continue;
-    // apikey servers need a key whose header scheme we don't know — skip
-    // fetching and rely on the catalog text. OAuth servers need a token.
+    // OAuth servers need a token from the native sign-in flow; apikey servers
+    // need the stored key (sent in the catalog's header scheme). Either way,
+    // without credentials the listing just fails — rely on the catalog text.
     const token =
       entry.auth === "oauth" ? await getAccessToken(entry.id).catch(() => null) : null;
-    if (entry.auth === "oauth" && !token) {
+    let extraHeaders: Record<string, string> = {};
+    if (entry.auth === "apikey") {
+      const stored = loadMcpServers()[entry.id];
+      extraHeaders = stored ? apiKeyHeadersForEntry(entry.id, stored) : {};
+    }
+    if ((entry.auth === "oauth" && !token) || (entry.auth === "apikey" && Object.keys(extraHeaders).length === 0)) {
       cache[entry.id] = { tools: [], fetchedAt: Date.now(), failed: true };
       continue;
     }
-    stale.push({ id: entry.id, url: entry.install.url, token });
+    stale.push({ id: entry.id, url: entry.install.url, token, extraHeaders });
   }
 
   await mapWithConcurrency(stale, CONCURRENCY, async (item) => {
-    const tools = await listRemoteToolSummaries(item.url, item.token, FETCH_TIMEOUT_MS);
+    const tools = await listRemoteToolSummaries(
+      item.url,
+      item.token,
+      FETCH_TIMEOUT_MS,
+      item.extraHeaders,
+    );
     cache[item.id] =
       tools && tools.length > 0
         ? { tools, fetchedAt: Date.now() }

@@ -58,6 +58,14 @@ export function hasToken(data: McpAuthData, name: string): boolean {
 }
 
 /**
+ * Drop the stored tokens (and client registration) for a connector — used
+ * when the connector is removed so no credentials linger on disk.
+ */
+export async function clearMcpTokens(name: string): Promise<void> {
+  await invoke("clear_mcp_auth", { name });
+}
+
+/**
  * A usable access token for the named MCP server: the stored one when still
  * valid, a refreshed one (via the Rust command) when expired but refreshable,
  * otherwise null (the server needs a fresh sign-in).

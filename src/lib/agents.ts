@@ -13,9 +13,22 @@ export function loadAgentDefinitions(): AgentDefinition[] {
     if (!raw) return [];
     const data = JSON.parse(raw) as AgentDefinition[];
     if (!Array.isArray(data)) return [];
-    return data.filter(
+    const valid = data.filter(
       (a) => a && typeof a.id === "string" && typeof a.name === "string",
     );
+    // One-time migration: "read past chats" used to grant access to every
+    // session. After the own/external split, legacy agents keep that reach
+    // by upgrading to externalChats: "all" (users can narrow it per agent).
+    let migrated = false;
+    const next = valid.map((a) => {
+      if ((a as AgentDefinition).readChats && a.externalChats === undefined) {
+        migrated = true;
+        return { ...a, externalChats: "all" as const };
+      }
+      return a;
+    });
+    if (migrated) persistAgents(next);
+    return next;
   } catch {
     return [];
   }

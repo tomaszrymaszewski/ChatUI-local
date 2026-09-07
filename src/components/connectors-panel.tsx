@@ -14,12 +14,12 @@ import {
   Brain,
   Workflow,
   Flame,
+  Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
 import {
   Select,
@@ -58,11 +58,12 @@ import {
   MicrosoftLogo,
 } from "@/components/brand-logos";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { readMcpAuth, hasToken, beginMcpOauth, type McpAuthData } from "@/lib/mcp-auth";
+import { readMcpAuth, hasToken, beginMcpOauth, clearMcpTokens, type McpAuthData } from "@/lib/mcp-auth";
 import {
   ensureMcpMigrated,
   loadMcpServers,
   saveMcpServer,
+  removeMcpServer,
   type McpServerEntry,
 } from "@/lib/mcp-store";
 import { searchMcpRegistry, type RegistryServer } from "@/lib/mcp-registry";
@@ -87,6 +88,7 @@ const MCP_ICONS: Record<string, { Icon: IconComponent; tile: string }> = {
   github: { Icon: GithubLogo, tile: "bg-foreground/10 text-foreground" },
   vercel: { Icon: VercelLogo, tile: "bg-foreground/10 text-foreground" },
   cloudflare: { Icon: CloudflareLogo, tile: "bg-[#F38020]/10 text-[#F38020]" },
+  "cloudflare-docs": { Icon: CloudflareLogo, tile: "bg-[#F38020]/10 text-[#F38020]" },
   sentry: { Icon: SentryLogo, tile: "bg-[#6C5FC7]/10 text-[#6C5FC7]" },
   postman: { Icon: PostmanLogo, tile: "bg-[#FF6C37]/10 text-[#FF6C37]" },
   context7: { Icon: UpstashLogo, tile: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" },
@@ -134,6 +136,7 @@ export function ConnectorsPanel({
   const [mcpAuth, setMcpAuth] = useState<McpAuthData>({});
   const [authing, setAuthing] = useState<string | null>(null);
   const [adding, setAdding] = useState<string | null>(null);
+  const [uninstalling, setUninstalling] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState<McpCategory | "All">("All");
@@ -149,6 +152,7 @@ export function ConnectorsPanel({
   const [registrySearching, setRegistrySearching] = useState(false);
   const [mcpName, setMcpName] = useState("");
   const [mcpUrl, setMcpUrl] = useState("");
+  const [mcpToken, setMcpToken] = useState("");
 
   const directory = scope === "project" ? activeDirectory : null;
 
@@ -251,6 +255,26 @@ export function ConnectorsPanel({
     }
   };
 
+  const handleUninstall = async (cat: McpCatalogEntry) => {
+    setUninstalling(cat.id);
+    try {
+      // Drop the stored entry (its tools leave the agent's set immediately)
+      // and, best-effort, the sign-in tokens on disk.
+      removeMcpServer(cat.id);
+      try {
+        await clearMcpTokens(cat.id);
+      } catch {
+        /* token cleanup is best-effort */
+      }
+      toast.success(`Removed ${cat.name}`);
+    } catch {
+      toast.error(`Failed to remove ${cat.name}`);
+    } finally {
+      setUninstalling(null);
+      setTick((t) => t + 1);
+    }
+  };
+
   const handleAuth = async (name: string) => {
     const entry = mcpEntries[name];
     if (!entry) return;
@@ -273,8 +297,16 @@ export function ConnectorsPanel({
           /* keep polling */
         }
       }
-    } catch {
-      toast.error(`Failed to sign in to ${name}`);
+    } catch (err) {
+      // Surface the Rust error (e.g. "no dynamic client registration") so
+      // the user knows whether to retry or paste a personal token below.
+      toast.error(
+        err instanceof Error && err.message
+          ? `Could not sign in to ${name}: ${err.message}`
+          : typeof err === "string" && err
+            ? `Could not sign in to ${name}: ${err}`
+            : `Failed to sign in to ${name}`,
+      );
     } finally {
       setAuthing(null);
       setTick((t) => t + 1);
@@ -284,16 +316,29 @@ export function ConnectorsPanel({
   const handleAddManual = async () => {
     if (!mcpName.trim() || !mcpUrl.trim()) return;
     try {
+      // An optional personal token (Zapier's per-user MCP URL secret, a PAT,
+      // ...) is stored as an explicit auth header — no external tooling needed.
+      const rawToken = mcpToken.trim();
+      const headers =
+        rawToken.length > 0
+          ? {
+              Authorization: /^\s*bearer\s/i.test(rawToken)
+                ? rawToken.trim()
+                : `Bearer ${rawToken}`,
+            }
+          : undefined;
       await addEntry(mcpName.trim(), {
         type: "remote",
         url: mcpUrl.trim(),
         enabled: true,
+        ...(headers ? { headers } : {}),
         ...(directory ? { projectDir: directory } : {}),
         addedAt: new Date().toISOString(),
       });
       toast.success(`Added ${mcpName.trim()}`);
       setMcpName("");
       setMcpUrl("");
+      setMcpToken("");
       setTick((t) => t + 1);
     } catch {
       toast.error("Failed to add MCP");
@@ -470,26 +515,58 @@ export function ConnectorsPanel({
                       </div>
                       {installed ? (
                         needsAuth ? (
-                          <Button
-                            size="xs"
-                            variant="outline"
-                            disabled={authing === cat.id}
-                            onClick={() => handleAuth(cat.id)}
+                          <div className="flex items-center gap-1.5">
+                            <Button
+                              size="xs"
+                              variant="outline"
+                              disabled={authing === cat.id}
+                              onClick={() => handleAuth(cat.id)}
+                            >
+                              {authing === cat.id ? (
+                                <Loader2 className="size-3 animate-spin" />
+                              ) : (
+                                <ExternalLink className="size-3" />
+                              )}
+                              Sign in
+                            </Button>
+                            <Button
+                              size="icon-xs"
+                              variant="ghost"
+                              aria-label={`Remove ${cat.name}`}
+                              title="Remove"
+                              disabled={uninstalling === cat.id}
+                              onClick={() => handleUninstall(cat)}
+                              className="text-muted-foreground hover:text-destructive dark:hover:text-destructive"
+                            >
+                              {uninstalling === cat.id ? (
+                                <Loader2 className="size-3 animate-spin" />
+                              ) : (
+                                <Trash2 className="size-3" />
+                              )}
+                            </Button>
+                          </div>
+                        ) : (
+                          <button
+                            onClick={() => handleUninstall(cat)}
+                            disabled={uninstalling === cat.id}
+                            className={cn(
+                              "group inline-flex h-6 items-center gap-1 rounded-md border px-2 text-xs font-medium transition-colors",
+                              "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+                              "hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive dark:hover:text-destructive",
+                              "disabled:pointer-events-none disabled:opacity-50",
+                            )}
                           >
-                            {authing === cat.id ? (
+                            {uninstalling === cat.id ? (
                               <Loader2 className="size-3 animate-spin" />
                             ) : (
-                              <ExternalLink className="size-3" />
+                              <>
+                                <Check className="size-2.5 group-hover:hidden" />
+                                <Trash2 className="hidden size-2.5 group-hover:block" />
+                              </>
                             )}
-                            Sign in
-                          </Button>
-                        ) : (
-                          <Badge
-                            variant="secondary"
-                            className="border-emerald-500/30 bg-emerald-500/10 text-[10px] text-emerald-700 dark:text-emerald-300"
-                          >
-                            <Check className="size-2.5" /> Added
-                          </Badge>
+                            <span className="group-hover:hidden">Added</span>
+                            <span className="hidden group-hover:inline">Remove</span>
+                          </button>
                         )
                       ) : (
                         <Button
@@ -594,8 +671,19 @@ export function ConnectorsPanel({
                       />
                     </div>
                   </div>
+                  <div className="flex flex-col gap-1">
+                    <Label className="text-xs">Access token (optional)</Label>
+                    <Input
+                      value={mcpToken}
+                      onChange={(e) => setMcpToken(e.target.value)}
+                      placeholder="Paste a personal token if the provider gave you one…"
+                      type="password"
+                    />
+                  </div>
                   <p className="text-xs text-muted-foreground">
                     Remote (URL) servers only — local stdio servers cannot run in the app.
+                    Use the token field when sign-in isn't offered, e.g. a Zapier
+                    per-user MCP URL secret or any other personal access token.
                   </p>
                   <Button
                     size="sm"

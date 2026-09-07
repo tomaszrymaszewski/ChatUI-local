@@ -228,8 +228,15 @@ function buildAgentSandboxPrompt(sandbox: AgentSandbox): string {
   } else {
     lines.push(
       "- No extra folders granted yet. If you need to work on a codebase or read documents " +
-        "outside your workspace, ask the user to add the folder in your agent settings (Permissions).",
+        "outside your workspace, ask the user to add the folder in your agent settings (Access).",
     );
+  }
+  const chatAccess: string[] = [];
+  if (sandbox.readChats) chatAccess.push("your own past sessions");
+  if (sandbox.externalChats === "all") chatAccess.push("every chat and task in the app");
+  else if (sandbox.externalChats === "selected") chatAccess.push("the specific chats and tasks the user selected");
+  if (chatAccess.length > 0) {
+    lines.push(`- search_chats: you may search and read ${chatAccess.join(" and ")}.`);
   }
   lines.push(
     "- File access inside your workspace and granted folders is trusted (no approval cards); " +

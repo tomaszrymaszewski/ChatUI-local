@@ -129,4 +129,29 @@ describe("agent definitions storage", () => {
     saveAgentDefinition(sampleDef);
     expect(fn).toHaveBeenCalledTimes(1);
   });
+
+  it("migrates legacy readChats=true agents to externalChats=all (keeps their reach)", () => {
+    const saved = saveAgentDefinition({ ...sampleDef, readChats: true });
+    storage.set(
+      "chatui:agents",
+      // Wipe the migrated field to simulate a pre-split record.
+      JSON.stringify([{ ...saved, externalChats: undefined }]),
+    );
+    const all = loadAgentDefinitions();
+    expect(all[0].readChats).toBe(true);
+    expect(all[0].externalChats).toBe("all");
+    // The migration persists so it runs once, not on every load.
+    expect(JSON.parse(storage.get("chatui:agents")!)[0].externalChats).toBe("all");
+  });
+
+  it("leaves agents with externalChats already set (or readChats off) untouched", () => {
+    const saved = saveAgentDefinition({ ...sampleDef, readChats: true });
+    storage.set("chatui:agents", JSON.stringify([{ ...saved, externalChats: "selected" }]));
+    expect(loadAgentDefinitions()[0].externalChats).toBe("selected");
+
+    const off = saveAgentDefinition(sampleDef);
+    storage.set("chatui:agents", JSON.stringify([off]));
+    expect(loadAgentDefinitions()[0].externalChats).toBeUndefined();
+    expect(storage.get("chatui:agents")).toBe(JSON.stringify([off]));
+  });
 });

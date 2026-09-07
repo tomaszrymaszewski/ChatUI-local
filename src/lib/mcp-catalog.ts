@@ -33,6 +33,12 @@ export interface McpCatalogEntry {
   auth: McpAuthType;              // "oauth" | "apikey" | "none"
   /** Environment variable keys the user must provide (when auth === "apikey"). */
   envKeys?: string[];
+  /**
+   * Header the API key is sent in (when auth === "apikey"). Defaults to
+   * "Authorization" (with a Bearer prefix). Exa expects the raw key in
+   * "x-api-key".
+   */
+  apiKeyHeader?: string;
   /** Extra search keywords that the agent's search_connectors tool matches against. */
   keywords?: string[];
   install: { type: "remote"; url: string };
@@ -153,8 +159,17 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     category: "Developer",
     vendor: "Cloudflare",
     auth: "oauth",
-    install: { type: "remote", url: "https://docs.mcp.cloudflare.com/mcp" },
+    install: { type: "remote", url: "https://bindings.mcp.cloudflare.com/mcp" },
     registryName: "com.cloudflare.mcp/mcp",
+  },
+  {
+    id: "cloudflare-docs",
+    name: "Cloudflare Docs",
+    tagline: "Search Cloudflare's official documentation — free, no sign-in needed.",
+    category: "Search & Research",
+    vendor: "Cloudflare",
+    auth: "none",
+    install: { type: "remote", url: "https://docs.mcp.cloudflare.com/mcp" },
   },
   {
     id: "postman",
@@ -230,6 +245,7 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     vendor: "Exa",
     auth: "apikey",
     envKeys: ["EXA_API_KEY"],
+    apiKeyHeader: "x-api-key",
     install: { type: "remote", url: "https://mcp.exa.ai/mcp" },
     registryName: "ai.exa/exa",
   },

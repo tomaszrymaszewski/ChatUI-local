@@ -37,10 +37,17 @@ static AUTH_FLOW: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 // ─── Structs ──────────────────────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct DirEntry {
     pub name: String,
     pub path: String,
     pub display_path: String,
+    /// True when the entry is a directory (the agent-console folder viewer).
+    pub is_dir: bool,
+    /// File size in bytes (0 for directories).
+    pub size: u64,
+    /// Last-modified time as unix seconds (0 when unknown).
+    pub modified_at: i64,
 }
 
 #[derive(Serialize)]
@@ -142,6 +149,9 @@ fn create_project_directory(name: &str) -> Result<DirEntry, String> {
         name: trimmed.to_string(),
         path: project_path.to_string_lossy().to_string(),
         display_path: make_display_path(&project_path),
+        is_dir: true,
+        size: 0,
+        modified_at: 0,
     })
 }
 
@@ -162,6 +172,9 @@ fn list_project_directories() -> Result<Vec<DirEntry>, String> {
                         name,
                         path: path.to_string_lossy().to_string(),
                         display_path: make_display_path(&path),
+                        is_dir: true,
+                        size: 0,
+                        modified_at: 0,
                     });
                 }
             }
@@ -201,6 +214,9 @@ fn import_existing_directory(path: &str) -> Result<DirEntry, String> {
         name,
         path: target.to_string_lossy().to_string(),
         display_path: make_display_path(&target),
+        is_dir: true,
+        size: 0,
+        modified_at: 0,
     })
 }
 
@@ -223,6 +239,9 @@ fn create_subdirectory(parent_path: &str, name: &str) -> Result<DirEntry, String
         name: trimmed.to_string(),
         path: sub_path.to_string_lossy().to_string(),
         display_path: make_display_path(&sub_path),
+        is_dir: true,
+        size: 0,
+        modified_at: 0,
     })
 }
 
@@ -243,6 +262,9 @@ fn list_subdirectories(parent_path: &str) -> Result<Vec<DirEntry>, String> {
                         name,
                         path: path.to_string_lossy().to_string(),
                         display_path: make_display_path(&path),
+                        is_dir: true,
+                        size: 0,
+                        modified_at: 0,
                     });
                 }
             }
@@ -299,10 +321,26 @@ fn list_dir_entries(path: String) -> Result<Vec<DirEntry>, String> {
             if name.starts_with('.') {
                 continue;
             }
+            let is_dir = ep.is_dir();
+            let (size, modified_at) = entry
+                .metadata()
+                .map(|m| {
+                    let modified = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    (m.len(), modified)
+                })
+                .unwrap_or((0, 0));
             entries.push(DirEntry {
                 name,
                 path: ep.to_string_lossy().to_string(),
                 display_path: make_display_path(&ep),
+                is_dir,
+                size,
+                modified_at,
             });
         }
     }
@@ -645,6 +683,30 @@ fn read_mcp_auth() -> Result<String, String> {
     }
 }
 
+/// Delete `name`'s entry from the parsed token store, returning whether an
+/// entry was removed.
+fn remove_mcp_auth_entry(data: &mut serde_json::Value, name: &str) -> bool {
+    data.as_object_mut()
+        .map(|o| o.remove(name).is_some())
+        .unwrap_or(false)
+}
+
+/// Drop a connector's stored OAuth tokens + client registration (used when
+/// the connector is uninstalled, so no credentials linger on disk).
+#[tauri::command]
+fn clear_mcp_auth(name: String) -> Result<bool, String> {
+    let path = ensure_mcp_auth_file()?;
+    let mut data: serde_json::Value = fs::read_to_string(&path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let removed = remove_mcp_auth_entry(&mut data, &name);
+    if removed {
+        write_mcp_auth(&path, &data)?;
+    }
+    Ok(removed)
+}
+
 /// RFC 8615 / MCP-spec well-known URL: for a resource at `origin` + `path`,
 /// metadata lives at `{origin}/.well-known/{suffix}{path}` (the resource path
 /// is appended after the well-known segment; query strings are stripped by
@@ -669,9 +731,33 @@ fn get_json(
     resp.json::<serde_json::Value>().ok()
 }
 
+/// Pull the `resource_metadata` URL out of a `WWW-Authenticate: Bearer ...`
+/// challenge header (RFC 9728 §3: the server answers 401 on the MCP endpoint
+/// itself when OAuth metadata lives somewhere the well-known URLs can't
+/// guess, e.g. Zapier).
+fn parse_resource_metadata_url(header: &str) -> Option<String> {
+    let lower = header.to_lowercase();
+    let bearer = lower.find("bearer")?;
+    let rest = &header[bearer + "bearer".len()..];
+    for param in rest.split(',') {
+        let param = param.trim();
+        let (key, value) = param.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case("resource_metadata") {
+            let url = value.trim().trim_matches('"').trim().to_string();
+            if !url.is_empty() {
+                return Some(url);
+            }
+        }
+    }
+    None
+}
+
 /// Discover an MCP server's OAuth authorization metadata (MCP authorization
-/// spec): protected-resource metadata points at the authorization server,
-/// whose own well-known metadata carries the endpoints.
+/// spec): the 401 challenge on the MCP endpoint itself points at the
+/// protected-resource metadata when present (RFC 9728), otherwise the
+/// well-known URLs derived from the server URL are tried. The
+/// protected-resource metadata points at the authorization server, whose own
+/// well-known metadata carries the endpoints.
 fn discover_oauth_metadata(
     client: &reqwest::blocking::Client,
     server_url: &str,
@@ -682,15 +768,37 @@ fn discover_oauth_metadata(
     let path = url.path().trim_end_matches('/').to_string();
 
     let mut issuer = origin.clone();
-    if let Some(resource) = get_json(
-        client,
-        &well_known_url(&origin, &path, "oauth-protected-resource"),
-    ) {
-        if let Some(server) = resource
-            .pointer("/authorization_servers/0")
-            .and_then(|v| v.as_str())
-        {
-            issuer = server.to_string();
+    // Prefer the server's own 401 challenge: it names the exact
+    // protected-resource metadata document.
+    if let Ok(resp) = client.get(server_url).send() {
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(challenge) = resp.headers().get(reqwest::header::WWW_AUTHENTICATE) {
+                if let Ok(text) = challenge.to_str() {
+                    if let Some(meta_url) = parse_resource_metadata_url(text) {
+                        if let Some(resource) = get_json(client, &meta_url) {
+                            if let Some(server) = resource
+                                .pointer("/authorization_servers/0")
+                                .and_then(|v| v.as_str())
+                            {
+                                issuer = server.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if issuer == origin {
+        if let Some(resource) = get_json(
+            client,
+            &well_known_url(&origin, &path, "oauth-protected-resource"),
+        ) {
+            if let Some(server) = resource
+                .pointer("/authorization_servers/0")
+                .and_then(|v| v.as_str())
+            {
+                issuer = server.to_string();
+            }
         }
     }
 
@@ -863,6 +971,29 @@ fn store_mcp_tokens(
     write_mcp_auth(&path, &data)
 }
 
+/// Decode the `/callback?...` query of the OAuth redirect into
+/// (code, state, error). Auth codes routinely contain percent-encoded
+/// characters, so this parses with URL decoding instead of splitting raw.
+fn parse_callback_params(path: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let full = format!("http://localhost{}", path);
+    let url = match reqwest::Url::parse(&full) {
+        Ok(u) => u,
+        Err(_) => return (None, None, None),
+    };
+    let mut code: Option<String> = None;
+    let mut state: Option<String> = None;
+    let mut error: Option<String> = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            "error" => error = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+    (code, state, error)
+}
+
 /// One HTTP response line/body helper for the callback listener.
 fn write_response(mut stream: std::net::TcpStream, status: &str, body: &str) {
     use std::io::Write as _;
@@ -914,21 +1045,7 @@ fn oauth_callback_loop(
             write_response(stream, "404 Not Found", "Not found");
             continue;
         }
-        let query = path.splitn(2, '?').nth(1).unwrap_or_default();
-        let mut code: Option<String> = None;
-        let mut state: Option<String> = None;
-        let mut error: Option<String> = None;
-        for pair in query.split('&') {
-            let mut kv = pair.splitn(2, '=');
-            let key = kv.next().unwrap_or_default();
-            let value = kv.next().unwrap_or_default();
-            match key {
-                "code" => code = Some(value.to_string()),
-                "state" => state = Some(value.to_string()),
-                "error" => error = Some(value.to_string()),
-                _ => {}
-            }
-        }
+        let (code, state, error) = parse_callback_params(&path);
         if let Some(err) = error {
             let _ = err;
             write_response(
@@ -982,6 +1099,41 @@ fn oauth_callback_loop(
     }
 }
 
+/// A pre-registered public OAuth client for authorization servers that offer
+/// no dynamic registration (RFC 7591) — per the MCP authorization spec, hosts
+/// bring their own client identity for such servers. Keyed by the issuer in
+/// the discovered authorization-server metadata.
+struct StaticOauthClient {
+    client_id: &'static str,
+    client_secret: Option<&'static str>,
+    /// Registered loopback callback host (RFC 8252: the port may vary).
+    redirect_host: &'static str,
+    /// Scopes to request; replaces the AS metadata's (GitHub advertises only
+    /// "offline_access", which alone grants no API access).
+    scopes: &'static str,
+}
+
+/// The static client for an authorization server, if one is known.
+fn static_client_for(meta: &serde_json::Value) -> Option<StaticOauthClient> {
+    let issuer = meta
+        .get("issuer")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if issuer == "https://github.com/login/oauth" {
+        // The GitHub CLI's public OAuth app: its client secret is published
+        // in gh's open source and safe to embed (the flow is PKCE-protected);
+        // the registered callback is http://127.0.0.1/callback, so any
+        // loopback port on 127.0.0.1 with that path is accepted.
+        return Some(StaticOauthClient {
+            client_id: "178c6fc778ccc68e1d6a",
+            client_secret: Some("34ddeff2b558a23d38fba8a6de74f086ede1cc0b"),
+            redirect_host: "127.0.0.1",
+            scopes: "repo read:org read:user gist",
+        });
+    }
+    None
+}
+
 /// Start a native OAuth sign-in for an MCP server: discover the server's
 /// OAuth metadata, dynamically register a client (PKCE), bind the loopback
 /// callback listener, and return the authorize URL for the browser. The code
@@ -1012,7 +1164,7 @@ async fn mcp_oauth_begin(name: String, server_url: String) -> Result<String, Str
             .and_then(|v| v.as_str())
             .ok_or_else(|| "OAuth metadata missing authorization_endpoint".to_string())?
             .to_string();
-        let scopes: Vec<String> = meta
+        let mut scopes: Vec<String> = meta
             .get("scopes_supported")
             .and_then(|v| v.as_array())
             .map(|a| {
@@ -1023,47 +1175,69 @@ async fn mcp_oauth_begin(name: String, server_url: String) -> Result<String, Str
             .unwrap_or_default();
 
         // Dynamic client registration (RFC 7591) — the MCP-spec path.
-        let (client_id, client_secret) = match meta.get("registration_endpoint").and_then(|v| v.as_str()) {
-            Some(registration_endpoint) => {
-                let resp = client
-                    .post(registration_endpoint)
-                    .json(&serde_json::json!({
-                        "client_name": "ChatUI",
-                        "redirect_uris": [format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT)],
-                        "grant_types": ["authorization_code"],
-                        "response_types": ["code"],
-                        "token_endpoint_auth_method": "none",
-                    }))
-                    .send()
-                    .map_err(|e| format!("Client registration failed: {}", e))?;
-                let status = resp.status();
-                let body: serde_json::Value = resp.json().map_err(|e| format!("Bad registration response: {}", e))?;
-                if !status.is_success() {
-                    return Err(format!("Client registration rejected ({})", status));
+        // Servers without it fall back to a pre-registered public client
+        // (see static_client_for).
+        let (client_id, client_secret, redirect_uri) =
+            match meta.get("registration_endpoint").and_then(|v| v.as_str()) {
+                Some(registration_endpoint) => {
+                    let resp = client
+                        .post(registration_endpoint)
+                        .json(&serde_json::json!({
+                            "client_name": "ChatUI",
+                            "redirect_uris": [format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT)],
+                            "grant_types": ["authorization_code"],
+                            "response_types": ["code"],
+                            "token_endpoint_auth_method": "none",
+                        }))
+                        .send()
+                        .map_err(|e| format!("Client registration failed: {}", e))?;
+                    let status = resp.status();
+                    let body: serde_json::Value = resp.json().map_err(|e| format!("Bad registration response: {}", e))?;
+                    if !status.is_success() {
+                        let detail = body
+                            .get("error_description")
+                            .or_else(|| body.get("error"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown error");
+                        return Err(format!(
+                            "Client registration rejected ({}): {}",
+                            status, detail
+                        ));
+                    }
+                    let id = body
+                        .get("client_id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| "Registration response missing client_id".to_string())?
+                        .to_string();
+                    let secret = body
+                        .get("client_secret")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    (
+                        id,
+                        secret,
+                        format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT),
+                    )
                 }
-                let id = body
-                    .get("client_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| "Registration response missing client_id".to_string())?
-                    .to_string();
-                let secret = body
-                    .get("client_secret")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                (id, secret)
-            }
-            None => {
-                return Err(
-                    "This MCP server does not support dynamic client registration, which this app needs for sign-in."
-                        .to_string(),
-                )
-            }
-        };
+                None => {
+                    let sc = static_client_for(&meta).ok_or_else(|| {
+                        "This MCP server does not support dynamic client registration, which this app needs for sign-in."
+                            .to_string()
+                    })?;
+                    if !sc.scopes.is_empty() {
+                        scopes = sc.scopes.split_whitespace().map(|s| s.to_string()).collect();
+                    }
+                    (
+                        sc.client_id.to_string(),
+                        sc.client_secret.map(|s| s.to_string()),
+                        format!("http://{}:{}/callback", sc.redirect_host, MCP_OAUTH_CALLBACK_PORT),
+                    )
+                }
+            };
 
         let code_verifier = random_token(32);
         let challenge = pkce_challenge(&code_verifier);
         let state = random_token(16);
-        let redirect_uri = format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT);
 
         let mut authorize = reqwest::Url::parse(&authorization_endpoint)
             .map_err(|e| format!("Bad authorization endpoint: {}", e))?;
@@ -2536,6 +2710,76 @@ mod tests {
     }
 
     #[test]
+    fn callback_params_decode_percent_encoded_code() {
+        let (code, state, error) = super::parse_callback_params(
+            "/callback?code=abc%2Fdef%3D123&state=xyz",
+        );
+        assert_eq!(code.as_deref(), Some("abc/def=123"));
+        assert_eq!(state.as_deref(), Some("xyz"));
+        assert_eq!(error, None);
+    }
+
+    #[test]
+    fn callback_params_capture_provider_error() {
+        let (code, state, error) =
+            super::parse_callback_params("/callback?error=access_denied&state=xyz");
+        assert_eq!(code, None);
+        assert_eq!(state.as_deref(), Some("xyz"));
+        assert_eq!(error.as_deref(), Some("access_denied"));
+    }
+
+    #[test]
+    fn resource_metadata_url_prefers_challenge_value() {
+        let header = r#"Bearer resource_metadata="https://mcp.zapier.com/.well-known/oauth-protected-resource/api/v1/connect", scope="openid""#;
+        assert_eq!(
+            super::parse_resource_metadata_url(header).as_deref(),
+            Some("https://mcp.zapier.com/.well-known/oauth-protected-resource/api/v1/connect")
+        );
+    }
+
+    #[test]
+    fn resource_metadata_url_is_none_without_challenge() {
+        assert_eq!(super::parse_resource_metadata_url("Basic realm=\"x\""), None);
+        assert_eq!(super::parse_resource_metadata_url("Bearer scope=\"openid\""), None);
+    }
+
+    // Uninstalling a connector must drop only that connector's tokens, and
+    // report whether anything was removed.
+    #[test]
+    fn remove_mcp_auth_entry_drops_only_named_entry() {
+        let mut data = serde_json::json!({
+            "zapier": {"tokens": {"accessToken": "a"}},
+            "supabase": {"tokens": {"accessToken": "b"}},
+        });
+        assert!(super::remove_mcp_auth_entry(&mut data, "zapier"));
+        assert_eq!(
+            data,
+            serde_json::json!({"supabase": {"tokens": {"accessToken": "b"}}})
+        );
+        assert!(!super::remove_mcp_auth_entry(&mut data, "zapier"));
+        assert!(!super::remove_mcp_auth_entry(&mut data, "missing"));
+        // A non-object store (corrupt file) removes nothing and must not panic.
+        let mut junk = serde_json::json!("nope");
+        assert!(!super::remove_mcp_auth_entry(&mut junk, "zapier"));
+    }
+
+    // GitHub's authorization server has no dynamic registration; sign-in
+    // there rides on the pre-registered public client keyed by issuer.
+    #[test]
+    fn static_client_matches_github_issuer_only() {
+        let github = serde_json::json!({ "issuer": "https://github.com/login/oauth" });
+        let sc = super::static_client_for(&github).expect("github static client");
+        assert_eq!(sc.client_id, "178c6fc778ccc68e1d6a");
+        assert!(sc.client_secret.is_some());
+        assert_eq!(sc.redirect_host, "127.0.0.1");
+        assert!(sc.scopes.contains("repo"));
+
+        let other = serde_json::json!({ "issuer": "https://mcp.notion.com" });
+        assert!(super::static_client_for(&other).is_none());
+        assert!(super::static_client_for(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
     fn base64url_nopad_uses_url_safe_alphabet_without_padding() {
         assert_eq!(super::base64url_nopad(&[]), "");
         assert_eq!(super::base64url_nopad(&[0x00]), "AA");
@@ -2762,6 +3006,57 @@ mod tests {
         assert!(resp.body.contains("<item>"), "Bing RSS should contain result items");
     }
 
+    // Live smoke test (network) for MCP OAuth metadata discovery against every
+    // OAuth connector in the frontend catalog (src/lib/mcp-catalog.ts) — run
+    // explicitly: cargo test -- --ignored discover_oauth_metadata_catalog_live.
+    // Keeps the discovery chain (401 challenge → protected-resource metadata →
+    // authorization-server metadata) honest for each vendor.
+    #[test]
+    #[ignore]
+    fn discover_oauth_metadata_catalog_live() {
+        let urls = [
+            "https://mcp.notion.com/mcp",
+            "https://ai.todoist.net/mcp",
+            "https://mcp.linear.app/mcp",
+            "https://mcp.atlassian.com/v1/mcp",
+            "https://mcp.zapier.com/api/v1/connect",
+            "https://mcp.airtable.com/mcp",
+            "https://mcp.figma.com/mcp",
+            "https://mcp.webflow.com/mcp",
+            "https://api.githubcopilot.com/mcp/",
+            "https://mcp.vercel.com",
+            "https://bindings.mcp.cloudflare.com/mcp",
+            "https://mcp.postman.com/mcp",
+            "https://mcp.supabase.com/mcp",
+            "https://mcp.prisma.io/sse",
+            "https://huggingface.co/mcp",
+            "https://mcp.stripe.com",
+            "https://mcp.paypal.com/mcp",
+        ];
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap();
+        let mut failed = Vec::new();
+        for url in urls {
+            match super::discover_oauth_metadata(&client, url) {
+                Ok(meta) => {
+                    let token = meta.get("token_endpoint").and_then(|v| v.as_str());
+                    let authz = meta.get("authorization_endpoint").and_then(|v| v.as_str());
+                    println!("ok   {:45} token={:?} authz={:?}", url, token, authz);
+                    if token.is_none() || authz.is_none() {
+                        failed.push(url);
+                    }
+                }
+                Err(e) => {
+                    println!("FAIL {:45} {}", url, e);
+                    failed.push(url);
+                }
+            }
+        }
+        assert!(failed.is_empty(), "discovery failed for: {:?}", failed);
+    }
+
     // ── Knowledge index (sqlite-vec) ──────────────────────────────────────
 
     // The frontend reads hit.sourceType / hit.sourceRef / hit.contentHash
@@ -2979,6 +3274,7 @@ pub fn run() {
             opencode_serve_in_dir,
             mcp_oauth_begin,
             read_mcp_auth,
+            clear_mcp_auth,
             refresh_mcp_token,
             detect_coding_agents,
             http_fetch,
