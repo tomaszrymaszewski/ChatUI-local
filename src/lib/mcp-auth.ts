@@ -1,11 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 
 /**
- * Read access to opencode's MCP OAuth token store
- * (~/.local/share/opencode/mcp-auth.json). The `opencode mcp auth` browser
- * flow writes tokens here; the langchain agent's own MCP connections (see
- * src/lib/agent/mcp.ts) read them back so connectors work without a running
- * opencode server. Refresh of expired tokens happens in Rust
+ * Access to the app's MCP OAuth token store
+ * (~/Documents/chatUI/mcp/auth.json, migrated once from opencode's old
+ * shared store). The native browser flow — started with beginMcpOauth —
+ * writes tokens here; the langchain agent's own MCP connections (see
+ * src/lib/agent/mcp.ts) read them back so connectors work without any
+ * external tooling. Refresh of expired tokens happens in Rust
  * (`refresh_mcp_token`) because token endpoints rarely send CORS headers.
  */
 
@@ -40,6 +41,16 @@ export async function readMcpAuth(): Promise<McpAuthData> {
   } catch {
     return {};
   }
+}
+
+/**
+ * Start a native OAuth sign-in for an MCP server: resolves the authorize URL
+ * (the Rust side registers a client, generates PKCE, and binds the callback
+ * listener) and returns it — open it in the browser. Completion is observed
+ * by polling readMcpAuth.
+ */
+export async function beginMcpOauth(name: string, serverUrl: string): Promise<string> {
+  return invoke<string>("mcp_oauth_begin", { name, serverUrl });
 }
 
 export function hasToken(data: McpAuthData, name: string): boolean {

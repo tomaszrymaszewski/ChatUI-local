@@ -88,7 +88,7 @@ export interface AgentSessionOptions {
   enableFileTools?: boolean;
   /** Restrict loaded skills to these names (sandboxed agents). undefined = all installed. */
   skillNames?: string[];
-  /** Restrict MCP connectors to these opencode.json config keys. undefined = all enabled; [] = none. */
+  /** Restrict MCP connectors to these connector store keys. undefined = all enabled; [] = none. */
   mcpNames?: string[];
   /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
   sandbox?: AgentSandbox;
@@ -140,7 +140,9 @@ Skills and connectors — proactive discovery:
   kind=skill to show an actionable install card.
 - Similarly, when the user wants to interact with an external app (email, calendar, docs, project
   tracker, etc.) and no matching connector is connected, call search_connectors to find one. If a
-  match is found and not connected, call suggest with kind=connector. For Google Workspace (Gmail,
+  match is found and not connected, call suggest with kind=connector — the card lets the user
+  connect and sign in with one click. Connectors that surface in the "Relevant knowledge" context
+  but aren't connected yet work the same way. For Google Workspace (Gmail,
   Google Calendar, Google Docs, Drive) and Microsoft 365 (Outlook, Excel, Word), the Zapier
   connector covers all of them — search for "gmail", "office", or "google" to find it.
 - Never suggest something that is already installed or connected (the search results show status).
@@ -165,7 +167,9 @@ Working style:
 - Use web_search / web_fetch for anything current or external. Read installed skills under
   /skills/ when a task matches one.
 - When a task would benefit from a skill or connector the user doesn't have yet, find it with
-  search_skills / search_connectors and propose it with the suggest tool.
+  search_skills / search_connectors and propose it with the suggest tool. Connectors surfaced in
+  the "Relevant knowledge" context that aren't connected yet can be proposed the same way — the
+  suggestion card lets the user connect and sign in with one click.
 - Connected external apps are available as mcp__… tools.
 - Be transparent: say what you are about to do, and report what you did.
 `.trim();
@@ -179,9 +183,10 @@ Local execution:
 - run_python runs Python for calculations and data processing.
 
 Coding tasks:
-- NEVER write application code files yourself for real coding work. Delegate to the coding agent
-  with run_coding_task: it runs opencode (a local coding agent) inside a project folder and
-  returns its summary and diff.
+- NEVER write application code files yourself for real coding work. Delegate to a local coding
+  agent with run_coding_task: it detects which of opencode, Claude Code, or Codex is installed,
+  asks the user to pick one when several are installed, and returns the agent's output. When
+  none is installed, do the work yourself with your own file and shell tools instead.
 - ALWAYS confirm the project folder with the user via request_structured_input (use a 'directory'
   field so they get a folder picker) before the first run_coding_task in a task, then reuse that
   folder.

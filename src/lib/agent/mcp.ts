@@ -3,14 +3,14 @@ import { DynamicStructuredTool, type StructuredTool } from "langchain";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { readOpencodeConfig, getMcpEntries, type McpEntry } from "@/lib/opencode-config";
+import { visibleMcpServers, type McpServerEntry } from "@/lib/mcp-store";
 import { getAccessToken } from "@/lib/mcp-auth";
 
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60);
 }
 
-async function connectClient(entry: McpEntry, headers: Record<string, string>): Promise<Client> {
+async function connectClient(entry: McpServerEntry, headers: Record<string, string>): Promise<Client> {
   const client = new Client({ name: "chatui", version: "0.1.0" });
   const url = new URL(entry.url!);
   try {
@@ -39,27 +39,20 @@ export interface McpToolsResult {
 
 export async function loadMcpTools(
   projectDir?: string | null,
-  /** Restrict to these opencode.json config keys (sandboxed agents). undefined = all enabled; [] = none. */
+  /** Restrict to these connector store keys (sandboxed agents). undefined = all enabled; [] = none. */
   allowedServers?: string[],
 ): Promise<McpToolsResult> {
   const tools: StructuredTool[] = [];
   const clients: Client[] = [];
-  let config;
-  try {
-    config = await readOpencodeConfig(projectDir);
-  } catch {
-    return { tools, dispose: async () => {} };
-  }
-  const entries = Object.entries(getMcpEntries(config));
+  const entries = visibleMcpServers(projectDir);
 
-  for (const [serverName, entry] of entries) {
-    if (entry.enabled === false) continue;
+  for (const [serverName, entry] of Object.entries(entries)) {
     if (allowedServers && !allowedServers.includes(serverName)) continue;
     if (!entry.url || !/^https?:\/\//.test(entry.url)) continue;
     try {
-      // OAuth-enabled servers: attach the Bearer token from the shared
-      // mcp-auth.json store (written by the `opencode mcp auth` browser
-      // flow) unless the config already carries an explicit auth header.
+      // OAuth-enabled servers: attach the Bearer token from the app's token
+      // store (written by the native browser sign-in flow) unless the entry
+      // already carries an explicit auth header.
       const headers: Record<string, string> = { ...(entry.headers ?? {}) };
       const hasAuthHeader = Object.keys(headers).some(
         (k) => k.toLowerCase() === "authorization",
@@ -112,4 +105,46 @@ export async function loadMcpTools(
       await Promise.allSettled(clients.map((c) => c.close()));
     },
   };
+}
+
+export interface RemoteToolSummary {
+  name: string;
+  description: string;
+}
+
+/**
+ * Best-effort tool listing for a remote MCP server — used by the knowledge
+ * indexer so the vector DB carries detailed, tool-level connector
+ * descriptions. Returns null when the server is unreachable or refuses
+ * unauthenticated listing.
+ */
+export async function listRemoteToolSummaries(
+  url: string,
+  token: string | null,
+  timeoutMs = 8000,
+): Promise<RemoteToolSummary[] | null> {
+  const entry: McpServerEntry = { type: "remote", url, addedAt: "" };
+  const headers: Record<string, string> = {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  try {
+    const client = await Promise.race([
+      connectClient(entry, headers),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("MCP connect timeout")), timeoutMs),
+      ),
+    ]);
+    try {
+      const { tools } = await client.listTools();
+      return tools
+        .map((t) => ({
+          name: t.name,
+          description: (t.description ?? t.name).replace(/\s+/g, " ").trim(),
+        }))
+        .filter((t) => t.name);
+    } finally {
+      await client.close().catch(() => {});
+    }
+  } catch {
+    return null;
+  }
 }

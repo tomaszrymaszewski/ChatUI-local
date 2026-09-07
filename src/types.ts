@@ -126,7 +126,7 @@ export interface AgentDefinition {
   systemPrompt: string;
   /** Installed skill names this agent may use. */
   skills: string[];
-  /** Connector config keys (opencode.json mcp.<id>) this agent may use. */
+  /** Connector ids (the app's connector store) this agent may use. */
   connectors: string[];
   capabilities: AgentCapabilities;
   /** Model name (from the providers list) this agent always runs on. undefined = the composer/global default. */
@@ -181,6 +181,27 @@ export type BackgroundPattern = "none" | "lines" | "plus" | "dots";
 
 /** How agent-mode tasks may run terminal commands on the user's machine. */
 export type TerminalApproval = "ask" | "task" | "auto";
+
+/** Optional OpenAI-compatible /v1/embeddings endpoint for the knowledge index. */
+export interface EmbeddingEndpointConfig {
+  /** e.g. "https://api.openai.com/v1" or "http://localhost:11434/v1" — /embeddings is appended. */
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+}
+
+/**
+ * Which user-data source types the knowledge index may embed and expose to
+ * the agent (skills and connectors are ALWAYS indexed — no toggles).
+ * Disabling a type removes its docs from the index and hides them from both
+ * auto-injection and the search_knowledge tool.
+ */
+export interface KnowledgeSourceToggles {
+  chats: boolean;
+  files: boolean;
+  images: boolean;
+  memories: boolean;
+}
 
 /** When a scheduled run fires. */
 export type ScheduleCadence = {
@@ -244,4 +265,8 @@ export interface UserSettings {
   embeddingModel: string;
   backgroundPattern: BackgroundPattern;
   terminalApproval: TerminalApproval;
+  /** Embedder for the knowledge index; null = the local model above. */
+  embeddingEndpoint: EmbeddingEndpointConfig | null;
+  knowledgeEnabled: boolean;
+  knowledgeSources: KnowledgeSourceToggles;
 }

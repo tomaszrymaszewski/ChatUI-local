@@ -1,5 +1,5 @@
 import { useMemo, useState } from "react";
-import { ArrowUp, Check, Plus, SquarePen } from "lucide-react";
+import { ArrowUp, Check, Plus } from "lucide-react";
 import type { AgentDefinition, ChatSession } from "@/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import {
@@ -170,44 +170,6 @@ export function AgentDashboard({
                           </span>
                         </div>
                       </div>
-                      <div className="flex flex-col gap-1">
-                        {agentSessions.length === 0 ? (
-                          <span className="text-xs italic text-muted-foreground">
-                            No tasks yet
-                          </span>
-                        ) : (
-                          agentSessions.slice(0, 3).map((session) => {
-                            const isRunning = runningIds?.has(session.id);
-                            return (
-                              <button
-                                key={session.id}
-                                type="button"
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  onSelectSession(session.id);
-                                }}
-                                className={cn(
-                                  "flex min-w-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-left text-xs transition-colors hover:bg-accent",
-                                  isRunning
-                                    ? "font-medium text-foreground"
-                                    : "text-muted-foreground",
-                                )}
-                                title={session.title}
-                              >
-                                {isRunning ? (
-                                  <Spinner className="size-3 shrink-0" />
-                                ) : (
-                                  <SquarePen className="size-3 shrink-0" />
-                                )}
-                                <span className="truncate">{session.title}</span>
-                                <span className="ml-auto shrink-0 text-[10px]">
-                                  {formatWhen(session.updatedAt)}
-                                </span>
-                              </button>
-                            );
-                          })
-                        )}
-                      </div>
                       <div className="mt-auto flex items-center justify-between pt-1 text-[10px] text-muted-foreground/80">
                         <span>
                           {last
@@ -220,6 +182,70 @@ export function AgentDashboard({
                           </span>
                         )}
                       </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          {/* ─── Recent sessions ─── */}
+          <section className="mt-6 flex flex-col gap-3">
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-semibold">Recent sessions</h2>
+              <span className="text-xs text-muted-foreground">
+                {sessions.length === 0
+                  ? "nothing yet"
+                  : `${sessions.length} session${sessions.length === 1 ? "" : "s"}`}
+              </span>
+            </div>
+            {sessions.length > 0 && (
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                {sessions.slice(0, 9).map((session) => {
+                  const agent = agents.find((a) => a.id === session.agentId) ?? null;
+                  const isRunning = runningIds?.has(session.id) ?? false;
+                  return (
+                    <div
+                      key={session.id}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => onSelectSession(session.id)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.preventDefault();
+                          onSelectSession(session.id);
+                        }
+                      }}
+                      className="relative flex cursor-pointer flex-col gap-3 rounded-xl border bg-card p-4 pr-9 transition-colors hover:border-foreground/20 hover:bg-muted/50"
+                    >
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <span
+                          className="truncate text-sm font-semibold leading-tight"
+                          title={session.title}
+                        >
+                          {session.title}
+                        </span>
+                        <span className="truncate text-xs leading-snug text-muted-foreground">
+                          {agent ? agent.name : "Session"}
+                        </span>
+                      </div>
+                      <div className="mt-auto flex items-center pt-1 text-[10px] text-muted-foreground/80">
+                        <span>Updated {formatWhen(session.updatedAt)}</span>
+                      </div>
+                      {agent && (
+                        <div className="absolute bottom-2.5 right-2.5">
+                          <AgentAvatar
+                            seed={agent.id}
+                            className="size-5"
+                            title={agent.name}
+                          />
+                          {isRunning && (
+                            <span className="absolute -right-1 -top-1 flex size-3 items-center justify-center rounded-full bg-emerald-500 text-emerald-50">
+                              <Spinner className="size-2" />
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </div>
                   );
                 })}

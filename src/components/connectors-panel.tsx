@@ -57,18 +57,14 @@ import {
   PaypalLogo,
   MicrosoftLogo,
 } from "@/components/brand-logos";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { readMcpAuth, hasToken, beginMcpOauth, type McpAuthData } from "@/lib/mcp-auth";
 import {
-  addMcpServer,
-  runOpendcodeMcpAuth,
-  getDefaultConfig,
-} from "@/lib/opencode";
-import {
-  readOpencodeConfig,
-  getMcpEntries,
-  setMcpEntry,
-  type McpEntry,
-} from "@/lib/opencode-config";
-import { readMcpAuth, hasToken, type McpAuthData } from "@/lib/mcp-auth";
+  ensureMcpMigrated,
+  loadMcpServers,
+  saveMcpServer,
+  type McpServerEntry,
+} from "@/lib/mcp-store";
 import { searchMcpRegistry, type RegistryServer } from "@/lib/mcp-registry";
 import {
   MCP_CATALOG,
@@ -129,15 +125,12 @@ function authLabel(entry: McpCatalogEntry): string {
 }
 
 export function ConnectorsPanel({
-  serving,
   activeDirectory,
 }: {
-  serving: boolean;
   activeDirectory: string | null;
 }) {
-  const config = useMemo(() => getDefaultConfig(), []);
   const [scope, setScope] = useState<"global" | "project">("global");
-  const [mcpEntries, setMcpEntries] = useState<Record<string, McpEntry>>({});
+  const [mcpEntries, setMcpEntries] = useState<Record<string, McpServerEntry>>({});
   const [mcpAuth, setMcpAuth] = useState<McpAuthData>({});
   const [authing, setAuthing] = useState<string | null>(null);
   const [adding, setAdding] = useState<string | null>(null);
@@ -155,19 +148,25 @@ export function ConnectorsPanel({
   const [registryResults, setRegistryResults] = useState<RegistryServer[]>([]);
   const [registrySearching, setRegistrySearching] = useState(false);
   const [mcpName, setMcpName] = useState("");
-  const [mcpType, setMcpType] = useState<"remote" | "local">("remote");
   const [mcpUrl, setMcpUrl] = useState("");
-  const [mcpCommand, setMcpCommand] = useState("");
 
   const directory = scope === "project" ? activeDirectory : null;
 
   const refresh = useCallback(async () => {
-    const configObj = await readOpencodeConfig(directory);
-    setMcpEntries(getMcpEntries(configObj));
-    // Sign-in status comes from the shared token store on disk — no running
-    // opencode server needed (the app no longer keeps one connected).
+    await ensureMcpMigrated();
+    const all = loadMcpServers();
+    // Scope filter: global entries everywhere, project entries only in
+    // their project.
+    const scoped: Record<string, McpServerEntry> = {};
+    for (const [name, entry] of Object.entries(all)) {
+      if (scope === "project" ? entry.projectDir === activeDirectory : !entry.projectDir) {
+        scoped[name] = entry;
+      }
+    }
+    setMcpEntries(scoped);
+    // Sign-in status comes from the token store on disk.
     setMcpAuth(await readMcpAuth());
-  }, [directory]);
+  }, [activeDirectory, scope]);
 
   useEffect(() => {
     void refresh();
@@ -190,15 +189,8 @@ export function ConnectorsPanel({
 
   const installedIds = useMemo(() => new Set(Object.keys(mcpEntries)), [mcpEntries]);
 
-  const addEntry = async (name: string, entry: McpEntry) => {
-    await setMcpEntry(directory, name, entry);
-    if (serving) {
-      try {
-        await addMcpServer(config, { name, config: entry as never }, directory ?? undefined);
-      } catch {
-        /* config write still persists */
-      }
-    }
+  const addEntry = async (name: string, entry: McpServerEntry) => {
+    saveMcpServer(name, entry);
   };
 
   const handleAddCatalog = async (cat: McpCatalogEntry) => {
@@ -210,10 +202,13 @@ export function ConnectorsPanel({
     }
     setAdding(cat.id);
     try {
-      const entry: McpEntry =
-        cat.install.type === "remote"
-          ? { type: "remote", url: cat.install.url, enabled: true }
-          : { type: "local", command: cat.install.command, enabled: true };
+      const entry: McpServerEntry = {
+        type: "remote",
+        url: cat.install.url,
+        enabled: true,
+        ...(directory ? { projectDir: directory } : {}),
+        addedAt: new Date().toISOString(),
+      };
       await addEntry(cat.id, entry);
       toast.success(`Added ${cat.name}`);
       setTick((t) => t + 1);
@@ -236,10 +231,14 @@ export function ConnectorsPanel({
     }
     setAdding(apikeyTarget.id);
     try {
-      const entry: McpEntry =
-        apikeyTarget.install.type === "remote"
-          ? { type: "remote", url: apikeyTarget.install.url, enabled: true, environment: env }
-          : { type: "local", command: apikeyTarget.install.command, enabled: true, environment: env };
+      const entry: McpServerEntry = {
+        type: "remote",
+        url: apikeyTarget.install.url,
+        enabled: true,
+        environment: env,
+        ...(directory ? { projectDir: directory } : {}),
+        addedAt: new Date().toISOString(),
+      };
       await addEntry(apikeyTarget.id, entry);
       toast.success(`Added ${apikeyTarget.name}`);
       setApikeyTarget(null);
@@ -253,11 +252,16 @@ export function ConnectorsPanel({
   };
 
   const handleAuth = async (name: string) => {
+    const entry = mcpEntries[name];
+    if (!entry) return;
     setAuthing(name);
     try {
-      await runOpendcodeMcpAuth(name);
-      // The browser flow writes tokens to mcp-auth.json when done; poll that
-      // store (not the opencode server) for up to ~5 minutes.
+      // Native OAuth flow: the Rust side registers a client, binds the
+      // callback listener, and returns the authorize URL for the browser.
+      const url = await beginMcpOauth(name, entry.url);
+      await openUrl(url);
+      // The browser flow writes tokens to the store when done; poll it
+      // for up to ~5 minutes.
       for (let i = 0; i < 150; i++) {
         await new Promise((r) => setTimeout(r, 2000));
         try {
@@ -278,17 +282,18 @@ export function ConnectorsPanel({
   };
 
   const handleAddManual = async () => {
-    if (!mcpName.trim()) return;
-    const entry: McpEntry =
-      mcpType === "remote"
-        ? { type: "remote", url: mcpUrl.trim(), enabled: true }
-        : { type: "local", command: mcpCommand.trim().split(/\s+/).filter(Boolean), enabled: true };
+    if (!mcpName.trim() || !mcpUrl.trim()) return;
     try {
-      await addEntry(mcpName.trim(), entry);
+      await addEntry(mcpName.trim(), {
+        type: "remote",
+        url: mcpUrl.trim(),
+        enabled: true,
+        ...(directory ? { projectDir: directory } : {}),
+        addedAt: new Date().toISOString(),
+      });
       toast.success(`Added ${mcpName.trim()}`);
       setMcpName("");
       setMcpUrl("");
-      setMcpCommand("");
       setTick((t) => t + 1);
     } catch {
       toast.error("Failed to add MCP");
@@ -297,13 +302,21 @@ export function ConnectorsPanel({
 
   const handleAddFromRegistry = async (server: RegistryServer) => {
     if (!server.id) return;
+    if (!server.remoteUrl) {
+      // Local (stdio) servers cannot run in the app's webview.
+      toast.error("Only remote (URL) MCP servers can be used in the app.");
+      return;
+    }
     const name = server.id.replace(/[/.]/g, "-").replace(/^-+|-+$/g, "");
     if (!name) return;
-    const entry: McpEntry = server.remoteUrl
-      ? { type: "remote", url: server.remoteUrl, enabled: true }
-      : { type: "local", command: ["npx", "-y", server.packageName ?? name], enabled: true };
     try {
-      await addEntry(name, entry);
+      await addEntry(name, {
+        type: "remote",
+        url: server.remoteUrl,
+        enabled: true,
+        ...(directory ? { projectDir: directory } : {}),
+        addedAt: new Date().toISOString(),
+      });
       toast.success(`Added ${server.title || name}`);
       setTick((t) => t + 1);
     } catch {
@@ -355,7 +368,7 @@ export function ConnectorsPanel({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="global">All projects (~/.config)</SelectItem>
+                  <SelectItem value="global">All sessions (app-wide)</SelectItem>
                   <SelectItem value="project" disabled={!activeDirectory}>
                     {activeDirectory
                       ? `This project (${activeDirectory.replace(/.*\//, "")})`
@@ -573,40 +586,20 @@ export function ConnectorsPanel({
                       />
                     </div>
                     <div className="flex flex-col gap-1">
-                      <Label className="text-xs">Type</Label>
-                      <Select
-                        value={mcpType}
-                        onValueChange={(v) => setMcpType(v as "remote" | "local")}
-                      >
-                        <SelectTrigger size="sm">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="remote">Remote (URL)</SelectItem>
-                          <SelectItem value="local">Local (command)</SelectItem>
-                        </SelectContent>
-                      </Select>
+                      <Label className="text-xs">URL</Label>
+                      <Input
+                        value={mcpUrl}
+                        onChange={(e) => setMcpUrl(e.target.value)}
+                        placeholder="https://mcp.example.com/mcp"
+                      />
                     </div>
                   </div>
-                  {mcpType === "remote" ? (
-                    <Input
-                      value={mcpUrl}
-                      onChange={(e) => setMcpUrl(e.target.value)}
-                      placeholder="https://mcp.example.com/mcp"
-                    />
-                  ) : (
-                    <Input
-                      value={mcpCommand}
-                      onChange={(e) => setMcpCommand(e.target.value)}
-                      placeholder="npx -y @modelcontextprotocol/server-foo"
-                    />
-                  )}
+                  <p className="text-xs text-muted-foreground">
+                    Remote (URL) servers only — local stdio servers cannot run in the app.
+                  </p>
                   <Button
                     size="sm"
-                    disabled={
-                      !mcpName.trim() ||
-                      (mcpType === "remote" ? !mcpUrl.trim() : !mcpCommand.trim())
-                    }
+                    disabled={!mcpName.trim() || !mcpUrl.trim()}
                     onClick={handleAddManual}
                   >
                     <Plus className="size-3.5" /> Add MCP

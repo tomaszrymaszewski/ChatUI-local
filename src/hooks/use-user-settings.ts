@@ -4,6 +4,13 @@ import type { UserSettings } from "@/types";
 const STORAGE_KEY = "chatui:settings";
 const SETTINGS_EVENT = "chatui:settings-changed";
 
+const DEFAULT_KNOWLEDGE_SOURCES: UserSettings["knowledgeSources"] = {
+  chats: true,
+  files: true,
+  images: true,
+  memories: true,
+};
+
 const DEFAULT_SETTINGS: UserSettings = {
   defaultModel: null,
   sendOnEnter: true,
@@ -16,6 +23,9 @@ const DEFAULT_SETTINGS: UserSettings = {
   embeddingModel: "Xenova/all-MiniLM-L6-v2",
   backgroundPattern: "dots",
   terminalApproval: "ask",
+  embeddingEndpoint: null,
+  knowledgeEnabled: true,
+  knowledgeSources: DEFAULT_KNOWLEDGE_SOURCES,
 };
 
 function loadSettings(): UserSettings {
@@ -23,7 +33,9 @@ function loadSettings(): UserSettings {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return DEFAULT_SETTINGS;
     const data = JSON.parse(raw) as Partial<UserSettings>;
-    return { ...DEFAULT_SETTINGS, ...data };
+    const merged = { ...DEFAULT_SETTINGS, ...data };
+    merged.knowledgeSources = { ...DEFAULT_KNOWLEDGE_SOURCES, ...data.knowledgeSources };
+    return merged;
   } catch {
     return DEFAULT_SETTINGS;
   }

@@ -12,6 +12,7 @@ import {
   chunkText,
 } from "@/lib/files";
 import { embed, embedQuery, cosineSimilarity } from "@/lib/embeddings";
+import { searchKnowledgeIndex } from "@/lib/knowledge-index";
 import { getModelCapabilities } from "@/lib/model-capabilities";
 import { getFileBlob, getFileText, setFileText } from "@/lib/attachment-store";
 
@@ -35,15 +36,28 @@ const MAX_SCANNED_PAGES = 10;/**
  * Build the text context for one extracted document: inlined when small,
  * chunked + embedded + top-K retrieved when large. Shared by the live send
  * path and the history-replay/project-context paths (which pass cached text).
+ * When the document is already embedded in the knowledge index (storageId
+ * known), ranking reuses the indexed chunks instead of re-embedding them.
  */
 export async function documentTextContext(
   name: string,
   text: string,
   query: string,
+  storageId?: string,
 ): Promise<string> {
   if (!text) return "";
   if (text.length <= INLINE_THRESHOLD) {
     return `\n\n--- ${name} ---\n${text.slice(0, MAX_INLINE_CHARS)}`;
+  }
+  if (storageId) {
+    const hits = await searchKnowledgeIndex(query || name, {
+      limit: RAG_TOP_K,
+      sourceTypes: ["file", "image"],
+      sourceRefs: [storageId],
+    });
+    if (hits.length > 0) {
+      return `\n\n--- ${name} (relevant excerpts) ---\n${hits.map((h) => h.text).join("\n…\n")}`;
+    }
   }
   const chunks = chunkText(text);
   const chunkEmbeds = await embed(chunks);
@@ -194,7 +208,7 @@ export async function rebuildAttachmentContent(
       }
       continue;
     }
-    docContext += await documentTextContext(a.name, text, message.content);
+    docContext += await documentTextContext(a.name, text, message.content, a.storageId);
   }
 
   if (imageUrls.length === 0 && !docContext) return null;
@@ -261,7 +275,7 @@ export async function buildProjectFilesContext(
       if (text) void setFileText(f.storageId, text);
     }
     if (!text) continue;
-    const ctx = await documentTextContext(f.name, text, query);
+    const ctx = await documentTextContext(f.name, text, query, f.storageId);
     if (ctx) {
       result.text += ctx;
       used += ctx.length;

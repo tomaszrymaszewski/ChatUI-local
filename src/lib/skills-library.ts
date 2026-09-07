@@ -306,6 +306,68 @@ export async function installCuratedSkill(
   }
 }
 
+// ─── Curated skill content cache (full SKILL.md bodies, fetched once) ──────
+
+const CURATED_CONTENT_KEY = "chatui:knowledge:curated-skills";
+const CURATED_CONTENT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+interface CuratedContentEntry {
+  content: string;
+  fetchedAt: number;
+}
+
+function readCuratedContentCache(): Record<string, CuratedContentEntry> {
+  try {
+    const raw = localStorage.getItem(CURATED_CONTENT_KEY);
+    if (!raw) return {};
+    return JSON.parse(raw) as Record<string, CuratedContentEntry>;
+  } catch {
+    return {};
+  }
+}
+
+/** Cached full SKILL.md body of a curated skill (null before first fetch). */
+export function getCuratedSkillContent(name: string): string | null {
+  const entry = readCuratedContentCache()[name];
+  return entry?.content ?? null;
+}
+
+/**
+ * One-time background fetch of every curated skill's SKILL.md from GitHub so
+ * the full instructions are searchable (and retrievable via RAG) before any
+ * install. Fresh cache entries are kept for ~30 days; failures are silent
+ * and retried on the next launch.
+ */
+export async function ensureCuratedSkillContent(): Promise<void> {
+  const cache = readCuratedContentCache();
+  const pending = CURATED_SKILLS.filter((s) => {
+    const cached = cache[s.name];
+    return !cached?.content || Date.now() - cached.fetchedAt > CURATED_CONTENT_TTL_MS;
+  });
+  if (pending.length === 0) return;
+  let changed = false;
+  for (const skill of pending) {
+    try {
+      const url = `https://raw.githubusercontent.com/${skill.repo}/main/${skill.dir}/SKILL.md`;
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const content = await res.text();
+      if (!content.trim()) continue;
+      cache[skill.name] = { content, fetchedAt: Date.now() };
+      changed = true;
+    } catch {
+      // offline / rate-limited — retry next launch
+    }
+  }
+  if (changed) {
+    try {
+      localStorage.setItem(CURATED_CONTENT_KEY, JSON.stringify(cache));
+    } catch {
+      // ignore quota errors
+    }
+  }
+}
+
 // ─── Chat integration: load installed skill content into the system prompt ──
 
 /**

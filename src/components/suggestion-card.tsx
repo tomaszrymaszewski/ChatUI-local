@@ -15,6 +15,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { InputGroup } from "@/components/ui/input-group";
 import { toast } from "sonner";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   installBundledSkill,
   installCuratedSkill,
@@ -22,6 +23,9 @@ import {
   getBundledSkillContent,
 } from "@/lib/skills-library";
 import { summarizeAgentPatch } from "@/lib/agent/tools";
+import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { getMcpServer, saveMcpServer } from "@/lib/mcp-store";
+import { beginMcpOauth, hasToken, readMcpAuth } from "@/lib/mcp-auth";
 import type { AgentConfigPatch } from "@/types";
 import type { SuggestionRequest } from "@/lib/agent/types";
 
@@ -45,6 +49,14 @@ export function SuggestionCard({
   const [installing, setInstalling] = useState(false);
   const [installed, setInstalled] = useState(false);
   const [applied, setApplied] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [connected, setConnected] = useState(false);
+
+  const catalogEntry = MCP_CATALOG.find((c) => c.id === suggestion.target);
+  // API-key connectors still need their key form in Settings; everything
+  // else connects right from the card.
+  const directConnect =
+    suggestion.kind === "connector" && catalogEntry?.auth !== "apikey";
 
   const icon =
     suggestion.kind === "skill" ? (
@@ -79,6 +91,50 @@ export function SuggestionCard({
   const handleConnect = () => {
     onOpenConnectors();
     onDismiss();
+  };
+
+  /** One-click connect: add the connector, then run the native OAuth
+   * sign-in in the browser when the provider needs it. */
+  const handleDirectConnect = async () => {
+    if (!catalogEntry || catalogEntry.install.type !== "remote") return;
+    setConnecting(true);
+    try {
+      if (!getMcpServer(catalogEntry.id)) {
+        saveMcpServer(catalogEntry.id, {
+          type: "remote",
+          url: catalogEntry.install.url,
+          enabled: true,
+          addedAt: new Date().toISOString(),
+        });
+      }
+      if (catalogEntry.auth === "oauth") {
+        const url = await beginMcpOauth(catalogEntry.id, catalogEntry.install.url);
+        await openUrl(url);
+        // The browser flow writes tokens when done; poll for up to ~5 min.
+        for (let i = 0; i < 150; i++) {
+          await new Promise((r) => setTimeout(r, 2000));
+          try {
+            if (hasToken(await readMcpAuth(), catalogEntry.id)) {
+              setConnected(true);
+              toast.success(`${catalogEntry.name} connected — its tools are available from your next message`);
+              onDismiss();
+              return;
+            }
+          } catch {
+            /* keep polling */
+          }
+        }
+        toast.error(`Sign-in to ${catalogEntry.name} didn't complete`);
+      } else {
+        setConnected(true);
+        toast.success(`${catalogEntry.name} connected — its tools are available from your next message`);
+        onDismiss();
+      }
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : `Failed to connect ${catalogEntry.name}`);
+    } finally {
+      setConnecting(false);
+    }
   };
 
   const handleEnableMode = () => {
@@ -140,7 +196,19 @@ export function SuggestionCard({
             Installed
           </Button>
         )}
-        {suggestion.kind === "connector" && (
+        {suggestion.kind === "connector" && directConnect && !connected && (
+          <Button size="sm" onClick={() => void handleDirectConnect()} disabled={connecting}>
+            {connecting ? <Loader2 className="animate-spin" /> : <Plug />}
+            Connect
+          </Button>
+        )}
+        {suggestion.kind === "connector" && connected && (
+          <Button size="sm" variant="outline" onClick={onDismiss} disabled>
+            <Check />
+            Connected
+          </Button>
+        )}
+        {suggestion.kind === "connector" && !directConnect && (
           <Button size="sm" onClick={handleConnect}>
             <Plug />
             Open Connectors

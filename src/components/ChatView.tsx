@@ -133,6 +133,8 @@ import { useMessages, loadMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
+import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
+import { ensureCuratedSkillContent } from "@/lib/skills-library";
 import { useAgents } from "@/hooks/use-agents";
 import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController } from "@/hooks/use-deep-agent";
 import { useScheduler } from "@/hooks/use-scheduler";
@@ -326,6 +328,17 @@ export function ChatView() {
       setChatMode((prev) => (prev === "none" ? "temporary" : prev));
     }
   }, [settings.temporaryByDefault]);
+
+  // Knowledge index: first sweep shortly after launch (debounced triggers in
+  // use-deep-agent re-index after each run). Curated skill content is
+  // prefetched once in the background so full skill instructions are
+  // searchable (and retrievable) before any install.
+  useEffect(() => {
+    scheduleKnowledgeSweep(15_000);
+    void ensureCuratedSkillContent()
+      .then(() => scheduleKnowledgeSweep(2_000))
+      .catch(() => {});
+  }, []);
 
   // Check for app updates once on launch (silently).
   useEffect(() => {

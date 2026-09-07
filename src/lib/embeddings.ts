@@ -153,3 +153,102 @@ function hashEmbed(text: string): number[] {
   const norm = Math.sqrt(vec.reduce((s, v) => s + v * v, 0)) || 1;
   return vec.map((v) => v / norm);
 }
+
+// ─── Knowledge-index embedder (hybrid) ─────────────────────────────────────
+
+export interface ApiEmbeddingConfig {
+  baseUrl: string;
+  model: string;
+  apiKey?: string;
+}
+
+/**
+ * The embedder used for the knowledge index — one identity for both indexing
+ * and queries. Mixing identities would silently corrupt nearest-neighbor
+ * ranking (different vector spaces and dimensions). Configured endpoint wins;
+ * otherwise the local transformers.js model above.
+ */
+export type IndexEmbedder =
+  | { kind: "api"; id: string; baseUrl: string; model: string; apiKey?: string }
+  | { kind: "local"; id: string; modelId: string; dims: number };
+
+export function getIndexEmbedder(): IndexEmbedder {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (raw) {
+      const data = JSON.parse(raw) as { embeddingEndpoint?: ApiEmbeddingConfig | null };
+      const ep = data.embeddingEndpoint;
+      if (ep && ep.baseUrl && ep.model) {
+        return {
+          kind: "api",
+          id: `api:${ep.baseUrl}#${ep.model}`,
+          baseUrl: ep.baseUrl.replace(/\/+$/, ""),
+          model: ep.model,
+          apiKey: ep.apiKey,
+        };
+      }
+    }
+  } catch {
+    // ignore
+  }
+  const modelId = getModelId();
+  return { kind: "local", id: `local:${modelId}`, modelId, dims: MODEL_DIMS[modelId] ?? 384 };
+}
+
+/**
+ * Same header hygiene as corsSafeFetch in src/lib/agent/models.ts (X-Stainless-*
+ * and User-Agent break CORS preflights in WKWebView) — duplicated locally so
+ * the embedding path doesn't pull the langchain stack into its bundle.
+ */
+async function embeddingsEndpointFetch(
+  baseUrl: string,
+  apiKey: string | undefined,
+  body: string,
+): Promise<Response> {
+  const headers = new Headers({ "Content-Type": "application/json" });
+  if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
+  return fetch(`${baseUrl}/embeddings`, { method: "POST", headers, body });
+}
+
+/**
+ * Embed texts with the index embedder. Throws on endpoint failure — the index
+ * layer decides to skip (query time) or abort the sweep (index time). It never
+ * silently falls back to a different model, which would corrupt the index
+ * (mixed vector spaces can't be ranked against each other).
+ */
+export async function embedForIndex(texts: string[]): Promise<number[][]> {
+  if (texts.length === 0) return [];
+  const embedder = getIndexEmbedder();
+  if (embedder.kind === "local") return embed(texts);
+  const out: number[][] = [];
+  const BATCH = 16;
+  for (let i = 0; i < texts.length; i += BATCH) {
+    const batch = texts.slice(i, i + BATCH);
+    const resp = await embeddingsEndpointFetch(
+      embedder.baseUrl,
+      embedder.apiKey,
+      JSON.stringify({ model: embedder.model, input: batch }),
+    );
+    if (!resp.ok) throw new Error(`embeddings endpoint returned ${resp.status}`);
+    const json = (await resp.json()) as { data?: Array<{ embedding?: number[] }> };
+    const data = json.data ?? [];
+    if (data.length !== batch.length) {
+      throw new Error("embeddings endpoint returned a malformed response");
+    }
+    for (const d of data) {
+      const vec = d.embedding;
+      if (!Array.isArray(vec) || vec.length === 0) {
+        throw new Error("embeddings endpoint returned a malformed response");
+      }
+      out.push(vec);
+    }
+  }
+  return out;
+}
+
+/** Embed one query with the index embedder (throws on failure). */
+export async function embedQueryForIndex(text: string): Promise<number[]> {
+  const [vec] = await embedForIndex([text]);
+  if (!vec) throw new Error("index embedder returned no vector");
+  return vec;
+}

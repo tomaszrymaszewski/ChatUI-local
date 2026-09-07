@@ -5,7 +5,10 @@ import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { DeepAgentSession, type AgentMessage } from "@/lib/agent/runtime";
 import { runDeepResearch } from "@/lib/agent/deep-research";
 import { runDiscuss } from "@/lib/agent/discuss";
+import { setRetrievedDocIds } from "@/lib/agent/run-context";
 import { loadUserSettings } from "@/hooks/use-user-settings";
+import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
+import { retrieveKnowledgeContext } from "@/lib/knowledge-retrieval";
 import { estimateTokens, recordAgentUsage } from "@/lib/agent-usage";
 import type {
   ActivityItem,
@@ -42,7 +45,7 @@ export interface DeepAgentRunOptions {
     enableFileTools?: boolean;
     /** Restrict skills to these names (sandboxed agents). */
     skillNames?: string[];
-    /** Restrict MCP connectors to these opencode.json keys (sandboxed agents). */
+    /** Restrict MCP connectors to these connector store keys (sandboxed agents). */
     mcpNames?: string[];
     /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
     sandbox?: AgentSandbox;
@@ -80,6 +83,25 @@ type InputResolution =
   | { values: Record<string, unknown> };
 
 type ApprovalResolution = { approved: boolean };
+
+/** Text of the newest user message — the retrieval query for a run. */
+function lastUserText(messages: AgentMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "user") continue;
+    if (typeof m.content === "string") return m.content.slice(0, 2000);
+    let text = "";
+    for (const part of m.content) {
+      const p: unknown = part;
+      if (typeof p === "string") text += p;
+      else if (p && typeof p === "object" && "text" in p) {
+        text += String((p as { text: unknown }).text ?? "");
+      }
+    }
+    return text.slice(0, 2000);
+  }
+  return "";
+}
 
 export interface AgentControllerApi {
   isRunning: boolean;
@@ -450,11 +472,20 @@ class AgentController implements AgentControllerApi {
         );
         pipelineCompleted = pipeline.completed;
       } else {
+        // Knowledge retrieval (RAG): top hits from the persistent index ride
+        // along in the instructions; their ids are remembered so the agent's
+        // search_knowledge tool can look beyond them.
+        let instructions = opts.instructions;
+        const retrieval = await retrieveKnowledgeContext(lastUserText(opts.messages));
+        setRetrievedDocIds(retrieval.ids);
+        if (retrieval.block) {
+          instructions = [instructions, retrieval.block].filter(Boolean).join("\n\n");
+        }
         session = await DeepAgentSession.create({
           provider: opts.provider,
           modelName: opts.modelName,
           reasoningEffort: opts.reasoningEffort,
-          instructions: opts.instructions,
+          instructions,
           mode: mode === "task" ? "task" : "chat",
           webFetchEnabled: opts.webFetchEnabled,
           projectDir: opts.projectDir,
@@ -493,6 +524,9 @@ class AgentController implements AgentControllerApi {
       this.pendingInput = null;
       this.pendingSuggestion = null;
       this.pendingApproval = null;
+      setRetrievedDocIds([]);
+      // The run changed (or added) chats/messages/files — re-index shortly.
+      scheduleKnowledgeSweep();
       this.notify();
       registryNotify();
     }

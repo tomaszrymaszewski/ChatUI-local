@@ -3,7 +3,12 @@ import { tool, type StructuredTool } from "langchain";
 import { executeTool } from "@/lib/tools";
 import { runPython } from "@/lib/run-python";
 import { runCommand } from "@/lib/run-command";
-import { runCodingTask } from "@/lib/coding-delegate";
+import {
+  detectCodingAgents,
+  resolveCodingAgent,
+  runCodingTaskWithAgent,
+  type CodingAgentInfo,
+} from "@/lib/coding-delegate";
 import { readLocalFile, writeLocalFile } from "@/lib/local-file";
 import {
   saveAgentDefinition,
@@ -17,11 +22,18 @@ import {
   type AgentSandbox,
 } from "@/lib/agent/sandbox";
 import type { AgentConfigPatch } from "@/types";
-import { getRunContext, type RunContext } from "@/lib/agent/run-context";
+import { getRunContext, getRetrievedDocIds, type RunContext } from "@/lib/agent/run-context";
 import { webSearch } from "@/lib/agent/web-search";
 import { CURATED_SKILLS, listBundledSkills, listInstalledSkills } from "@/lib/skills-library";
 import { MCP_CATALOG } from "@/lib/mcp-catalog";
-import { getMcpEntries } from "@/lib/opencode-config";
+import { isConnected } from "@/lib/mcp-store";
+import { loadUserSettings } from "@/hooks/use-user-settings";
+import {
+  enabledKnowledgeSourceTypes,
+  searchKnowledgeIndex,
+  type KnowledgeSourceType,
+} from "@/lib/knowledge-index";
+import { formatKnowledgeHitsForTool } from "@/lib/knowledge-retrieval";
 
 let artifactCounter = 0;
 
@@ -339,10 +351,6 @@ export function buildAgentTools(
     tool(
       async ({ query }: { query: string }) => {
         const q = query.toLowerCase().trim();
-        const config = await import("@/lib/opencode-config").then((m) => m.readOpencodeConfig(null)).catch(() => ({}));
-        const entries = getMcpEntries(config);
-        const connectedIds = new Set(Object.entries(entries).filter(([, e]) => e.enabled !== false).map(([id]) => id));
-
         const scored = MCP_CATALOG.map((c) => {
           const haystack = `${c.name} ${c.tagline} ${c.category} ${(c.keywords ?? []).join(" ")}`.toLowerCase();
           let score = 0;
@@ -360,7 +368,7 @@ export function buildAgentTools(
             tagline: c.tagline,
             category: c.category,
             auth: c.auth,
-            connected: connectedIds.has(c.id),
+            connected: isConnected(c.id),
             score,
           };
         })
@@ -487,51 +495,83 @@ export function buildAgentTools(
         },
       ),
       tool(
-        async ({ prompt, directory }: { prompt: string; directory: string }) => {
+        async ({
+          prompt,
+          directory,
+          agent,
+        }: {
+          prompt: string;
+          directory: string;
+          agent?: string;
+        }) => {
           if (
             sandbox?.allowedDirectories &&
             !(await isPathAllowed(directory, sandbox.allowedDirectories))
           ) {
             return sandboxDeniedMessage(sandbox.allowedDirectories);
           }
-          let result;
+          const available = await detectCodingAgents();
+          const choice = resolveCodingAgent(available, agent);
+          if (choice.status === "missing") {
+            const names = available.map((a) => a.name).join(", ") || "none";
+            return (
+              `"${choice.requested}" is not installed. Locally installed coding agents: ${names}. ` +
+              `Ask the user how to proceed (or pick a different agent).`
+            );
+          }
+          if (choice.status === "none") {
+            return (
+              "No local coding agent is installed (checked: opencode, Claude Code, Codex), so there is " +
+              "nothing to delegate to. Do this coding task yourself with your own tools: plan it, create " +
+              `and edit the files in ${directory}, run/verify the result with your shell access, and ` +
+              "report exactly what you built and changed."
+            );
+          }
+          if (choice.status === "ask") {
+            const options = choice.options.map((a) => a.name).join(", ");
+            return (
+              `Several coding agents are installed: ${options}. Ask the user which one should handle ` +
+              `this task (request_structured_input with a 'select' field listing them), then call ` +
+              `run_coding_task again with agent set to their choice.`
+            );
+          }
+          const agentInfo: CodingAgentInfo = choice.agent;
           try {
-            const ctx = ctxFn();
-            result = await runCodingTask({ prompt, directory, requestApproval: ctx?.requestApproval });
+            const result = await runCodingTaskWithAgent({
+              prompt,
+              directory,
+              agentId: agentInfo.id,
+            });
+            const lines: string[] = [
+              result.timedOut
+                ? `The coding agent (${agentInfo.name}) timed out and was stopped. Partial output:`
+                : `The coding agent (${agentInfo.name}) finished (exit code ${result.exitCode}).`,
+            ];
+            lines.push(`Its output:\n${result.summary.slice(0, 6000)}`);
+            return lines.join("\n\n");
           } catch (err) {
             return `Coding task failed: ${err instanceof Error ? err.message : String(err)}`;
           }
-          const lines: string[] = [
-            result.timedOut
-              ? "The coding agent timed out and was stopped. Partial results:"
-              : "The coding agent finished.",
-          ];
-          lines.push(`Its final reply:\n${result.summary.slice(0, 6000)}`);
-          if (result.filesChanged.length > 0) {
-            lines.push(
-              "Files changed:\n" +
-                result.filesChanged
-                  .map((f) => `- ${f.file} (+${f.additions}/-${f.deletions})`)
-                  .join("\n"),
-            );
-          } else {
-            lines.push("No files were changed.");
-          }
-          return lines.join("\n\n");
         },
         {
           name: "run_coding_task",
           description:
-            "Delegate a coding task to the local coding agent (opencode), which edits files, runs " +
-            "commands, and returns a summary + diff. Use this for real coding work instead of writing " +
-            "code files yourself. ALWAYS confirm the project folder with the user first " +
-            "(request_structured_input with a 'directory' field) and reuse that folder for the " +
-            "rest of the task." + allowedNote,
+            "Delegate a coding task to a local coding agent (checks which of opencode, Claude Code, or " +
+            "Codex is installed and runs it headlessly in a project folder). Use this for real coding " +
+            "work instead of writing code files yourself. When several agents are installed, the tool " +
+            "returns their names so you can ask the user to pick one; when none is installed, do the " +
+            "work yourself with your own file and shell tools instead. ALWAYS confirm the project " +
+            "folder with the user first (request_structured_input with a 'directory' field) and reuse " +
+            "that folder for the rest of the task." + allowedNote,
           schema: z.object({
             prompt: z
               .string()
               .describe("Full task description for the coding agent: what to build/fix, constraints, where to look."),
             directory: z.string().describe("Absolute path of the project folder to work in."),
+            agent: z
+              .enum(["opencode", "claude", "codex"])
+              .optional()
+              .describe("Coding agent to use when several are installed (ask the user, then pass their choice)."),
           }),
         },
       ),
@@ -663,6 +703,62 @@ export function buildAgentTools(
             schema: z.object({
               query: z.string().optional().describe("Keywords to search chat titles and messages for."),
               session_id: z.string().optional().describe("Read this chat in full (from a previous search result)."),
+            }),
+          },
+        ),
+      );
+    }
+
+    // Knowledge index search (RAG): semantic search over everything embedded
+    // in the persistent index. Registered only while at least one source
+    // type is enabled; respects the user's per-source permissions.
+    const settings = loadUserSettings();
+    const knowledgeTypes = enabledKnowledgeSourceTypes(settings);
+    if (knowledgeTypes.length > 0) {
+      tools.push(
+        tool(
+          async ({
+            query,
+            source_types,
+            limit,
+            exclude_ids,
+          }: {
+            query: string;
+            source_types?: KnowledgeSourceType[];
+            limit?: number;
+            exclude_ids?: string[];
+          }) => {
+            const hits = await searchKnowledgeIndex(query, {
+              limit: Math.min(limit ?? 8, 20),
+              sourceTypes: source_types?.filter((t) => knowledgeTypes.includes(t)),
+              // Never re-serve what the run was already handed.
+              excludeIds: [...(exclude_ids ?? []), ...getRetrievedDocIds()],
+            });
+            if (hits.length === 0) {
+              return `No knowledge found for "${query}". Try different wording or a broader query.`;
+            }
+            return formatKnowledgeHitsForTool(hits);
+          },
+          {
+            name: "search_knowledge",
+            description:
+              "Semantic search across the user's knowledge index: past chats, uploaded files, image " +
+              "descriptions, skills, connectors, and saved memories. Use it when the context provided " +
+              "with the conversation is not enough, when the user references earlier chats or files, " +
+              "or when you need broader/deeper results than what was already provided.",
+            schema: z.object({
+              query: z.string().describe("Natural-language search query."),
+              source_types: z
+                .array(
+                  z.enum(["chat", "file", "image", "skill", "skill_doc", "connector", "memory"]),
+                )
+                .optional()
+                .describe("Restrict the search to these source types."),
+              limit: z.number().int().min(1).max(20).optional().describe("Max results (default 8)."),
+              exclude_ids: z
+                .array(z.string())
+                .optional()
+                .describe("Doc ids from earlier results to exclude — use this to dig broader."),
             }),
           },
         ),

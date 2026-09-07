@@ -24,3 +24,19 @@ export function setRunContext(ctx: RunContext | null) {
 export function getRunContext(): RunContext | null {
   return current;
 }
+
+/**
+ * Doc ids auto-injected into the current run's instructions by pre-prompt
+ * retrieval. search_knowledge excludes them so the agent can always dig
+ * broader than what it was handed. Module-level (not on RunContext) because
+ * only one generation runs at a time — same reason as RunContext itself.
+ */
+let currentRetrievedDocIds: string[] = [];
+
+export function setRetrievedDocIds(ids: string[]) {
+  currentRetrievedDocIds = ids;
+}
+
+export function getRetrievedDocIds(): string[] {
+  return currentRetrievedDocIds;
+}

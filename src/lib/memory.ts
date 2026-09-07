@@ -1,6 +1,7 @@
 import type { Provider } from "@/types";
 import { streamChatCompletion, type ChatCompletionMessage } from "@/lib/llm";
 import { embed, embedQuery, cosineSimilarity } from "@/lib/embeddings";
+import { searchKnowledgeIndex, scheduleKnowledgeSweep } from "@/lib/knowledge-index";
 
 export interface MemoryEntry {
   id: string;
@@ -43,17 +44,20 @@ export function addMemory(scope: string, text: string, sourceSessionId?: string)
   entries.unshift(entry);
   const cap = scope === "global" ? MAX_GLOBAL : MAX_PROJECT;
   saveMemory(scope, entries.slice(0, cap));
+  scheduleKnowledgeSweep(5_000);
   return entry;
 }
 
 export function deleteMemory(scope: string, id: string) {
   const entries = loadMemory(scope).filter((e) => e.id !== id);
   saveMemory(scope, entries);
+  scheduleKnowledgeSweep(5_000);
 }
 
 export function updateMemory(scope: string, id: string, text: string) {
   const entries = loadMemory(scope).map((e) => (e.id === id ? { ...e, text } : e));
   saveMemory(scope, entries);
+  scheduleKnowledgeSweep(5_000);
 }
 
 function clearMemory(scope: string) {
@@ -64,6 +68,29 @@ function clearMemory(scope: string) {
 export async function buildMemoryContext(projectId: string | null, query: string): Promise<string> {
   const scopes: string[] = ["global"];
   if (projectId) scopes.push(projectId);
+
+  // Preferred path: the persistent knowledge index (memories are embedded
+  // once by the sweep instead of re-ranked per prompt).
+  try {
+    const hits = await searchKnowledgeIndex(query, { limit: TOP_K, sourceTypes: ["memory"] });
+    if (hits.length > 0) {
+      const parts: string[] = [];
+      const global = hits.filter((h) => h.extra?.scope === "global");
+      if (global.length > 0) {
+        parts.push(`What you know about the user:\n${global.map((h) => `- ${h.text}`).join("\n")}`);
+      }
+      if (projectId) {
+        const project = hits.filter((h) => h.extra?.scope === projectId);
+        if (project.length > 0) {
+          parts.push(`What you know about this project:\n${project.map((h) => `- ${h.text}`).join("\n")}`);
+        }
+      }
+      if (parts.length > 0) return parts.join("\n\n");
+    }
+  } catch {
+    // fall back to live ranking below
+  }
+
   const parts: string[] = [];
   for (const sc of scopes) {
     const entries = loadMemory(sc);

@@ -21,7 +21,7 @@ export type McpCategory =
   | "Search & Research";
 
 export interface McpCatalogEntry {
-  /** Config key used in opencode.json (`mcp.<id>`). */
+  /** Config key in the app's connector store (chatui:mcp). */
   id: string;
   /** Friendly display name. */
   name: string;
@@ -35,9 +35,7 @@ export interface McpCatalogEntry {
   envKeys?: string[];
   /** Extra search keywords that the agent's search_connectors tool matches against. */
   keywords?: string[];
-  install:
-    | { type: "remote"; url: string }
-    | { type: "local"; command: string[] };
+  install: { type: "remote"; url: string };
   /** Optional registry namespace for validation/lookup. */
   registryName?: string;
 }
@@ -159,17 +157,6 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     registryName: "com.cloudflare.mcp/mcp",
   },
   {
-    id: "sentry",
-    name: "Sentry",
-    tagline: "Pull errors and issues from Sentry so the AI can help debug them.",
-    category: "Developer",
-    vendor: "Sentry",
-    auth: "apikey",
-    envKeys: ["SENTRY_AUTH_TOKEN"],
-    install: { type: "local", command: ["npx", "-y", "@sentry/mcp-server"] },
-    registryName: "io.github.getsentry/sentry-mcp",
-  },
-  {
     id: "postman",
     name: "Postman",
     tagline: "Run and explore your Postman API collections from chat.",
@@ -178,16 +165,6 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     auth: "oauth",
     install: { type: "remote", url: "https://mcp.postman.com/mcp" },
     registryName: "com.postman/postman-mcp-server",
-  },
-  {
-    id: "context7",
-    name: "Context7",
-    tagline: "Get up-to-date, version-accurate docs for any library while coding.",
-    category: "Developer",
-    vendor: "Upstash",
-    auth: "none",
-    install: { type: "local", command: ["npx", "-y", "@upstash/context7-mcp"] },
-    registryName: "io.github.upstash/context7",
   },
 
   // ─── Data & AI ─────────────────────────────────────────────────────────────
@@ -200,17 +177,6 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     auth: "oauth",
     install: { type: "remote", url: "https://mcp.supabase.com/mcp" },
     registryName: "com.supabase/mcp",
-  },
-  {
-    id: "mongodb",
-    name: "MongoDB",
-    tagline: "Query and explore your MongoDB databases.",
-    category: "Data & AI",
-    vendor: "MongoDB",
-    auth: "apikey",
-    envKeys: ["MONGODB_URI"],
-    install: { type: "local", command: ["npx", "-y", "mongodb-mcp-server"] },
-    registryName: "io.github.mongodb-js/mongodb-mcp-server",
   },
   {
     id: "prisma",
@@ -268,17 +234,6 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     registryName: "ai.exa/exa",
   },
   {
-    id: "firecrawl",
-    name: "Firecrawl",
-    tagline: "Turn any website into clean text the AI can read and search.",
-    category: "Search & Research",
-    vendor: "Firecrawl",
-    auth: "apikey",
-    envKeys: ["FIRECRAWL_API_KEY"],
-    install: { type: "local", command: ["npx", "-y", "firecrawl-mcp"] },
-    registryName: "io.github.firecrawl/firecrawl-mcp-server",
-  },
-  {
     id: "microsoft-learn",
     name: "Microsoft Learn",
     tagline: "Search official Microsoft documentation — free, no sign-in needed.",
@@ -287,35 +242,6 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     auth: "none",
     install: { type: "remote", url: "https://learn.microsoft.com/api/mcp" },
     registryName: "com.microsoft/microsoft-learn-mcp",
-  },
-
-  // ─── Reference utilities (official MCP-org reference servers) ───────────────
-  {
-    id: "fetch",
-    name: "Web Fetch",
-    tagline: "Let the AI read a specific web page when you paste a link.",
-    category: "Search & Research",
-    vendor: "Model Context Protocol",
-    auth: "none",
-    install: { type: "local", command: ["npx", "-y", "@modelcontextprotocol/server-fetch"] },
-  },
-  {
-    id: "memory",
-    name: "Memory",
-    tagline: "A persistent knowledge graph so the AI remembers things across chats.",
-    category: "Productivity",
-    vendor: "Model Context Protocol",
-    auth: "none",
-    install: { type: "local", command: ["npx", "-y", "@modelcontextprotocol/server-memory"] },
-  },
-  {
-    id: "sequential-thinking",
-    name: "Sequential Thinking",
-    tagline: "Helps the AI break hard problems into step-by-step reasoning.",
-    category: "Data & AI",
-    vendor: "Model Context Protocol",
-    auth: "none",
-    install: { type: "local", command: ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"] },
   },
 ];
 

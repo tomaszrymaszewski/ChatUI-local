@@ -1,4 +1,4 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect, useCallback } from "react";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import {
@@ -54,9 +54,15 @@ import { getProviderMeta } from "@/lib/provider-meta";
 import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync } from "@/lib/model-capabilities";
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
 import { EMBEDDING_MODELS, setEmbeddingModel } from "@/lib/embeddings";
+import {
+  getKnowledgeIndexStats,
+  rebuildKnowledgeIndex,
+  scheduleKnowledgeSweep,
+  type KnowledgeIndexStats,
+} from "@/lib/knowledge-index";
 import { resetOnboarding } from "@/lib/onboarding";
 import { modelLabel } from "@/lib/model-display";
-import type { Provider, ProviderModel, UserSettings } from "@/types";
+import type { Provider, ProviderModel, UserSettings, KnowledgeSourceToggles } from "@/types";
 
 export type SettingsTab = "general" | "memory" | "models" | "skills" | "connectors" | "updates";
 
@@ -79,6 +85,29 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
   const [memoryTick, setMemoryTick] = useState(0);
   const [memoryProjectId, setMemoryProjectId] = useState<string | null>(null);
   const [newMemoryText, setNewMemoryText] = useState("");
+  const [knowledgeStats, setKnowledgeStats] = useState<KnowledgeIndexStats | null>(null);
+  const [sweeping, setSweeping] = useState(false);
+
+  const refreshKnowledgeStats = useCallback(() => {
+    void getKnowledgeIndexStats().then(setKnowledgeStats);
+  }, []);
+
+  useEffect(() => {
+    refreshKnowledgeStats();
+  }, [refreshKnowledgeStats]);
+
+  const handleRebuildIndex = async () => {
+    setSweeping(true);
+    try {
+      await rebuildKnowledgeIndex();
+      toast.success("Knowledge index rebuilt");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to rebuild the knowledge index");
+    } finally {
+      setSweeping(false);
+      refreshKnowledgeStats();
+    }
+  };
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -463,6 +492,116 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                 </Select>
               </div>
 
+              <Separator />
+
+              <div className="flex items-center justify-between">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm font-medium">Knowledge index</span>
+                  <span className="text-xs text-muted-foreground">
+                    Embeds chats, files, images, and memories once so the agent can find them by meaning.
+                    Skills and connectors are always indexed.
+                  </span>
+                </div>
+                <Switch
+                  checked={settings.knowledgeEnabled}
+                  onCheckedChange={(v) => updateSettings({ knowledgeEnabled: v })}
+                />
+              </div>
+
+              {settings.knowledgeEnabled && (
+                <div className="flex flex-col gap-3 rounded-lg border p-3">
+                  <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+                    {(
+                      [
+                        ["chats", "Past chats"],
+                        ["files", "Files"],
+                        ["images", "Images (captioned with your default model)"],
+                        ["memories", "Memories"],
+                      ] as Array<[keyof KnowledgeSourceToggles, string]>
+                    ).map(([key, label]) => (
+                      <div key={key} className="flex items-center justify-between gap-2">
+                        <span className="text-xs text-muted-foreground">{label}</span>
+                        <Switch
+                          checked={settings.knowledgeSources[key]}
+                          onCheckedChange={(v) =>
+                            updateSettings({
+                              knowledgeSources: { ...settings.knowledgeSources, [key]: v },
+                            })
+                          }
+                        />
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor="knowledge-endpoint">Embeddings API endpoint (optional)</Label>
+                    <Input
+                      id="knowledge-endpoint"
+                      placeholder="https://api.openai.com/v1 (empty = local model)"
+                      value={settings.embeddingEndpoint?.baseUrl ?? ""}
+                      onChange={(e) => {
+                        const current = settings.embeddingEndpoint;
+                        updateSettings({
+                          embeddingEndpoint: {
+                            baseUrl: e.target.value,
+                            model: current?.model ?? "",
+                            apiKey: current?.apiKey,
+                          },
+                        });
+                        scheduleKnowledgeSweep(5_000);
+                      }}
+                    />
+                    <Input
+                      placeholder="Embedding model (e.g. text-embedding-3-small)"
+                      value={settings.embeddingEndpoint?.model ?? ""}
+                      onChange={(e) => {
+                        const current = settings.embeddingEndpoint;
+                        updateSettings({
+                          embeddingEndpoint: {
+                            baseUrl: current?.baseUrl ?? "",
+                            model: e.target.value,
+                            apiKey: current?.apiKey,
+                          },
+                        });
+                        scheduleKnowledgeSweep(5_000);
+                      }}
+                    />
+                    <Input
+                      type="password"
+                      placeholder="API key (optional)"
+                      value={settings.embeddingEndpoint?.apiKey ?? ""}
+                      onChange={(e) => {
+                        const current = settings.embeddingEndpoint;
+                        updateSettings({
+                          embeddingEndpoint: {
+                            baseUrl: current?.baseUrl ?? "",
+                            model: current?.model ?? "",
+                            apiKey: e.target.value,
+                          },
+                        });
+                      }}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Any OpenAI-compatible /v1/embeddings endpoint (OpenAI, Ollama, LM Studio…). Changing the
+                      endpoint or model re-embeds the whole index on the next sweep.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs text-muted-foreground">
+                      {knowledgeStats
+                        ? `${knowledgeStats.totalChunks} indexed chunks${
+                            knowledgeStats.embeddingModel ? ` · ${knowledgeStats.embeddingModel}` : ""
+                          }`
+                        : "Index not built yet"}
+                    </span>
+                    <Button size="sm" variant="outline" disabled={sweeping} onClick={() => void handleRebuildIndex()}>
+                      {sweeping ? "Rebuilding…" : "Rebuild index"}
+                    </Button>
+                  </div>
+                </div>
+              )}
+
               {/* Universal memory list */}
               <div className="flex flex-col gap-2">
                 <Label>Universal Memory</Label>
@@ -826,7 +965,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
 
         {/* ─── Connectors Tab ─── */}
         {activeTab === "connectors" && (
-          <ConnectorsPanel serving={oc.serving} activeDirectory={oc.activeDirectory} />
+          <ConnectorsPanel activeDirectory={oc.activeDirectory} />
         )}
 
         {/* ─── Updates Tab ─── */}

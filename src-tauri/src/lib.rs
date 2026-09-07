@@ -1,19 +1,26 @@
 use std::fs;
 use std::fs::OpenOptions;
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
+
+use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::types::Value as SqlValue;
 
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 
+/// Port of our own MCP OAuth callback listener. The flow that owns this port
+/// receives the browser redirect and validates `state`.
+const MCP_OAUTH_CALLBACK_PORT: u16 = 19876;
+
+// Legacy OpenCode server (kept for the legacy agent half; coding delegation
+// now shells out to installed coding-agent CLIs instead).
 const OPENCODE_PORT: &str = "2138";
 const OPENCODE_URL: &str = "http://localhost:2138";
-/// opencode's hard-coded MCP OAuth callback listener (see opencode
-/// mcp/oauth-provider.ts OAUTH_CALLBACK_PORT). The process that owns this
-/// port is the one that receives the browser redirect and validates `state`.
-const MCP_OAUTH_CALLBACK_PORT: &str = "19876";
 
 static SERVER_PID: Mutex<Option<u32>> = Mutex::new(None);
 
@@ -22,14 +29,10 @@ static SERVER_PID: Mutex<Option<u32>> = Mutex::new(None);
 /// scaffold command's blocking thread alive and stall shutdown.
 static SCAFFOLD_PID: Mutex<Option<u32>> = Mutex::new(None);
 
-/// PID of the detached `opencode mcp auth` child. Only ONE OAuth flow may own
-/// the callback listener (127.0.0.1:19876) at a time: opencode validates the
-/// redirect's `state` against the in-memory map of the process that holds the
-/// port, so if a stale flow is still listening when a new one starts, the
-/// browser redirect lands on the wrong process and fails with "Invalid or
-/// expired state parameter - potential CSRF attack". Tracked so a new flow
-/// kills the previous one first, and so exit kills any in-flight flow.
-static AUTH_PID: Mutex<Option<u32>> = Mutex::new(None);
+/// Abort flag of the currently running native MCP OAuth flow (see
+/// mcp_oauth_begin). Starting a new flow aborts the previous one so two flows
+/// never race for the callback port.
+static AUTH_FLOW: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
 // ─── Structs ──────────────────────────────────────────────────────────────
 
@@ -374,13 +377,6 @@ fn kill_scaffold_child() {
     }
 }
 
-fn kill_tracked_auth() {
-    if let Some(pid) = *AUTH_PID.lock().unwrap() {
-        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
-        *AUTH_PID.lock().unwrap() = None;
-    }
-}
-
 /// Find the PID of the process listening on `port` (if any).
 fn pid_listening_on(port: &str) -> Option<u32> {
     let out = Command::new("lsof")
@@ -595,42 +591,16 @@ fn wait_for_health_blocking() -> Result<(), String> {
     Err("OpenCode server did not start within 30 seconds".to_string())
 }
 
-// ─── MCP auth ──────────────────────────────────────────────────────────────
+// ─── MCP OAuth (native — no external auth process) ─────────────────────────
 
-#[tauri::command]
-async fn opencode_mcp_auth(name: String) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let bin = opencode_bin();
-        // Kill any previous auth flow first (see AUTH_PID). Also evict ANY
-        // listener on the OAuth callback port — a stale process there (from a
-        // crashed session or a manual run) would otherwise receive the browser
-        // redirect, fail to find the new flow's in-memory `state`, and reject
-        // it with "Invalid or expired state parameter - potential CSRF attack".
-        kill_tracked_auth();
-        if let Some(pid) = pid_listening_on(MCP_OAUTH_CALLBACK_PORT) {
-            let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
-        }
-        // Give the OS a moment to release the port before the new flow binds it.
-        std::thread::sleep(Duration::from_millis(300));
-        // Spawn detached — opencode opens a browser for the OAuth flow.
-        let child = Command::new(&bin)
-            .args(["mcp", "auth", &name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to run opencode mcp auth: {}", e))?;
-        *AUTH_PID.lock().unwrap() = Some(child.id());
-        // Detach: dropping the Child does not kill it in std.
-        drop(child);
-        Ok(())
-    })
-    .await
-    .map_err(|e| e.to_string())?
+/// App-owned OAuth token store (~/Documents/chatUI/mcp/auth.json).
+fn mcp_auth_path() -> Result<PathBuf, String> {
+    Ok(chat_ui_base_dir()?.join("mcp").join("auth.json"))
 }
 
-// ─── MCP OAuth tokens (shared store used by opencode) ─────────────────────
-
-fn mcp_auth_path() -> Result<PathBuf, String> {
+/// Legacy shared token store from the removed opencode integration — migrated
+/// once into the app-owned store.
+fn legacy_mcp_auth_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "Could not find home directory".to_string())?;
     Ok(home
         .join(".local")
@@ -639,13 +609,37 @@ fn mcp_auth_path() -> Result<PathBuf, String> {
         .join("mcp-auth.json"))
 }
 
-/// Read opencode's MCP OAuth token store (~/.local/share/opencode/mcp-auth.json).
-/// Returns the raw JSON ("" when the file doesn't exist yet). The frontend
-/// uses it to attach Bearer tokens to its own MCP connections and to show
-/// sign-in status — no running opencode server required.
+/// Ensure the app-owned token store exists, migrating opencode's old
+/// mcp-auth.json on first run (the original file is left untouched).
+fn ensure_mcp_auth_file() -> Result<PathBuf, String> {
+    let path = mcp_auth_path()?;
+    if path.exists() {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if let Ok(legacy) = legacy_mcp_auth_path() {
+        if legacy.exists() {
+            if let Ok(content) = fs::read_to_string(&legacy) {
+                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&content) {
+                    write_mcp_auth(&path, &data)?;
+                    return Ok(path);
+                }
+            }
+        }
+    }
+    write_mcp_auth(&path, &serde_json::json!({}))?;
+    Ok(path)
+}
+
+/// Read the MCP OAuth token store. Returns the raw JSON ("" when empty). The
+/// frontend uses it to attach Bearer tokens to its own MCP connections and to
+/// show sign-in status.
 #[tauri::command]
 fn read_mcp_auth() -> Result<String, String> {
-    match fs::read_to_string(mcp_auth_path()?) {
+    let path = ensure_mcp_auth_file()?;
+    match fs::read_to_string(path) {
         Ok(content) => Ok(content),
         Err(_) => Ok(String::new()),
     }
@@ -663,50 +657,58 @@ fn well_known_url(origin: &str, path: &str, suffix: &str) -> String {
     }
 }
 
-/// Discover the OAuth token endpoint for an MCP server URL: protected-resource
-/// metadata → authorization-server metadata (MCP authorization spec), falling
-/// back to authorization-server metadata on the MCP origin itself.
-fn discover_token_endpoint(
+/// Fetch a JSON document, returning None on any failure.
+fn get_json(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Option<serde_json::Value> {
+    let resp = client.get(url).send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.json::<serde_json::Value>().ok()
+}
+
+/// Discover an MCP server's OAuth authorization metadata (MCP authorization
+/// spec): protected-resource metadata points at the authorization server,
+/// whose own well-known metadata carries the endpoints.
+fn discover_oauth_metadata(
     client: &reqwest::blocking::Client,
     server_url: &str,
-) -> Result<String, String> {
+) -> Result<serde_json::Value, String> {
     let url = reqwest::Url::parse(server_url)
         .map_err(|_| format!("Bad MCP server URL: {}", server_url))?;
     let origin = url.origin().ascii_serialization();
     let path = url.path().trim_end_matches('/').to_string();
 
-    let mut auth_server: Option<String> = None;
-    if let Ok(resp) = client
-        .get(well_known_url(&origin, &path, "oauth-protected-resource"))
-        .send()
-    {
-        if resp.status().is_success() {
-            if let Ok(meta) = resp.json::<serde_json::Value>() {
-                auth_server = meta
-                    .pointer("/authorization_servers/0")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            }
+    let mut issuer = origin.clone();
+    if let Some(resource) = get_json(
+        client,
+        &well_known_url(&origin, &path, "oauth-protected-resource"),
+    ) {
+        if let Some(server) = resource
+            .pointer("/authorization_servers/0")
+            .and_then(|v| v.as_str())
+        {
+            issuer = server.to_string();
         }
     }
 
-    let issuer = auth_server.unwrap_or(origin);
     if let Ok(issuer_url) = reqwest::Url::parse(&issuer) {
-        let meta_url = format!(
-            "{}/.well-known/oauth-authorization-server",
-            issuer_url.origin().ascii_serialization()
-        );
-        if let Ok(resp) = client.get(&meta_url).send() {
-            if resp.status().is_success() {
-                if let Ok(meta) = resp.json::<serde_json::Value>() {
-                    if let Some(te) = meta.get("token_endpoint").and_then(|v| v.as_str()) {
-                        return Ok(te.to_string());
-                    }
+        let issuer_origin = issuer_url.origin().ascii_serialization();
+        let issuer_path = issuer_url.path().trim_end_matches('/').to_string();
+        for meta_url in [
+            well_known_url(&issuer_origin, &issuer_path, "oauth-authorization-server"),
+            format!("{}/.well-known/oauth-authorization-server", issuer_origin),
+        ] {
+            if let Some(meta) = get_json(client, &meta_url) {
+                if meta.get("token_endpoint").is_some() {
+                    return Ok(meta);
                 }
             }
         }
     }
-    Err("Could not discover OAuth token endpoint for this MCP server".to_string())
+    Err("Could not discover OAuth metadata for this MCP server".to_string())
 }
 
 fn write_mcp_auth(path: &std::path::Path, data: &serde_json::Value) -> Result<(), String> {
@@ -729,15 +731,387 @@ fn write_mcp_auth(path: &std::path::Path, data: &serde_json::Value) -> Result<()
     }
 }
 
+fn random_token(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    let _ = getrandom::getrandom(&mut buf);
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// PKCE code verifier (hex — valid unreserved chars) + S256 challenge.
+fn pkce_challenge(verifier: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(verifier.as_bytes());
+    base64url_nopad(&digest)
+}
+
+/// Standard base64 (URL-safe alphabet, no padding).
+fn base64url_nopad(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(n >> 6) as usize & 63] as char);
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[n as usize & 63] as char);
+        }
+    }
+    out
+}
+
+/// Exchange an authorization code for tokens (public client + PKCE).
+fn exchange_code(
+    client: &reqwest::blocking::Client,
+    token_endpoint: &str,
+    code: &str,
+    redirect_uri: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    code_verifier: &str,
+) -> Result<serde_json::Value, String> {
+    let mut form = vec![
+        ("grant_type", "authorization_code".to_string()),
+        ("code", code.to_string()),
+        ("redirect_uri", redirect_uri.to_string()),
+        ("client_id", client_id.to_string()),
+        ("code_verifier", code_verifier.to_string()),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret.to_string()));
+    }
+    let resp = client
+        .post(token_endpoint)
+        .header("Accept", "application/json")
+        .form(&form)
+        .send()
+        .map_err(|e| format!("Token request failed: {}", e))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().map_err(|e| format!("Bad token response: {}", e))?;
+    if !status.is_success() {
+        let msg = body
+            .get("error_description")
+            .or_else(|| body.get("error"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown error");
+        return Err(format!("Token exchange rejected ({}): {}", status, msg));
+    }
+    if body.get("access_token").and_then(|v| v.as_str()).is_none() {
+        return Err("Token response missing access_token".to_string());
+    }
+    Ok(body)
+}
+
+/// Merge a fresh token set for `name` into the app-owned store.
+fn store_mcp_tokens(
+    name: &str,
+    server_url: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+    tokens: &serde_json::Value,
+) -> Result<(), String> {
+    let path = ensure_mcp_auth_file()?;
+    let content = fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
+    let mut data: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let mut token_obj = serde_json::Map::new();
+    token_obj.insert(
+        "accessToken".into(),
+        serde_json::Value::String(
+            tokens
+                .get("access_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    if let Some(rt) = tokens.get("refresh_token").and_then(|v| v.as_str()) {
+        token_obj.insert("refreshToken".into(), serde_json::Value::String(rt.to_string()));
+    }
+    if let Some(expires_in) = tokens.get("expires_in").and_then(|v| v.as_f64()) {
+        token_obj.insert("expiresAt".into(), serde_json::json!(now + expires_in));
+    }
+    if let Some(scope) = tokens.get("scope").and_then(|v| v.as_str()) {
+        token_obj.insert("scope".into(), serde_json::Value::String(scope.to_string()));
+    }
+
+    let mut client_info = serde_json::Map::new();
+    client_info.insert("clientId".into(), serde_json::Value::String(client_id.to_string()));
+    if let Some(secret) = client_secret {
+        client_info.insert("clientSecret".into(), serde_json::Value::String(secret.to_string()));
+    }
+    client_info.insert("clientIdIssuedAt".into(), serde_json::json!(now));
+
+    let entry = serde_json::json!({
+        "tokens": serde_json::Value::Object(token_obj),
+        "clientInfo": serde_json::Value::Object(client_info),
+        "serverUrl": server_url,
+    });
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(name.to_string(), entry);
+    }
+    write_mcp_auth(&path, &data)
+}
+
+/// One HTTP response line/body helper for the callback listener.
+fn write_response(mut stream: std::net::TcpStream, status: &str, body: &str) {
+    use std::io::Write as _;
+    let head = format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        status,
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.flush();
+}
+
+/// Accept loop for the OAuth callback: wait for /callback?code=…&state=…,
+/// validate state, then exchange the code and store the tokens. Exits when
+/// the abort flag is set (a newer flow replaced this one) or after the code
+/// was handled.
+fn oauth_callback_loop(
+    listener: TcpListener,
+    abort: Arc<AtomicBool>,
+    name: String,
+    server_url: String,
+    token_endpoint: String,
+    client_id: String,
+    client_secret: Option<String>,
+    code_verifier: String,
+    expected_state: String,
+    redirect_uri: String,
+) {
+    for stream in listener.incoming() {
+        if abort.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut buf = [0u8; 4096];
+        let n = match std::io::Read::read(&mut stream, &mut buf) {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let head = String::from_utf8_lossy(&buf[..n]);
+        let request_line = head.lines().next().unwrap_or_default().to_string();
+        let path = request_line.split_whitespace().nth(1).unwrap_or_default().to_string();
+
+        if !path.starts_with("/callback") {
+            write_response(stream, "404 Not Found", "Not found");
+            continue;
+        }
+        let query = path.splitn(2, '?').nth(1).unwrap_or_default();
+        let mut code: Option<String> = None;
+        let mut state: Option<String> = None;
+        let mut error: Option<String> = None;
+        for pair in query.split('&') {
+            let mut kv = pair.splitn(2, '=');
+            let key = kv.next().unwrap_or_default();
+            let value = kv.next().unwrap_or_default();
+            match key {
+                "code" => code = Some(value.to_string()),
+                "state" => state = Some(value.to_string()),
+                "error" => error = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        if let Some(err) = error {
+            let _ = err;
+            write_response(
+                stream,
+                "200 OK",
+                "<html><body><h2>Sign-in failed</h2><p>The provider returned an error. Return to ChatUI and try again.</p></body></html>",
+            );
+            return;
+        }
+        if code.is_none() || state.as_deref() != Some(expected_state.as_str()) {
+            write_response(
+                stream,
+                "400 Bad Request",
+                "<html><body><h2>Invalid or expired state parameter</h2><p>Return to ChatUI and start the sign-in again.</p></body></html>",
+            );
+            continue;
+        }
+
+        write_response(
+            stream,
+            "200 OK",
+            "<html><body><h2>Sign-in complete</h2><p>You can close this tab and return to ChatUI.</p></body></html>",
+        );
+
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match exchange_code(
+            &client,
+            &token_endpoint,
+            code.as_deref().unwrap_or_default(),
+            &redirect_uri,
+            &client_id,
+            client_secret.as_deref(),
+            &code_verifier,
+        ) {
+            Ok(tokens) => {
+                if let Err(e) =
+                    store_mcp_tokens(&name, &server_url, &client_id, client_secret.as_deref(), &tokens)
+                {
+                    eprintln!("[mcp-oauth] failed to store tokens for {}: {}", name, e);
+                }
+            }
+            Err(e) => eprintln!("[mcp-oauth] token exchange failed for {}: {}", name, e),
+        }
+        return;
+    }
+}
+
+/// Start a native OAuth sign-in for an MCP server: discover the server's
+/// OAuth metadata, dynamically register a client (PKCE), bind the loopback
+/// callback listener, and return the authorize URL for the browser. The code
+/// exchange + token storage happen in the background; the frontend polls
+/// read_mcp_auth to observe completion.
+#[tauri::command]
+async fn mcp_oauth_begin(name: String, server_url: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Abort any previous flow so two sign-ins never race for the port.
+        if let Some(prev) = AUTH_FLOW.lock().unwrap().as_ref() {
+            prev.store(true, Ordering::Relaxed);
+        }
+        let abort = Arc::new(AtomicBool::new(false));
+        *AUTH_FLOW.lock().unwrap() = Some(abort.clone());
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let meta = discover_oauth_metadata(&client, &server_url)?;
+        let token_endpoint = meta
+            .get("token_endpoint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "OAuth metadata missing token_endpoint".to_string())?
+            .to_string();
+        let authorization_endpoint = meta
+            .get("authorization_endpoint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "OAuth metadata missing authorization_endpoint".to_string())?
+            .to_string();
+        let scopes: Vec<String> = meta
+            .get("scopes_supported")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Dynamic client registration (RFC 7591) — the MCP-spec path.
+        let (client_id, client_secret) = match meta.get("registration_endpoint").and_then(|v| v.as_str()) {
+            Some(registration_endpoint) => {
+                let resp = client
+                    .post(registration_endpoint)
+                    .json(&serde_json::json!({
+                        "client_name": "ChatUI",
+                        "redirect_uris": [format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT)],
+                        "grant_types": ["authorization_code"],
+                        "response_types": ["code"],
+                        "token_endpoint_auth_method": "none",
+                    }))
+                    .send()
+                    .map_err(|e| format!("Client registration failed: {}", e))?;
+                let status = resp.status();
+                let body: serde_json::Value = resp.json().map_err(|e| format!("Bad registration response: {}", e))?;
+                if !status.is_success() {
+                    return Err(format!("Client registration rejected ({})", status));
+                }
+                let id = body
+                    .get("client_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Registration response missing client_id".to_string())?
+                    .to_string();
+                let secret = body
+                    .get("client_secret")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                (id, secret)
+            }
+            None => {
+                return Err(
+                    "This MCP server does not support dynamic client registration, which this app needs for sign-in."
+                        .to_string(),
+                )
+            }
+        };
+
+        let code_verifier = random_token(32);
+        let challenge = pkce_challenge(&code_verifier);
+        let state = random_token(16);
+        let redirect_uri = format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT);
+
+        let mut authorize = reqwest::Url::parse(&authorization_endpoint)
+            .map_err(|e| format!("Bad authorization endpoint: {}", e))?;
+        authorize.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", &client_id)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        if !scopes.is_empty() {
+            authorize.query_pairs_mut().append_pair("scope", &scopes.join(" "));
+        }
+
+        // Bind before returning so a busy port fails fast, then hand the
+        // listener to the background loop that completes the flow.
+        let listener = TcpListener::bind(("127.0.0.1", MCP_OAUTH_CALLBACK_PORT))
+            .map_err(|e| format!("Could not bind the OAuth callback port: {}", e))?;
+        std::thread::spawn(move || {
+            oauth_callback_loop(
+                listener,
+                abort,
+                name,
+                server_url,
+                token_endpoint,
+                client_id,
+                client_secret,
+                code_verifier,
+                state,
+                redirect_uri,
+            );
+        });
+
+        Ok(authorize.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Refresh an expired MCP OAuth access token using the stored refresh token
 /// (standard OAuth2 refresh grant against the server's discovered token
-/// endpoint), then write the fresh tokens back to mcp-auth.json so both this
-/// app and opencode keep using them. Runs in Rust because the token endpoint
-/// rarely sends CORS headers, so the webview couldn't call it directly.
+/// endpoint), then write the fresh tokens back to the app-owned store. Runs
+/// in Rust because the token endpoint rarely sends CORS headers, so the
+/// webview couldn't call it directly.
 #[tauri::command]
 async fn refresh_mcp_token(name: String) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let path = mcp_auth_path()?;
+        let path = ensure_mcp_auth_file()?;
         let content = fs::read_to_string(&path)
             .map_err(|_| "No MCP auth data — sign in first".to_string())?;
         let mut data: serde_json::Value = serde_json::from_str(&content)
@@ -769,7 +1143,11 @@ async fn refresh_mcp_token(name: String) -> Result<String, String> {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| e.to_string())?;
-        let token_endpoint = discover_token_endpoint(&client, &server_url)?;
+        let token_endpoint = discover_oauth_metadata(&client, &server_url)?
+            .get("token_endpoint")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "OAuth metadata missing token_endpoint".to_string())?
+            .to_string();
 
         let mut form = vec![
             ("grant_type", "refresh_token".to_string()),
@@ -834,6 +1212,70 @@ async fn refresh_mcp_token(name: String) -> Result<String, String> {
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ─── Coding-agent detection ────────────────────────────────────────────────
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodingAgentInfo {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// True when the binary can be found (known install location or PATH).
+fn coding_agent_available(id: &str) -> Option<String> {
+    if let Some(home) = dirs::home_dir() {
+        let candidates: &[(&str, &str)] = match id {
+            "opencode" => &[
+                (".opencode/bin/opencode", "opencode"),
+                (".local/bin/opencode", "opencode"),
+            ],
+            "claude" => &[
+                (".claude/local/claude", "claude"),
+                (".local/bin/claude", "claude"),
+            ],
+            "codex" => &[(".local/bin/codex", "codex")],
+            _ => &[],
+        };
+        for (rel, _bin) in candidates {
+            let candidate = home.join(rel);
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().to_string());
+            }
+        }
+    }
+    // Fall back to PATH.
+    if Command::new("which")
+        .arg(id)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Some(id.to_string());
+    }
+    None
+}
+
+/// Detect installed local coding agents (for run_coding_task delegation).
+#[tauri::command]
+fn detect_coding_agents() -> Vec<CodingAgentInfo> {
+    let known: &[(&str, &str)] = &[
+        ("opencode", "OpenCode"),
+        ("claude", "Claude Code"),
+        ("codex", "Codex"),
+    ];
+    known
+        .iter()
+        .filter_map(|(id, name)| {
+            coding_agent_available(id).map(|path| CodingAgentInfo {
+                id: id.to_string(),
+                name: name.to_string(),
+                path,
+            })
+        })
+        .collect()
 }
 
 // ─── Relaunch (update flow) ────────────────────────────────────────────────
@@ -1568,11 +2010,549 @@ fn update_local_session_title(id: String, title: String) -> Result<(), String> {
     Ok(())
 }
 
+// ─── Knowledge index (sqlite-vec) ─────────────────────────────────────────
+//
+// Persistent vector index for RAG. The frontend embeds text (local
+// transformers.js model or a configured OpenAI-compatible /v1/embeddings
+// endpoint) and stores f32 vectors here; every vec_* command below is a thin
+// wrapper over the *_impl functions so tests can drive a plain in-memory
+// Connection.
+
+/// Global index connection, opened lazily on the first vec_* command.
+static VEC_CONN: Mutex<Option<Connection>> = Mutex::new(None);
+
+/// sqlite-vec is statically compiled into the binary (the sqlite-vec crate
+/// builds its C source via `cc`). Registering its entry point as a SQLite
+/// auto-extension makes every connection opened afterwards — including test
+/// connections — load the vec0 virtual-table module.
+static VEC_EXT_REGISTRATION: Once = Once::new();
+
+fn register_vec_extension() {
+    VEC_EXT_REGISTRATION.call_once(|| {
+        unsafe {
+            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            )));
+        }
+    });
+}
+
+fn vec_db_path() -> Result<PathBuf, String> {
+    let base = chat_ui_base_dir()?;
+    if !base.exists() {
+        fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    }
+    Ok(base.join("index.db"))
+}
+
+fn open_vec_connection() -> Result<Connection, String> {
+    register_vec_extension();
+    let conn = Connection::open(vec_db_path()?).map_err(|e| e.to_string())?;
+    let _: String = conn
+        .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    conn.busy_timeout(Duration::from_millis(5000))
+        .map_err(|e| e.to_string())?;
+    Ok(conn)
+}
+
+fn vec_global_conn() -> Result<std::sync::MutexGuard<'static, Option<Connection>>, String> {
+    let mut guard = VEC_CONN
+        .lock()
+        .map_err(|_| "index connection lock poisoned".to_string())?;
+    if guard.is_none() {
+        *guard = Some(open_vec_connection()?);
+    }
+    Ok(guard)
+}
+
+const VEC_SCHEMA_VERSION: &str = "1";
+
+/// One indexed chunk. A "source" (sourceType + sourceRef) is the indexing
+/// unit: every upsert replaces ALL chunks of that source, so re-indexing a
+/// message/file/skill with a changed chunk count needs no explicit deletes.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VecUpsertDoc {
+    pub id: String,
+    pub source_type: String,
+    pub source_ref: String,
+    pub source_title: Option<String>,
+    pub chunk_index: i64,
+    pub text: String,
+    pub content_hash: String,
+    /// Optional JSON payload (role, timestamp, projectId, …) echoed with hits.
+    pub extra: Option<String>,
+    pub embedding: Vec<f32>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VecSearchHit {
+    pub id: String,
+    pub source_type: String,
+    pub source_ref: String,
+    pub source_title: Option<String>,
+    pub chunk_index: i64,
+    pub text: String,
+    pub extra: Option<String>,
+    pub distance: f64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VecSourceState {
+    pub source_type: String,
+    pub source_ref: String,
+    pub content_hash: String,
+    pub chunk_count: i64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VecInitResult {
+    pub rebuilt: bool,
+    pub dims: i64,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct VecStats {
+    pub total_chunks: i64,
+    pub by_source: std::collections::HashMap<String, i64>,
+    pub embedding_model: Option<String>,
+    pub dims: Option<i64>,
+}
+
+/// Little-endian f32 blob — the wire format sqlite-vec accepts for vectors.
+fn f32_blob(vec: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(vec.len() * 4);
+    for v in vec {
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
+fn vec_meta_get(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM vec_meta WHERE key = ?1",
+        [key],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
+fn vec_meta_set(conn: &Connection, key: &str, value: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT OR REPLACE INTO vec_meta (key, value) VALUES (?1, ?2)",
+        [key, value],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Create the schema for the given embedding model + dims, wiping stale data
+/// when the model or dimension changed (vec0 tables have a fixed dimension —
+/// vectors from different models can never be mixed). Returns true when
+/// existing data was dropped.
+fn vec_ensure_schema(conn: &Connection, embedding_model: &str, dims: i64) -> Result<bool, String> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS vec_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+    )
+    .map_err(|e| e.to_string())?;
+    let existing_version = vec_meta_get(conn, "schema_version");
+    let needs_rebuild = match &existing_version {
+        None => false,
+        Some(version) => {
+            version != VEC_SCHEMA_VERSION
+                || vec_meta_get(conn, "dims").and_then(|v| v.parse::<i64>().ok()) != Some(dims)
+                || vec_meta_get(conn, "embedding_model").as_deref() != Some(embedding_model)
+        }
+    };
+    if needs_rebuild {
+        conn.execute_batch("DROP TABLE IF EXISTS vec_chunks; DROP TABLE IF EXISTS chunks;")
+            .map_err(|e| e.to_string())?;
+    }
+    if existing_version.is_none() || needs_rebuild {
+        vec_meta_set(conn, "schema_version", VEC_SCHEMA_VERSION)?;
+        vec_meta_set(conn, "embedding_model", embedding_model)?;
+        vec_meta_set(conn, "dims", &dims.to_string())?;
+    }
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS chunks (
+            id TEXT PRIMARY KEY,
+            source_type TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            source_title TEXT,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            extra TEXT,
+            updated_at INTEGER NOT NULL,
+            UNIQUE(source_type, source_ref, chunk_index)
+        );
+        CREATE INDEX IF NOT EXISTS idx_chunks_source ON chunks (source_type, source_ref);
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(
+            chunk_id TEXT PRIMARY KEY,
+            embedding float[{dims}]
+        );"
+    ))
+    .map_err(|e| e.to_string())?;
+    Ok(needs_rebuild)
+}
+
+fn vec_upsert_impl(conn: &Connection, docs: &[VecUpsertDoc]) -> Result<usize, String> {
+    if docs.is_empty() {
+        return Ok(0);
+    }
+    let dims = vec_meta_get(conn, "dims")
+        .and_then(|v| v.parse::<i64>().ok())
+        .ok_or_else(|| "index not initialized — call vec_init first".to_string())?;
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    // Sources must appear as full chunk-sets; only the FIRST doc of a source
+    // in this call clears that source's previous chunks (otherwise a later
+    // doc would wipe the ones just inserted for the same source).
+    let mut seen_sources: std::collections::HashSet<(String, String)> = Default::default();
+    for doc in docs {
+        if doc.id.is_empty() || doc.source_type.is_empty() || doc.source_ref.is_empty() {
+            return Err("id, source_type and source_ref are required".to_string());
+        }
+        if doc.embedding.len() as i64 != dims {
+            return Err(format!(
+                "embedding dimension mismatch: index has {dims}, got {}",
+                doc.embedding.len()
+            ));
+        }
+        // Replace-all per source: drop the source's old vectors, then its rows.
+        if seen_sources.insert((doc.source_type.clone(), doc.source_ref.clone())) {
+            let stale: Vec<String> = {
+                let mut stmt = tx
+                    .prepare("SELECT id FROM chunks WHERE source_type = ?1 AND source_ref = ?2")
+                    .map_err(|e| e.to_string())?;
+                let rows = stmt
+                    .query_map(
+                        [doc.source_type.as_str(), doc.source_ref.as_str()],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .map_err(|e| e.to_string())?;
+                rows.collect::<Result<Vec<String>, _>>()
+                    .map_err(|e| e.to_string())?
+            };
+            for stale_id in &stale {
+                tx.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", [stale_id])
+                    .map_err(|e| e.to_string())?;
+            }
+            tx.execute(
+                "DELETE FROM chunks WHERE source_type = ?1 AND source_ref = ?2",
+                [doc.source_type.as_str(), doc.source_ref.as_str()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO chunks
+                (id, source_type, source_ref, source_title, chunk_index, text, content_hash, extra, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                doc.id,
+                doc.source_type,
+                doc.source_ref,
+                doc.source_title,
+                doc.chunk_index,
+                doc.text,
+                doc.content_hash,
+                doc.extra,
+                now_unix(),
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+        tx.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+            params![doc.id, f32_blob(&doc.embedding)],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(docs.len())
+}
+
+fn vec_delete_sources_impl(
+    conn: &Connection,
+    source_type: &str,
+    source_refs: &[String],
+) -> Result<(), String> {
+    for source_ref in source_refs {
+        let stale: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM chunks WHERE source_type = ?1 AND source_ref = ?2")
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map(
+                    [source_type, source_ref.as_str()],
+                    |r| r.get::<_, String>(0),
+                )
+                .map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<String>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        for stale_id in &stale {
+            conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", [stale_id])
+                .map_err(|e| e.to_string())?;
+        }
+        conn.execute(
+            "DELETE FROM chunks WHERE source_type = ?1 AND source_ref = ?2",
+            [source_type, source_ref.as_str()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn vec_search_impl(
+    conn: &Connection,
+    query: &[f32],
+    limit: i64,
+    source_types: Option<&[String]>,
+    source_refs: Option<&[String]>,
+    exclude_ids: Option<&[String]>,
+) -> Result<Vec<VecSearchHit>, String> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let dims = vec_meta_get(conn, "dims")
+        .and_then(|v| v.parse::<i64>().ok())
+        .ok_or_else(|| "index not initialized — call vec_init first".to_string())?;
+    if query.len() as i64 != dims {
+        return Err(format!(
+            "query dimension mismatch: index has {dims}, got {}",
+            query.len()
+        ));
+    }
+    let limit = limit.clamp(1, 50);
+    // vec0's KNN cursor picks its k nearest vectors BEFORE the join filters
+    // apply, so overfetch (clamped to vec0's k ≤ 512) to survive exclusions.
+    let k = ((limit + exclude_ids.map(|e| e.len()).unwrap_or(0) as i64) * 3 + 8).min(512);
+    let mut sql = String::from(
+        "SELECT c.id, c.source_type, c.source_ref, c.source_title, c.chunk_index, c.text, c.extra, v.distance
+         FROM vec_chunks v
+         JOIN chunks c ON c.id = v.chunk_id
+         WHERE v.embedding MATCH ?1 AND v.k = ?2",
+    );
+    let mut bound: Vec<SqlValue> = Vec::new();
+    if let Some(types) = source_types.filter(|t| !t.is_empty()) {
+        let placeholders = types.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        sql.push_str(&format!(" AND c.source_type IN ({placeholders})"));
+        for t in types {
+            bound.push(SqlValue::Text(t.clone()));
+        }
+    }
+    if let Some(refs) = source_refs.filter(|r| !r.is_empty()) {
+        let placeholders = refs.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        sql.push_str(&format!(" AND c.source_ref IN ({placeholders})"));
+        for r in refs {
+            bound.push(SqlValue::Text(r.clone()));
+        }
+    }
+    if let Some(exclude) = exclude_ids.filter(|e| !e.is_empty()) {
+        let placeholders = exclude.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+        sql.push_str(&format!(" AND c.id NOT IN ({placeholders})"));
+        for id in exclude {
+            bound.push(SqlValue::Text(id.clone()));
+        }
+    }
+    sql.push_str(" ORDER BY v.distance");
+    sql.push_str(&format!(" LIMIT {limit}"));
+
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut params_iter = vec![
+        SqlValue::Blob(f32_blob(query)),
+        SqlValue::Integer(k),
+    ];
+    params_iter.extend(bound);
+    let rows = stmt
+        .query_map(params_from_iter(params_iter.iter()), |row| {
+            Ok(VecSearchHit {
+                id: row.get(0)?,
+                source_type: row.get(1)?,
+                source_ref: row.get(2)?,
+                source_title: row.get(3)?,
+                chunk_index: row.get(4)?,
+                text: row.get(5)?,
+                extra: row.get(6)?,
+                distance: row.get(7)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut hits = Vec::new();
+    for row in rows {
+        hits.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(hits)
+}
+
+fn vec_source_states_impl(
+    conn: &Connection,
+    source_type: Option<&str>,
+) -> Result<Vec<VecSourceState>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT source_type, source_ref, content_hash, COUNT(*) AS n
+             FROM chunks
+             WHERE (?1 IS NULL OR source_type = ?1)
+             GROUP BY source_type, source_ref
+             ORDER BY source_type, source_ref",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([source_type], |row| {
+            Ok(VecSourceState {
+                source_type: row.get(0)?,
+                source_ref: row.get(1)?,
+                content_hash: row.get(2)?,
+                chunk_count: row.get(3)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    let mut states = Vec::new();
+    for row in rows {
+        states.push(row.map_err(|e| e.to_string())?);
+    }
+    Ok(states)
+}
+
+fn vec_clear_impl(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("DELETE FROM vec_chunks; DELETE FROM chunks;")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn vec_stats_impl(conn: &Connection) -> Result<VecStats, String> {
+    let embedding_model = vec_meta_get(conn, "embedding_model");
+    let dims = vec_meta_get(conn, "dims").and_then(|v| v.parse::<i64>().ok());
+    let mut by_source = std::collections::HashMap::new();
+    let mut total = 0i64;
+    let mut stmt = conn
+        .prepare("SELECT source_type, COUNT(*) FROM chunks GROUP BY source_type")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (k, n) = row.map_err(|e| e.to_string())?;
+        total += n;
+        by_source.insert(k, n);
+    }
+    Ok(VecStats {
+        total_chunks: total,
+        by_source,
+        embedding_model,
+        dims,
+    })
+}
+
+#[tauri::command]
+fn vec_init(embedding_model: String, dims: i64) -> Result<VecInitResult, String> {
+    if !(8..=4096).contains(&dims) {
+        return Err(format!("unsupported embedding dimension: {dims}"));
+    }
+    let guard = vec_global_conn()?;
+    let conn = guard.as_ref().ok_or("index connection unavailable")?;
+    let rebuilt = vec_ensure_schema(conn, &embedding_model, dims)?;
+    Ok(VecInitResult { rebuilt, dims })
+}
+
+#[tauri::command]
+fn vec_upsert(docs: Vec<VecUpsertDoc>) -> Result<usize, String> {
+    let guard = vec_global_conn()?;
+    let conn = guard.as_ref().ok_or("index connection unavailable")?;
+    vec_upsert_impl(conn, &docs)
+}
+
+#[tauri::command]
+fn vec_delete_sources(source_type: String, source_refs: Vec<String>) -> Result<(), String> {
+    let guard = vec_global_conn()?;
+    let conn = guard.as_ref().ok_or("index connection unavailable")?;
+    vec_delete_sources_impl(conn, &source_type, &source_refs)
+}
+
+#[tauri::command]
+fn vec_search(
+    query_embedding: Vec<f32>,
+    limit: i64,
+    source_types: Option<Vec<String>>,
+    source_refs: Option<Vec<String>>,
+    exclude_ids: Option<Vec<String>>,
+) -> Result<Vec<VecSearchHit>, String> {
+    let guard = vec_global_conn()?;
+    let conn = guard.as_ref().ok_or("index connection unavailable")?;
+    vec_search_impl(
+        conn,
+        &query_embedding,
+        limit,
+        source_types.as_deref(),
+        source_refs.as_deref(),
+        exclude_ids.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn vec_get_state(source_type: Option<String>) -> Result<Vec<VecSourceState>, String> {
+    let guard = vec_global_conn()?;
+    let conn = guard.as_ref().ok_or("index connection unavailable")?;
+    vec_source_states_impl(conn, source_type.as_deref())
+}
+
+#[tauri::command]
+fn vec_clear() -> Result<(), String> {
+    let guard = vec_global_conn()?;
+    let conn = guard.as_ref().ok_or("index connection unavailable")?;
+    vec_clear_impl(conn)
+}
+
+#[tauri::command]
+fn vec_stats() -> Result<VecStats, String> {
+    let guard = vec_global_conn()?;
+    let conn = guard.as_ref().ok_or("index connection unavailable")?;
+    vec_stats_impl(conn)
+}
+
 // ─── Entry point ──────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // PKCE S256 challenge = base64url(SHA256(verifier)) — verified against a
+    // known RFC 7636 appendix vector.
+    #[test]
+    fn pkce_challenge_matches_rfc7636_vector() {
+        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        assert_eq!(
+            super::pkce_challenge(verifier),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn base64url_nopad_uses_url_safe_alphabet_without_padding() {
+        assert_eq!(super::base64url_nopad(&[]), "");
+        assert_eq!(super::base64url_nopad(&[0x00]), "AA");
+        assert_eq!(super::base64url_nopad(&[0xff, 0xef]), "_-8");
+        // 0xfb + 0xff + 0xff would produce '+'/'/' in standard base64.
+        assert_eq!(super::base64url_nopad(&[0xfb, 0xff, 0xff]), "-___");
+        assert!(!super::base64url_nopad(&[0xff, 0xff, 0xff]).contains('='));
+    }
+
+    #[test]
+    fn random_token_is_hex_and_long_enough() {
+        let a = super::random_token(32);
+        let b = super::random_token(32);
+        assert_eq!(a.len(), 64);
+        assert_ne!(a, b, "two random tokens must differ");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 
     // The frontend reads resp.statusText / resp.contentType (src/lib/http-fetch.ts);
     // a snake_case payload would silently break web_fetch with a JS TypeError.
@@ -1781,6 +2761,192 @@ mod tests {
         assert_eq!(resp.status, 200, "Bing RSS should return 200, got {}", resp.status);
         assert!(resp.body.contains("<item>"), "Bing RSS should contain result items");
     }
+
+    // ── Knowledge index (sqlite-vec) ──────────────────────────────────────
+
+    // The frontend reads hit.sourceType / hit.sourceRef / hit.contentHash
+    // (src/lib/knowledge-retrieval.ts); a snake_case payload would silently
+    // break retrieval rendering.
+    #[test]
+    fn vec_structs_serialize_to_camel_case() {
+        let hit = serde_json::to_value(super::VecSearchHit {
+            id: "chat:s1:0:0".into(),
+            source_type: "chat".into(),
+            source_ref: "s1:0".into(),
+            source_title: Some("Title".into()),
+            chunk_index: 0,
+            text: "hi".into(),
+            extra: None,
+            distance: 0.5,
+        })
+        .unwrap();
+        let obj = hit.as_object().unwrap();
+        assert!(obj.contains_key("sourceType"));
+        assert!(obj.contains_key("sourceRef"));
+        assert!(obj.contains_key("sourceTitle"));
+        assert!(obj.contains_key("chunkIndex"));
+        assert!(obj.contains_key("distance"));
+        assert!(!obj.contains_key("source_type"));
+
+        let stats = serde_json::to_value(super::VecStats {
+            total_chunks: 1,
+            by_source: [("chat".to_string(), 1)].into_iter().collect(),
+            embedding_model: Some("Xenova/all-MiniLM-L6-v2".into()),
+            dims: Some(384),
+        })
+        .unwrap();
+        let obj = stats.as_object().unwrap();
+        assert!(obj.contains_key("totalChunks"));
+        assert!(obj.contains_key("bySource"));
+        assert!(obj.contains_key("embeddingModel"));
+        assert!(!obj.contains_key("total_chunks"));
+
+        let state = serde_json::to_value(super::VecSourceState {
+            source_type: "chat".into(),
+            source_ref: "s1:0".into(),
+            content_hash: "abc".into(),
+            chunk_count: 2,
+        })
+        .unwrap();
+        let obj = state.as_object().unwrap();
+        assert!(obj.contains_key("sourceType"));
+        assert!(obj.contains_key("contentHash"));
+        assert!(obj.contains_key("chunkCount"));
+    }
+
+    fn vec_test_conn() -> Connection {
+        super::register_vec_extension();
+        Connection::open_in_memory().unwrap()
+    }
+
+    fn vec_doc(id: &str, source_ref: &str, embedding: &[f32]) -> super::VecUpsertDoc {
+        super::VecUpsertDoc {
+            id: id.into(),
+            source_type: "chat".into(),
+            source_ref: source_ref.into(),
+            source_title: Some("Test chat".into()),
+            chunk_index: 0,
+            text: format!("text of {id}"),
+            content_hash: format!("hash-{id}"),
+            extra: None,
+            embedding: embedding.to_vec(),
+        }
+    }
+
+    // sqlite-vec loads via auto-extension and a vec0 KNN query ranks cosine-
+    // nearest chunks first. This is the Phase 0 integration check: if the
+    // static extension fails to link or register, this fails at runtime.
+    #[test]
+    fn vec_upsert_search_rank_exclude_and_replace() {
+        let conn = vec_test_conn();
+        assert!(!super::vec_ensure_schema(&conn, "test-model", 4).unwrap());
+
+        // Unit vectors: a matches the query exactly, c partially, b not at all.
+        // a and b are two chunks of source s1 (chunk_index 0 and 1).
+        let a = vec_doc("a", "s1", &[1.0, 0.0, 0.0, 0.0]);
+        let b = super::VecUpsertDoc {
+            chunk_index: 1,
+            ..vec_doc("b", "s1", &[0.0, 1.0, 0.0, 0.0])
+        };
+        let c = vec_doc("c", "s2", &[0.6, 0.8, 0.0, 0.0]);
+        assert_eq!(super::vec_upsert_impl(&conn, &[a, b, c]).unwrap(), 3);
+
+        let hits = super::vec_search_impl(&conn, &[1.0, 0.0, 0.0, 0.0], 3, None, None, None)
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].id, "a");
+        assert_eq!(hits[1].id, "c");
+        assert_eq!(hits[2].id, "b");
+        assert!(hits[0].distance < hits[1].distance);
+        assert_eq!(hits[0].source_type, "chat");
+        assert_eq!(hits[0].source_title.as_deref(), Some("Test chat"));
+
+        // Excluding prior results widens the ranking to the remainder.
+        let hits = super::vec_search_impl(
+            &conn,
+            &[1.0, 0.0, 0.0, 0.0],
+            3,
+            None,
+            None,
+            Some(&["a".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(hits[0].id, "c");
+
+        // Source-type filter.
+        let hits = super::vec_search_impl(
+            &conn,
+            &[1.0, 0.0, 0.0, 0.0],
+            3,
+            Some(&["file".to_string()]),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(hits.is_empty());
+
+        // Source-ref filter narrows to one source's chunks.
+        let hits = super::vec_search_impl(
+            &conn,
+            &[1.0, 0.0, 0.0, 0.0],
+            3,
+            None,
+            Some(&["s2".to_string()]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "c");
+
+        // Upserting a source replaces all of its chunks (b gone, b2 added in
+        // its place) — the call carries the source's full chunk-set again.
+        let a_again = vec_doc("a", "s1", &[1.0, 0.0, 0.0, 0.0]);
+        let b2 = super::VecUpsertDoc {
+            chunk_index: 1,
+            ..vec_doc("b2", "s1", &[0.0, 0.0, 1.0, 0.0])
+        };
+        super::vec_upsert_impl(&conn, &[a_again, b2]).unwrap();
+        let hits = super::vec_search_impl(&conn, &[1.0, 0.0, 0.0, 0.0], 10, None, None, None).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert!(!ids.contains(&"b"));
+        assert!(ids.contains(&"b2"));
+        assert!(ids.contains(&"a"));
+
+        // State reflects per-source chunk counts.
+        let states = super::vec_source_states_impl(&conn, None).unwrap();
+        assert_eq!(states.len(), 2);
+        let s1 = states.iter().find(|s| s.source_ref == "s1").unwrap();
+        assert_eq!(s1.chunk_count, 2);
+
+        // Delete one source; only its chunks disappear.
+        super::vec_delete_sources_impl(&conn, "chat", &["s1".to_string()]).unwrap();
+        let hits = super::vec_search_impl(&conn, &[1.0, 0.0, 0.0, 0.0], 10, None, None, None).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+        assert_eq!(ids, vec!["c"]);
+    }
+
+    // Switching embedding model/dims must wipe the index — vec0 tables have
+    // a fixed dimension, so mixed-model vectors would silently corrupt search.
+    #[test]
+    fn vec_ensure_schema_rebuilds_on_model_change() {
+        let conn = vec_test_conn();
+        assert!(!super::vec_ensure_schema(&conn, "model-a", 4).unwrap());
+        let doc = vec_doc("a", "s1", &[1.0, 0.0, 0.0, 0.0]);
+        super::vec_upsert_impl(&conn, &[doc]).unwrap();
+
+        // Same model + dims → no rebuild, data intact.
+        assert!(!super::vec_ensure_schema(&conn, "model-a", 4).unwrap());
+        assert_eq!(super::vec_stats_impl(&conn).unwrap().total_chunks, 1);
+
+        // Different model → rebuild, data wiped.
+        assert!(super::vec_ensure_schema(&conn, "model-b", 4).unwrap());
+        assert_eq!(super::vec_stats_impl(&conn).unwrap().total_chunks, 0);
+
+        // Different dims → also a rebuild, and upserts of the old size fail.
+        assert!(super::vec_ensure_schema(&conn, "model-b", 8).unwrap());
+        let wrong = vec_doc("w", "s1", &[1.0, 0.0, 0.0, 0.0]);
+        assert!(super::vec_upsert_impl(&conn, &[wrong]).is_err());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1811,9 +2977,10 @@ pub fn run() {
             opencode_serve_stop,
             opencode_server_log,
             opencode_serve_in_dir,
-            opencode_mcp_auth,
+            mcp_oauth_begin,
             read_mcp_auth,
             refresh_mcp_token,
+            detect_coding_agents,
             http_fetch,
             relaunch_app,
             run_python,
@@ -1825,6 +2992,13 @@ pub fn run() {
             save_local_session,
             delete_local_session,
             update_local_session_title,
+            vec_init,
+            vec_upsert,
+            vec_delete_sources,
+            vec_search,
+            vec_get_state,
+            vec_clear,
+            vec_stats,
         ])
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
@@ -1838,7 +3012,6 @@ pub fn run() {
         tauri::RunEvent::Exit => {
             kill_tracked_server();
             kill_scaffold_child();
-            kill_tracked_auth();
         }
         // macOS: the Dock icon was clicked. If the process is alive but the
         // window was lost (e.g. after a sleep/wake cycle or a stalled quit),
