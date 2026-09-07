@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import type { Message } from "@/types";
-import type { ActivityItem, ReasoningStream } from "@/lib/agent/types";
+import type { ActivityItem, ReasoningStream, SharedFile } from "@/lib/agent/types";
 import type { Artifact } from "@/lib/artifacts";
 import { deleteFileBlob } from "@/lib/attachment-store";
 
@@ -29,6 +29,7 @@ export function loadMessages(sessionId: string): Message[] {
       reasoningStreams?: ReasoningStream[];
       activities?: ActivityItem[];
       artifacts?: Artifact[];
+      files?: SharedFile[];
     }>;
     return data.map((m) => ({
       id: m.id,
@@ -43,6 +44,7 @@ export function loadMessages(sessionId: string): Message[] {
       reasoning: m.reasoning,
       reasoningStreams: m.reasoningStreams,
       artifacts: m.artifacts,
+      files: m.files,
       // A message loaded from storage is never mid-run, so any activity that was
       // still "running" when the app quit/crashed is settled to "done" to avoid
       // permanently-pulsing chips and stuck-open sub-agent boxes.
@@ -71,6 +73,7 @@ function serializeMessages(messages: Message[]) {
       reasoningStreams: m.reasoningStreams,
       activities: m.activities,
       artifacts: m.artifacts,
+      files: m.files,
     })),
   );
 }
@@ -94,7 +97,7 @@ export function appendMessageHeadless(sessionId: string, msg: Message) {
 export function updateMessageHeadless(
   sessionId: string,
   messageId: string,
-  updates: Partial<Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts">>,
+  updates: Partial<Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts" | "files">>,
 ) {
   const loaded = loadMessages(sessionId);
   if (!loaded.some((m) => m.id === messageId)) return;
@@ -177,7 +180,7 @@ export function useMessages(sessionId: string | null) {
       sessionId: string,
       messageId: string,
       updates: Partial<
-        Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts">
+        Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts" | "files">
       >,
     ) => {
       setMessages((prev) => {

@@ -1,4 +1,4 @@
-import type { ActivityItem, ReasoningStream } from "@/lib/agent/types";
+import type { ActivityItem, ReasoningStream, SharedFile } from "@/lib/agent/types";
 import type { Artifact } from "@/lib/artifacts";
 
 export type MessageRole = "user" | "assistant" | "system";
@@ -28,6 +28,8 @@ export interface Message {
   reasoningStreams?: ReasoningStream[];
   activities?: ActivityItem[];
   artifacts?: Artifact[];
+  /** Files the agent shared for download (share_files tool). */
+  files?: SharedFile[];
 }
 
 export interface ProjectFile {

@@ -80,12 +80,23 @@ export interface ApprovalRequest {
 
 export type AgentMode = "chat" | "council" | "research" | "task";
 
+/** A file the agent shared so the user can download it from the chat. */
+export interface SharedFile {
+  /** Absolute path on disk (workspace or an allowed folder). */
+  path: string;
+  /** File name shown on the download card. */
+  name: string;
+  /** Byte size when known at share time. */
+  size?: number;
+}
+
 export type AgentEvent =
   | { type: "token"; text: string }
   | { type: "reasoning"; text: string; id?: string; label?: string }
   | { type: "activity"; activity: ActivityItem }
   | { type: "todos"; todos: TodoItem[] }
   | { type: "artifact"; artifact: Artifact }
+  | { type: "files"; files: SharedFile[] }
   | { type: "suggestion"; suggestion: SuggestionRequest };
 
 export interface ReasoningStream {
@@ -108,6 +119,8 @@ export interface AgentRunResult {
   activities: ActivityItem[];
   todos: TodoItem[];
   artifacts: Artifact[];
+  /** Files the agent shared for download (share_files tool). */
+  files?: SharedFile[];
   /** For research/council modes: whether the pipeline ran to full completion.
    * False when the run ended early (clarification cancelled or aborted).
    * Chat mode leaves this unset (treated as complete). */

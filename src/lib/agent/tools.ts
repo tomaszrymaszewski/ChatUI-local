@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { invoke } from "@tauri-apps/api/core";
 import { tool, type StructuredTool } from "langchain";
 import { executeTool } from "@/lib/tools";
 import { runPython } from "@/lib/run-python";
@@ -20,12 +21,19 @@ import {
   isSessionReadable,
   sandboxDeniedMessage,
   ensureAgentWorkspace,
+  normalizePath,
   type AgentSandbox,
 } from "@/lib/agent/sandbox";
 import type { AgentConfigPatch } from "@/types";
 import { getRunContext, getRetrievedDocIds, type RunContext } from "@/lib/agent/run-context";
 import { webSearch } from "@/lib/agent/web-search";
-import { CURATED_SKILLS, listBundledSkills, listInstalledSkills } from "@/lib/skills-library";
+import {
+  CURATED_SKILLS,
+  listBundledSkills,
+  listInstalledSkills,
+  installBundledSkill,
+  installCuratedSkill,
+} from "@/lib/skills-library";
 import { MCP_CATALOG } from "@/lib/mcp-catalog";
 import { hasToken, readMcpAuth } from "@/lib/mcp-auth";
 import { isConnected } from "@/lib/mcp-store";
@@ -203,6 +211,59 @@ export function buildAgentTools(
       },
     ),
     tool(
+      async ({ paths }: { paths: string[] }) => {
+        const allowed = sandbox?.allowedDirectories;
+        const shared: Array<{ path: string; name: string; size?: number }> = [];
+        const skipped: string[] = [];
+        for (const raw of paths.slice(0, 10)) {
+          const p = normalizePath(raw);
+          if (!p.startsWith("/")) {
+            skipped.push(`${raw} (relative path — use an absolute path)`);
+            continue;
+          }
+          if (allowed && !(await isPathAllowed(p, allowed))) {
+            skipped.push(`${p} (outside your sandbox)`);
+            continue;
+          }
+          const exists = await invoke<boolean>("path_exists", { path: p }).catch(() => false);
+          if (!exists) {
+            skipped.push(`${p} (does not exist)`);
+            continue;
+          }
+          const name = p.split("/").filter(Boolean).pop() ?? p;
+          if (!shared.some((f) => f.path === p)) shared.push({ path: p, name });
+        }
+        if (shared.length === 0) {
+          return `No files shared. Skipped: ${skipped.join("; ") || "none requested"}.`;
+        }
+        const ctx = ctxFn();
+        if (!ctx) return "Error: no active run — download cards could not be shown.";
+        ctx.emit({ type: "files", files: shared });
+        const skippedNote =
+          skipped.length > 0 ? ` Skipped: ${skipped.join("; ")}.` : "";
+        return (
+          `Shared ${shared.length} file(s) with the user — download cards are now attached to this ` +
+          `message in the chat: ${shared.map((f) => f.name).join(", ")}.${skippedNote} ` +
+          `Mention briefly that the files are ready to download; do not repeat their paths.`
+        );
+      },
+      {
+        name: "share_files",
+        description:
+          "Attach download cards for local files to your chat message so the user can save them " +
+          "(deck.pptx, report.docx, data.csv, screenshots, zips, …). Use this for EVERY file you " +
+          "create or save on disk — files on the user's Mac are NOT otherwise downloadable from the " +
+          "chat. Call it after the file exists (e.g. right after your python/generator run) and " +
+          "before you write your summary. Paths must be absolute.",
+        schema: z.object({
+          paths: z
+            .array(z.string())
+            .max(10)
+            .describe("Absolute paths of the files to share, e.g. ['/Users/me/report.pptx']."),
+        }),
+      },
+    ),
+    tool(
       async ({ code }: { code: string }) => {
         const result = await runPython(code);
         const parts: string[] = [];
@@ -331,20 +392,56 @@ export function buildAgentTools(
           return `No skills found for "${query}". The user can browse the full catalog in Settings → Skills.`;
         }
 
+        // Catalog skills are auto-installed at launch — a miss means the
+        // launch download hasn't reached this one yet (or failed). Install it
+        // right now so it lands on disk for future runs, and inline the
+        // SKILL.md content so this run can act on it immediately.
+        let inlineContent = "";
+        const top = scored[0];
+        if (!top.installed) {
+          try {
+            const curated = CURATED_SKILLS.find((c) => c.name === top.name);
+            if (curated) {
+              await installCuratedSkill(curated, "global");
+            } else {
+              await installBundledSkill(top.name, "global");
+            }
+            let skillMd = "";
+            for (const installed of await listInstalledSkills("global")) {
+              if (installed.name !== top.name) continue;
+              skillMd = await invoke<string>("read_text_file", {
+                path: `${installed.path}/SKILL.md`,
+              }).catch(() => "");
+              break;
+            }
+            top.installed = true;
+            inlineContent = skillMd.slice(0, 6000).trim();
+          } catch {
+            // Offline / rate-limited — fall through to the suggest-card path.
+          }
+        }
+
         const lines = scored.map(
           (s, i) =>
             `[${i + 1}] ${s.title} (${s.name})${s.installed ? " [INSTALLED]" : ""}\n    ${s.description}\n    Category: ${s.category} · Source: ${s.source}`,
         );
-        return `Found ${scored.length} skill(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        const header = `Found ${scored.length} skill(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        if (!inlineContent) return header;
+        return (
+          `${header}\n\n[${top.name}] was just installed to disk and is now available to every ` +
+          `future run. Its SKILL.md (may be truncated):\n\n${inlineContent}`
+        );
       },
       {
         name: "search_skills",
         description:
           "Search the skill catalog (bundled + curated) for skills matching a query. " +
           "Returns the skill name, description, category, and whether it is already installed. " +
-          "Use this when the user's task might benefit from a skill that isn't installed yet " +
-          "(e.g. creating Word/Excel/PPT/PDF documents, frontend design, testing). " +
-          "If a matching skill is found and not installed, call suggest with kind=skill.",
+          "Use this when the user's task might benefit from a skill (e.g. creating Word/Excel/PPT/PDF " +
+          "documents, frontend design, testing). Catalog skills are auto-installed at launch, so a " +
+          "match is normally already installed and immediately usable. If one shows as NOT installed, " +
+          "this tool installs it on the spot and returns its SKILL.md inline — follow it in this run; " +
+          "only if the install fails, call suggest with kind=skill.",
         schema: z.object({
           query: z.string().describe("What the user wants to do, e.g. 'create word document' or 'react best practices'."),
         }),

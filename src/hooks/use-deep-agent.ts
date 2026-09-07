@@ -17,6 +17,7 @@ import type {
   AgentRunResult,
   ApprovalRequest,
   ReasoningStream,
+  SharedFile,
   SuggestionRequest,
   StructuredInputRequest,
   TodoItem,
@@ -110,6 +111,7 @@ export interface AgentControllerApi {
   activities: ActivityItem[];
   todos: TodoItem[];
   artifacts: Artifact[];
+  files: SharedFile[];
   pendingInput: StructuredInputRequest | null;
   pendingSuggestion: SuggestionRequest | null;
   pendingApproval: ApprovalRequest | null;
@@ -132,6 +134,7 @@ class AgentController implements AgentControllerApi {
   activities: ActivityItem[] = [];
   todos: TodoItem[] = [];
   artifacts: Artifact[] = [];
+  files: SharedFile[] = [];
   pendingInput: StructuredInputRequest | null = null;
   pendingSuggestion: SuggestionRequest | null = null;
   pendingApproval: ApprovalRequest | null = null;
@@ -146,6 +149,7 @@ class AgentController implements AgentControllerApi {
   private activitiesRef = new Map<string, ActivityItem>();
   private todosRef: TodoItem[] = [];
   private artifactsRef: Artifact[] = [];
+  private filesRef: SharedFile[] = [];
   private abortRef: AbortController | null = null;
   private inputResolverRef: ((r: InputResolution) => void) | null = null;
   private approvalResolverRef: ((approved: boolean) => void) | null = null;
@@ -286,6 +290,16 @@ class AgentController implements AgentControllerApi {
         this.artifacts = [...this.artifactsRef];
         this.notify();
         break;
+      case "files":
+        // Dedupe by path — a re-share of the same file updates nothing.
+        for (const file of event.files) {
+          if (!this.filesRef.some((f) => f.path === file.path)) {
+            this.filesRef.push(file);
+          }
+        }
+        this.files = [...this.filesRef];
+        this.notify();
+        break;
       case "suggestion":
         this.pendingSuggestion = event.suggestion;
         this.notify();
@@ -299,6 +313,7 @@ class AgentController implements AgentControllerApi {
     this.activitiesRef = new Map();
     this.todosRef = [];
     this.artifactsRef = [];
+    this.filesRef = [];
     this.reasoningStartRef = null;
     this.reasoningMsRef = 0;
     this.reasoningStreamsRef = new Map();
@@ -308,6 +323,7 @@ class AgentController implements AgentControllerApi {
     this.activities = [];
     this.todos = [];
     this.artifacts = [];
+    this.files = [];
     this.pendingInput = null;
     this.pendingSuggestion = null;
     this.pendingApproval = null;
@@ -570,6 +586,7 @@ class AgentController implements AgentControllerApi {
       activities: [...finalActivities, ...todoActivities],
       todos: this.todosRef,
       artifacts: this.artifactsRef,
+      files: this.filesRef.length > 0 ? [...this.filesRef] : undefined,
       completed: pipelineCompleted && !cancelled,
     };
   };

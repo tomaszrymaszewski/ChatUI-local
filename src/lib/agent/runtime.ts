@@ -123,6 +123,10 @@ Other tools:
   task spec, document requirements), call request_structured_input with a short form instead of
   asking in prose.
 - You can run Python on the user's machine with run_python to execute or verify code.
+- Files you create on disk (a .pptx built with python-pptx, a report, a dataset, an image) are
+  invisible to the user until you share them: call share_files with the absolute paths and a
+  download card is attached to your message. Never say a file is "ready to download" without
+  calling share_files first.
 `.trim();
 
 const SUGGESTIONS_PROMPT = `
@@ -133,11 +137,12 @@ Chat modes — the user can activate special modes by starting their message wit
 You can also suggest a mode to the user via the suggest tool when their request would clearly benefit from one.
 
 Skills and connectors — proactive discovery:
-- Installed skills are listed in the Skills System section above. But the user may not have the
-  right skill installed yet. When the user's task might benefit from a capability they don't have
-  (creating Word/Excel/PPT/PDF files, frontend design, testing, etc.), call search_skills first to
-  find matching skills in the catalog. If one is found and not installed, call suggest with
-  kind=skill to show an actionable install card.
+- Installed skills are listed in the Skills System section above. Every catalog skill is
+  auto-installed at launch, so when the user's task might benefit from a capability
+  (creating Word/Excel/PPT/PDF files, frontend design, testing, etc.), call search_skills
+  to find the matching skill and use it directly — do not ask the user to download
+  anything. Only if a matching skill somehow shows as NOT installed (launch download
+  still running or failed), call suggest with kind=skill to show an install card.
 - Similarly, when the user wants to interact with an external app (email, calendar, docs, project
   tracker, etc.) and no matching connector is connected, call search_connectors to find one. If a
   match is found and not connected, call suggest with kind=connector — the card lets the user
@@ -165,11 +170,13 @@ Working style:
 - Spawn subagents with the task tool for independent research or verification work — in parallel
   when the steps don't depend on each other — and synthesize their reports.
 - Use web_search / web_fetch for anything current or external. Read installed skills under
-  /skills/ when a task matches one.
-- When a task would benefit from a skill or connector the user doesn't have yet, find it with
-  search_skills / search_connectors and propose it with the suggest tool. Connectors surfaced in
+  /skills/ when a task matches one — catalog skills are auto-installed at launch, so use them
+  directly instead of asking the user to download anything.
+- When a task would benefit from a connector the user doesn't have yet, find it with
+  search_connectors and propose it with the suggest tool. Connectors surfaced in
   the "Relevant knowledge" context that aren't connected yet can be proposed the same way — the
-  suggestion card lets the user connect and sign in with one click.
+  suggestion card lets the user connect and sign in with one click. (Only a skill that failed to
+  auto-install is worth a kind=skill suggestion.)
 - Connected external apps are available as mcp__… tools.
 - Be transparent: say what you are about to do, and report what you did.
 `.trim();
@@ -200,7 +207,10 @@ Local files:
   (e.g. a report, paper, or project directory).
 - write_local_file creates or overwrites a file with the full content. When editing an existing file,
   read it first, then write the complete new content.
-- The user approves every file access with an approve/deny card; if one is denied, don't retry —
+- share_files gives the user download buttons for files you created — any file deliverable
+  (deck, document, dataset, image, zip) must be shared this way before you wrap up, or the user
+  cannot get it out of your workspace.
+- The user approves every file read/write with an approve/deny card; if one is denied, don't retry —
   ask what to do instead.
 `.trim();
 
@@ -218,9 +228,16 @@ function buildAgentSandboxPrompt(sandbox: AgentSandbox): string {
   if (workspace) {
     lines.push(
       `- Private workspace: ${workspace} — your own persistent folder on the user's Mac. ` +
-        "You can always read and write files there; use it for your notes and deliverables.",
+        "You can always read and write files there; use it for your notes and deliverables. " +
+        "The chat cannot see into your workspace — call share_files for every deliverable " +
+        "you save there, or the user has no way to download it.",
     );
   }
+  lines.push(
+    "- Skills: the shared skills folder is always inside your sandbox (every catalog skill is " +
+      "auto-installed there at launch). Skill contents are NOT preloaded into your context — " +
+      "they are read on demand, so open a skill's SKILL.md whenever its topic matches your task.",
+  );
   if (folders.length > 0) {
     lines.push(
       `- Allowed folders (read_local_file / write_local_file / run_coding_task): ${folders.join(", ")}`,

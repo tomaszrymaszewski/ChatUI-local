@@ -12,12 +12,30 @@ import {
   KeyRound,
   LayoutDashboard,
   MessageCircle,
+  MoreHorizontal,
+  Pencil,
   Plus,
   Plug,
   Settings,
   Sparkles,
+  Trash2,
   User,
 } from "lucide-react"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Button } from "@/components/ui/button"
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import { isMacOS } from "@/lib/platform"
 import { cn } from "@/lib/utils"
@@ -32,6 +50,7 @@ import {
   SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
+  SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarRail,
@@ -189,6 +208,12 @@ export function AppSidebar({
   agentConsoleComposing?: boolean
 }) {
 
+  const { isMobile } = useSidebar()
+
+  // Rename dialog state for the agent-console session list.
+  const [agentSessionRename, setAgentSessionRename] = React.useState<{ id: string; title: string } | null>(null)
+  const [agentSessionRenameDraft, setAgentSessionRenameDraft] = React.useState("")
+
   const startDrag = (e: React.MouseEvent) => {
     if (e.button === 0) getCurrentWindow().startDragging();
   };
@@ -249,12 +274,49 @@ export function AppSidebar({
                       isActive={session.id === activeSessionId && !agentConsoleComposing}
                       onClick={() => onSelectSession(session.id)}
                       tooltip={session.title}
+                      // The kebab floats over the row, so keep the title's
+                      // full width (menu actions normally reserve pr-8).
+                      className="pr-2!"
                     >
                       <span className="truncate">{session.title}</span>
                       {runningIds?.has(session.id) && (
                         <Spinner className="ml-auto size-3" />
                       )}
                     </SidebarMenuButton>
+                    {/* The kebab floats on top of the row (no space is taken
+                        from the title); the opaque background keeps it readable
+                        over the title text. */}
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <SidebarMenuAction showOnHover className="bg-background shadow-sm">
+                          <MoreHorizontal />
+                          <span className="sr-only">More</span>
+                        </SidebarMenuAction>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent
+                        className="w-44 rounded-lg"
+                        side={isMobile ? "bottom" : "right"}
+                        align={isMobile ? "end" : "start"}
+                      >
+                        <DropdownMenuItem
+                          onClick={() => {
+                            setAgentSessionRename({ id: session.id, title: session.title });
+                            setAgentSessionRenameDraft(session.title);
+                          }}
+                        >
+                          <Pencil className="text-muted-foreground" />
+                          <span>Rename</span>
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem
+                          variant="destructive"
+                          onClick={() => onDeleteChat(session.id)}
+                        >
+                          <Trash2 className="text-muted-foreground" />
+                          <span>Delete Session</span>
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </SidebarMenuItem>
                 ))}
                 {agentSessions.length === 0 && (
@@ -270,6 +332,69 @@ export function AppSidebar({
               onOpenAgentConsole={(agentId) => onOpenAgentConsole?.(agentId)}
             />
           </SidebarContent>
+
+          <Dialog
+            open={!!agentSessionRename}
+            onOpenChange={(open) => {
+              if (!open) {
+                setAgentSessionRename(null);
+                setAgentSessionRenameDraft("");
+              }
+            }}
+          >
+            <DialogContent>
+              <DialogHeader>
+                <DialogTitle className="flex items-center gap-2">
+                  <Pencil className="size-5" />
+                  Rename Session
+                </DialogTitle>
+              </DialogHeader>
+              <div className="flex flex-col gap-4 pt-2">
+                <Input
+                  autoFocus
+                  value={agentSessionRenameDraft}
+                  onChange={(e) => setAgentSessionRenameDraft(e.target.value)}
+                  placeholder="Session name"
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && agentSessionRename && agentSessionRenameDraft.trim() && onRenameChat) {
+                      onRenameChat(agentSessionRename.id, agentSessionRenameDraft.trim());
+                      setAgentSessionRename(null);
+                      setAgentSessionRenameDraft("");
+                    }
+                    if (e.key === "Escape") {
+                      setAgentSessionRename(null);
+                      setAgentSessionRenameDraft("");
+                    }
+                  }}
+                />
+                <div className="flex justify-end gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setAgentSessionRename(null);
+                      setAgentSessionRenameDraft("");
+                    }}
+                  >
+                    Cancel
+                  </Button>
+                  <Button
+                    size="sm"
+                    disabled={!agentSessionRenameDraft.trim()}
+                    onClick={() => {
+                      if (agentSessionRename && onRenameChat) {
+                        onRenameChat(agentSessionRename.id, agentSessionRenameDraft.trim());
+                      }
+                      setAgentSessionRename(null);
+                      setAgentSessionRenameDraft("");
+                    }}
+                  >
+                    Rename
+                  </Button>
+                </div>
+              </div>
+            </DialogContent>
+          </Dialog>
         </div>
       ) : view !== "settings" ? (
         activeTab === "agent" ? (

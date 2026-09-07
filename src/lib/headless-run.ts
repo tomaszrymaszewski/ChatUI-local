@@ -13,6 +13,7 @@ import {
   updateMessageHeadless,
 } from "@/hooks/use-messages";
 import { ensureAgentWorkspace } from "@/lib/agent/sandbox";
+import { globalSkillsDirectory } from "@/lib/skills-library";
 import { renderStepPrompt } from "@/lib/workflows";
 
 /**
@@ -75,8 +76,9 @@ export async function runHeadlessTask(opts: {
     );
   }
 
-  // Filesystem sandbox for saved agents: private workspace + granted folders
-  // + granted projects' folders (same composition as ChatView).
+  // Filesystem sandbox for saved agents: private workspace + the shared
+  // skills folder + granted folders + granted projects' folders (same
+  // composition as ChatView).
   let workspace: string | undefined;
   let allowedDirectories: string[] | undefined;
   if (agentDef) {
@@ -87,8 +89,10 @@ export async function runHeadlessTask(opts: {
       : (agentDef.allowedProjects ?? [])
           .map((pid) => projectRecords.find((p) => p.id === pid)?.directory)
           .filter((d): d is string => !!d);
+    const skillsDir = await globalSkillsDirectory().catch(() => undefined);
     allowedDirectories = [
       ...(workspace ? [workspace] : []),
+      ...(skillsDir ? [skillsDir] : []),
       ...(agentDef.allowedFolders ?? []),
       ...projectDirs,
     ];
@@ -141,7 +145,8 @@ export async function runHeadlessTask(opts: {
         toolProfile: "task",
         enableCommandTools: agentDef ? agentDef.capabilities.terminal : true,
         enableFileTools: !!agentDef,
-        mcpNames: agentDef?.connectors,
+        mcpNames:
+          agentDef && agentDef.connectors.length > 0 ? agentDef.connectors : undefined,
         ...(agentDef && allowedDirectories
           ? {
               sandbox: {
@@ -173,6 +178,7 @@ export async function runHeadlessTask(opts: {
     activities: result.activities,
     reasoningStreams: result.reasoningStreams,
     artifacts: result.artifacts,
+    files: result.files?.length ? result.files : undefined,
   });
 
   return {

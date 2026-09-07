@@ -227,13 +227,87 @@ export async function listAnthropicSkills(): Promise<SkillCatalogEntry[]> {
 
 // ─── Install / delete / list installed ─────────────────────────────────────
 
+// Names the user has deliberately deleted — the launch auto-installer must
+// not resurrect them. Any manual install clears the marker again.
+const AUTO_INSTALL_SKIP_KEY = "chatui:skills:auto-install-skipped";
+
+function readAutoInstallSkip(): Set<string> {
+  try {
+    const raw = localStorage.getItem(AUTO_INSTALL_SKIP_KEY);
+    if (!raw) return new Set();
+    return new Set(JSON.parse(raw) as string[]);
+  } catch {
+    return new Set();
+  }
+}
+
+function writeAutoInstallSkip(names: Set<string>): void {
+  try {
+    localStorage.setItem(AUTO_INSTALL_SKIP_KEY, JSON.stringify([...names]));
+  } catch {
+    // ignore quota errors
+  }
+}
+
+function markAutoInstallSkip(name: string): void {
+  const names = readAutoInstallSkip();
+  if (names.has(name)) return;
+  names.add(name);
+  writeAutoInstallSkip(names);
+}
+
+function clearAutoInstallSkip(name: string): void {
+  const names = readAutoInstallSkip();
+  if (!names.has(name)) return;
+  names.delete(name);
+  writeAutoInstallSkip(names);
+}
+
+/**
+ * The app-owned skills home: ~/Documents/chatUI/skills (kept alongside the
+ * rest of the app's data — sessions, agents, projects). The skills folder
+ * used to live at ~/.config/opencode/skills (shared with the legacy opencode
+ * integration); anything found there is copied over once, and the legacy
+ * folder is left untouched.
+ */
+export async function globalSkillsDirectory(): Promise<string> {
+  const base = await invoke<string>("ensure_chat_ui_directory");
+  return `${base}/skills`;
+}
+
+let legacyMigration: Promise<void> | null = null;
+
+function migrateLegacySkillsDir(): Promise<void> {
+  legacyMigration ??= (async () => {
+    try {
+      const home = await invoke<string>("get_home_dir");
+      const legacy = `${home}/.config/opencode/skills`;
+      if (!(await invoke<boolean>("path_exists", { path: legacy }))) return;
+      const dest = await globalSkillsDirectory();
+      const entries = await invoke<Array<{ name: string; path: string }>>("list_dir_entries", {
+        path: legacy,
+      });
+      for (const entry of entries) {
+        const target = `${dest}/${entry.name}`;
+        if (await invoke<boolean>("path_exists", { path: target })) continue;
+        await invoke("copy_path", { src: entry.path, dest: target }).catch(() => {
+          // Skip this skill — retried on the next launch (idempotent).
+        });
+      }
+    } catch {
+      // Browser dev / no shell — nothing to migrate.
+    }
+  })();
+  return legacyMigration;
+}
+
 async function globalSkillsDir(): Promise<string> {
-  const home = await invoke<string>("get_home_dir");
-  return `${home}/.config/opencode/skills`;
+  await migrateLegacySkillsDir();
+  return globalSkillsDirectory();
 }
 
 function projectSkillsDir(projectDir: string): string {
-  return `${projectDir}/.opencode/skills`;
+  return `${projectDir}/.chatui/skills`;
 }
 
 export async function installBundledSkill(name: string, scope: "global" | "project", projectDir?: string): Promise<void> {
@@ -241,6 +315,7 @@ export async function installBundledSkill(name: string, scope: "global" | "proje
   if (!content) throw new Error(`Unknown bundled skill: ${name}`);
   const base = scope === "global" ? await globalSkillsDir() : projectSkillsDir(projectDir!);
   await invoke("write_text_file", { path: `${base}/${name}/SKILL.md`, content });
+  clearAutoInstallSkip(name);
 }
 
 export async function installAnthropicSkill(name: string, scope: "global" | "project", projectDir?: string): Promise<void> {
@@ -274,6 +349,7 @@ export async function listInstalledSkills(scope: "global" | "project", projectDi
 export async function deleteSkill(name: string, scope: "global" | "project", projectDir?: string): Promise<void> {
   const base = scope === "global" ? await globalSkillsDir() : projectSkillsDir(projectDir!);
   await invoke("remove_path", { path: `${base}/${name}` });
+  markAutoInstallSkip(name);
 }
 
 // ─── Generic GitHub skill installer (for any curated source repo) ───────────
@@ -304,6 +380,7 @@ export async function installCuratedSkill(
     const relPath = file.path.slice(prefix.length);
     await invoke("write_text_file", { path: `${base}/${skill.name}/${relPath}`, content });
   }
+  clearAutoInstallSkip(skill.name);
 }
 
 // ─── Curated skill content cache (full SKILL.md bodies, fetched once) ──────
@@ -365,6 +442,42 @@ export async function ensureCuratedSkillContent(): Promise<void> {
     } catch {
       // ignore quota errors
     }
+  }
+}
+
+// ─── Auto-install: every catalog skill on disk and agent-ready ─────────────
+
+/**
+ * Install every bundled + curated skill that isn't on disk yet (global
+ * scope). Called once in the background at launch so no agent ever has to
+ * ask the user to download a skill: DeepAgentSession.create re-reads the
+ * skills directory on every send, so anything written here is usable by the
+ * very next message. Skills the user deleted are left alone (see
+ * AUTO_INSTALL_SKIP_KEY); failures are silent and retried on the next
+ * launch.
+ */
+export async function ensureAllCuratedSkillsInstalled(): Promise<void> {
+  try {
+    const installed = new Set((await listInstalledSkills("global")).map((s) => s.name));
+    const skipped = readAutoInstallSkip();
+    for (const skill of CURATED_SKILLS) {
+      if (installed.has(skill.name) || skipped.has(skill.name)) continue;
+      try {
+        await installCuratedSkill(skill, "global");
+      } catch {
+        // offline / rate-limited — retried on the next launch
+      }
+    }
+    for (const bundled of BUNDLED_SKILLS) {
+      if (installed.has(bundled.name) || skipped.has(bundled.name)) continue;
+      try {
+        await installBundledSkill(bundled.name, "global");
+      } catch {
+        // retried on the next launch
+      }
+    }
+  } catch {
+    // scope unavailable (e.g. plain browser dev) — nothing to do
   }
 }
 

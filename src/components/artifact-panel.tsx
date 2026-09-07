@@ -268,7 +268,7 @@ export function ArtifactPanel({
   };
 
   return (
-    <div className={cn("flex h-full w-full flex-col overflow-hidden rounded-xl border bg-background shadow-2xl", windowMode !== "expanded" && "max-h-[90vh]")}>
+    <div className={cn("flex h-full w-full flex-col overflow-hidden rounded-xl border bg-background shadow-2xl @container", windowMode !== "expanded" && "max-h-[90vh]")}>
       {/* Title bar with macOS traffic lights */}
       <div className="group/tl relative flex shrink-0 items-center gap-2 border-b px-3 py-2">
         {/* Traffic lights */}
@@ -304,18 +304,18 @@ export function ArtifactPanel({
         </div>
 
         {/* Centered title */}
-        <span className="absolute left-1/2 max-w-[50%] -translate-x-1/2 truncate text-sm font-medium">
+        <span className="absolute left-1/2 max-w-[50%] -translate-x-1/2 truncate text-sm font-medium @max-[320px]:hidden">
           {artifact.title}
         </span>
 
-        {/* Actions (right) */}
-        <div className="ml-auto flex items-center gap-1">
+        {/* Actions (right) — buttons always win over badges/title when squeezed */}
+        <div className="relative ml-auto flex shrink-0 items-center gap-1">
           {modified && (
-            <span className="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] text-amber-600 dark:text-amber-400">
+            <span className="shrink-0 rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] text-amber-600 @max-[380px]:hidden dark:text-amber-400">
               Modified
             </span>
           )}
-          <span className="shrink-0 rounded-full bg-secondary px-2 py-0.5 text-[10px] text-secondary-foreground">
+          <span className="shrink-0 rounded-full bg-secondary px-2 py-0.5 text-[10px] text-secondary-foreground @max-[380px]:hidden">
             {artifact.language}
           </span>
           {runnable && (

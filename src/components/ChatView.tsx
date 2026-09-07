@@ -27,10 +27,12 @@ import {
   SquareTerminal,
   Globe,
   GraduationCap,
+  Loader2,
   UsersRound,
   SignalHigh,
   SignalMedium,
   SignalLow,
+  Download,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar, type AgentConsoleTab } from "@/components/app-sidebar";
@@ -47,6 +49,7 @@ import { ArtifactPanel } from "@/components/artifact-panel";
 import { StructuredInputForm } from "@/components/structured-input-form";
 import { SuggestionCard, installSkillByName } from "@/components/suggestion-card";
 import { type Artifact } from "@/lib/artifacts";
+import { downloadSharedFile } from "@/lib/local-file";
 import { checkForUpdate, loadUpdateSettings, isUpdaterAvailable } from "@/lib/updater";
 import { detectModeTrigger } from "@/lib/mode-triggers";
 import { modelLabel } from "@/lib/model-display";
@@ -134,7 +137,11 @@ import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
-import { ensureCuratedSkillContent } from "@/lib/skills-library";
+import {
+  ensureCuratedSkillContent,
+  ensureAllCuratedSkillsInstalled,
+  globalSkillsDirectory,
+} from "@/lib/skills-library";
 import { useAgents } from "@/hooks/use-agents";
 import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController } from "@/hooks/use-deep-agent";
 import { useScheduler } from "@/hooks/use-scheduler";
@@ -332,10 +339,13 @@ export function ChatView() {
   // Knowledge index: first sweep shortly after launch (debounced triggers in
   // use-deep-agent re-index after each run). Curated skill content is
   // prefetched once in the background so full skill instructions are
-  // searchable (and retrievable) before any install.
+  // searchable (and retrievable) before any install, and every catalog skill
+  // is auto-installed to the global skills dir so agents can use them
+  // without asking the user to download anything.
   useEffect(() => {
     scheduleKnowledgeSweep(15_000);
     void ensureCuratedSkillContent()
+      .then(() => ensureAllCuratedSkillsInstalled())
       .then(() => scheduleKnowledgeSweep(2_000))
       .catch(() => {});
   }, []);
@@ -491,12 +501,14 @@ export function ChatView() {
         .join("\n\n")
       : currentProjectInstructions || undefined;
 
-    // Filesystem sandbox for saved agents: private workspace + granted
-    // folders + granted projects' codebase folders. Standalone tasks and
-    // builder chats run unrestricted (approval-gated as before).
+    // Filesystem sandbox for saved agents: private workspace + the shared
+    // skills folder + granted folders + granted projects' codebase folders.
+    // Standalone tasks and builder chats run unrestricted (approval-gated as
+    // before).
     let sandbox: AgentSandbox | undefined;
     if (agentDef) {
       const workspace = await ensureAgentWorkspace(agentDef.id).catch(() => undefined);
+      const skillsDir = await globalSkillsDirectory().catch(() => undefined);
       const projectDirs = agentDef.allProjects
         ? projects.map((p) => p.directory).filter((d): d is string => !!d)
         : (agentDef.allowedProjects ?? [])
@@ -507,6 +519,7 @@ export function ChatView() {
         workspace,
         allowedDirectories: [
           ...(workspace ? [workspace] : []),
+          ...(skillsDir ? [skillsDir] : []),
           ...(agentDef.allowedFolders ?? []),
           ...projectDirs,
         ],
@@ -528,8 +541,10 @@ export function ChatView() {
         // authorization — granted folders are trusted, no approval cards.
         enableFileTools: !!agentDef,
         // Skills are auto-discovered: every agent sees all installed skills
-        // and pulls them in via search_skills when needed.
-        mcpNames: agentDef ? agentDef.connectors : undefined,
+        // and pulls them in via search_skills when needed. Connectors: an
+        // agent with no explicit selection gets every connected server.
+        mcpNames:
+          agentDef && agentDef.connectors.length > 0 ? agentDef.connectors : undefined,
         sandbox,
       },
       agent: agentDef,
@@ -670,6 +685,15 @@ export function ChatView() {
     setArtifactPanel({ artifacts: [artifact], activeIndex: 0 });
     setArtifactWindowMode("open");
     setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
+  };
+
+  const handleDownloadSharedFile = async (path: string) => {
+    try {
+      const name = await downloadSharedFile(path);
+      toast.success(`Downloaded ${name}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Download failed");
+    }
   };
 
   const startDrag = (e: React.MouseEvent) => {
@@ -981,6 +1005,7 @@ export function ChatView() {
           activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
           reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
           artifacts: ctrl.artifacts.length ? [...ctrl.artifacts] : undefined,
+          files: ctrl.files.length ? [...ctrl.files] : undefined,
         });
       }, 2500);
 
@@ -1008,7 +1033,7 @@ export function ChatView() {
         if (sessionId) updateSession(sessionId, { chat_mode: "none" });
       }
 
-      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0;
+      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0 || (result.files?.length ?? 0) > 0;
       if (hasOutput) {
         updateMessage(sessionId, assistantMsg.id, {
           content: result.content,
@@ -1016,6 +1041,7 @@ export function ChatView() {
           activities: result.activities,
           reasoningStreams: result.reasoningStreams,
           artifacts: result.artifacts?.length ? result.artifacts : undefined,
+          files: result.files?.length ? result.files : undefined,
         });
       } else {
         deleteMessage(sessionId, assistantMsg.id);
@@ -1482,13 +1508,20 @@ export function ChatView() {
    * the next send is wired to this agent.
    */
   const enterAgentCompose = () => {
-    if (!activeAgentConsole) return;
+    // The console may resolve through the open session (dashboard → session,
+    // moved chats) without activeAgentConsoleId being set. Pin the console
+    // explicitly — otherwise clearing the session below drops the console
+    // lookup and the dashboard opens instead of the new-session page.
+    const agentId = activeAgentConsole?.id ?? activeSession?.agentId;
+    if (!agentId || !agents.some((a) => a.id === agentId)) return;
     if (activeSessionId) {
       deleteTemporaryMessages(activeSessionId);
     }
     setActiveSessionId(null);
-    setPendingAgentId(activeAgentConsole.id);
+    setActiveAgentConsoleId(agentId);
+    setPendingAgentId(agentId);
     setPendingSetup(false);
+    setAgentDashboardOpen(false);
     setAgentConsoleComposing(true);
   };
 
@@ -1937,6 +1970,26 @@ export function ChatView() {
                         <FileCode className="size-4 shrink-0 text-muted-foreground" />
                         <span className="font-medium">{a.title}</span>
                         <span className="text-muted-foreground">{a.language}</span>
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
+              {(() => {
+                const shared = msg.files ?? [];
+                if (shared.length === 0) return null;
+                return (
+                  <div className="mb-1 flex flex-col gap-1.5">
+                    {shared.map((f) => (
+                      <button
+                        key={f.path}
+                        onClick={() => void handleDownloadSharedFile(f.path)}
+                        className="flex w-full items-center gap-2 rounded-lg border px-4 py-3 text-sm transition-opacity hover:bg-accent"
+                        title={f.path}
+                      >
+                        <FileText className="size-4 shrink-0 text-muted-foreground" />
+                        <span className="truncate font-medium">{f.name}</span>
+                        <Download className="ml-auto size-4 shrink-0 text-muted-foreground" />
                       </button>
                     ))}
                   </div>
@@ -2541,14 +2594,22 @@ export function ChatView() {
                         <Message>
                           <MessageContent>
                             {agent?.streamingContent || agent?.streamingReasoning || agent?.activities.length > 0 ? (
-                              <MessageStream
-                                content={agent?.streamingContent}
-                                activities={agent?.activities}
-                                reasoning={agent?.streamingReasoning}
-                                reasoningStreams={agent?.reasoningStreams}
-                                todos={agent?.todos}
-                                live
-                              />
+                              <>
+                                <MessageStream
+                                  content={agent?.streamingContent}
+                                  activities={agent?.activities}
+                                  reasoning={agent?.streamingReasoning}
+                                  reasoningStreams={agent?.reasoningStreams}
+                                  todos={agent?.todos}
+                                  live
+                                />
+                                {isAgentTab && (
+                                  <div className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground" role="status">
+                                    <Loader2 className="size-3.5 animate-spin" />
+                                    <span className="shimmer">Working…</span>
+                                  </div>
+                                )}
+                              </>
                             ) : (
                               <Marker role="status">
                                 <MarkerIcon>
@@ -2796,6 +2857,10 @@ export function ChatView() {
                   // and the composer never overflows. The minimized overlay is
                   // absolute-positioned and does not squeeze the chat column.
                   // When expanded, allow full width (chat column is hidden).
+                  // Floor the open panel so the header actions (download etc.)
+                  // are never squeezed out of reach — the chat column squishes
+                  // instead.
+                  minWidth: artifactWindowMode === "open" ? 220 : undefined,
                   maxWidth: artifactWindowMode === "minimized"
                     ? undefined
                     : artifactWindowMode === "expanded"
@@ -3512,6 +3577,7 @@ export function ChatView() {
           activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
           reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
           artifacts: ctrl.artifacts.length ? [...ctrl.artifacts] : undefined,
+          files: ctrl.files.length ? [...ctrl.files] : undefined,
         });
       }, 2500);
 
@@ -3539,7 +3605,7 @@ export function ChatView() {
         updateSession(newSession.id, { chat_mode: "none" });
       }
 
-      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0;
+      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0 || (result.files?.length ?? 0) > 0;
       if (hasOutput) {
         updateMessage(newSession.id, assistantMsg.id, {
           content: result.content,
@@ -3547,6 +3613,7 @@ export function ChatView() {
           activities: result.activities,
           reasoningStreams: result.reasoningStreams,
           artifacts: result.artifacts?.length ? result.artifacts : undefined,
+          files: result.files?.length ? result.files : undefined,
         });
 
         if (result.content) {

@@ -297,14 +297,54 @@ fn path_exists(path: String) -> bool {
 
 #[tauri::command]
 fn remove_path(path: String) -> Result<(), String> {
-    let p = PathBuf::from(&path);
+    let p = expand_tilde(&path);
     if p.is_dir() {
-        fs::remove_dir_all(&p).map_err(|e| e.to_string())
-    } else if p.is_file() {
-        fs::remove_file(&p).map_err(|e| e.to_string())
+        fs::remove_dir_all(&p).map_err(|e| format!("{}: {}", p.display(), e))
+    } else if p.exists() {
+        fs::remove_file(&p).map_err(|e| format!("{}: {}", p.display(), e))
     } else {
         Ok(())
     }
+}
+
+fn copy_path_recursive(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    if src.is_dir() {
+        fs::create_dir_all(dest).map_err(|e| format!("{}: {}", dest.display(), e))?;
+        for entry in fs::read_dir(src).map_err(|e| format!("{}: {}", src.display(), e))? {
+            let entry = entry.map_err(|e| format!("{}: {}", src.display(), e))?;
+            let child_src = entry.path();
+            let child_dest = dest.join(entry.file_name());
+            copy_path_recursive(&child_src, &child_dest)?;
+        }
+        Ok(())
+    } else if src.is_file() {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {}", parent.display(), e))?;
+        }
+        fs::copy(src, dest)
+            .map(|_| ())
+            .map_err(|e| format!("{} → {}: {}", src.display(), dest.display(), e))
+    } else {
+        Ok(())
+    }
+}
+
+/// Recursively copy a file or folder (skills-dir migration needs this — the
+/// web side only has text read/write, which would mangle scripts/binary
+/// assets inside skill folders). Creates `dest`'s parents as needed and
+/// overwrites an existing `dest` file.
+#[tauri::command]
+async fn copy_path(src: String, dest: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let s = expand_tilde(&src);
+        let d = expand_tilde(&dest);
+        if !s.exists() {
+            return Err(format!("Source does not exist: {}", s.display()));
+        }
+        copy_path_recursive(&s, &d)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1998,6 +2038,87 @@ async fn write_local_file(path: String, content: String) -> Result<LocalFileWrit
         .map_err(|e| e.to_string())?
 }
 
+/// Byte cap for files handed to the chat as download cards — generous for
+/// decks/documents/datasets while refusing absurd reads (multi-GB videos).
+const SHARED_FILE_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+/// A file the user wants to download from a chat message: raw bytes as
+/// standard base64 (the webview decodes with atob and saves a Blob).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SharedFileBytes {
+    path: String,
+    name: String,
+    size: u64,
+    content_base64: String,
+}
+
+fn base64_standard(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Read a file as base64 so the chat can offer it as a download (generated
+/// deliverables: pptx, docx, zip, images, …). Read-only, no approval card —
+/// the agent chose to hand the file to the user, which is the point.
+#[tauri::command]
+async fn read_shared_file(path: String) -> Result<SharedFileBytes, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let p = expand_tilde(&path);
+        if !p.is_absolute() {
+            return Err(format!(
+                "Path must be absolute (start with / or ~): {}",
+                path
+            ));
+        }
+        let meta = fs::metadata(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
+        if !meta.is_file() {
+            return Err(format!("{} is not a regular file", p.display()));
+        }
+        let size = meta.len();
+        if size > SHARED_FILE_MAX_BYTES {
+            return Err(format!(
+                "{} is {} bytes — larger than the {} MB download cap",
+                p.display(),
+                size,
+                SHARED_FILE_MAX_BYTES / (1024 * 1024)
+            ));
+        }
+        let bytes = fs::read(&p).map_err(|e| format!("Cannot read {}: {}", p.display(), e))?;
+        let name = p
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "download".to_string());
+        Ok(SharedFileBytes {
+            path: p.display().to_string(),
+            name,
+            size,
+            content_base64: base64_standard(&bytes),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ─── Scaffolding ───────────────────────────────────────────────────────────
 
 fn scaffold_command(template: &str) -> Result<(String, Vec<String>), String> {
@@ -2798,6 +2919,24 @@ mod tests {
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
+    // RFC 4648 test vectors — the webview decodes with atob, which only
+    // accepts the standard alphabet with padding.
+    #[test]
+    fn base64_standard_matches_rfc4648_vectors() {
+        assert_eq!(super::base64_standard(&[]), "");
+        assert_eq!(super::base64_standard(b"f"), "Zg==");
+        assert_eq!(super::base64_standard(b"fo"), "Zm8=");
+        assert_eq!(super::base64_standard(b"foo"), "Zm9v");
+        assert_eq!(super::base64_standard(b"foob"), "Zm9vYg==");
+        assert_eq!(super::base64_standard(b"fooba"), "Zm9vYmE=");
+        assert_eq!(super::base64_standard(b"foobar"), "Zm9vYmFy");
+        assert_eq!(
+            super::base64_standard(&[0xfb, 0xff, 0xff]),
+            "+///",
+            "full 3-byte group encodes without padding"
+        );
+    }
+
     // The frontend reads resp.statusText / resp.contentType (src/lib/http-fetch.ts);
     // a snake_case payload would silently break web_fetch with a JS TypeError.
     #[test]
@@ -2856,6 +2995,28 @@ mod tests {
         assert!(obj.contains_key("timedOut"));
         assert!(!obj.contains_key("exit_code"));
         assert!(!obj.contains_key("timed_out"));
+    }
+
+    // Skills-dir migration copies whole skill folders (nested files included)
+    // from the legacy location into the app-owned one.
+    #[test]
+    fn copy_path_recursive_copies_files_and_nested_folders() {
+        let base = std::env::temp_dir().join(format!("chatui-copy-test-{}", std::process::id()));
+        let src = base.join("src");
+        fs::create_dir_all(src.join("nested/deeper")).unwrap();
+        fs::write(src.join("SKILL.md"), "hello").unwrap();
+        fs::write(src.join("nested/deeper/script.py"), "print(1)").unwrap();
+        let dest = base.join("dest");
+        super::copy_path_recursive(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "hello");
+        assert_eq!(
+            fs::read_to_string(dest.join("nested/deeper/script.py")).unwrap(),
+            "print(1)"
+        );
+        // Copying again overwrites without error (idempotent migration).
+        super::copy_path_recursive(&src, &dest).unwrap();
+        assert_eq!(fs::read_to_string(dest.join("SKILL.md")).unwrap(), "hello");
+        fs::remove_dir_all(&base).unwrap();
     }
 
     // MCP OAuth metadata discovery follows RFC 8615 well-known URLs with the
@@ -3283,6 +3444,8 @@ pub fn run() {
             run_command,
             read_local_file,
             write_local_file,
+            read_shared_file,
+            copy_path,
             run_scaffold,
             list_local_sessions,
             save_local_session,

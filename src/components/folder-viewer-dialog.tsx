@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   ArrowLeft,
   ChevronRight,
+  Download,
   FileText,
   Folder,
   FolderOpen,
@@ -19,6 +20,8 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { downloadSharedFile } from "@/lib/local-file";
+import { toast } from "sonner";
 
 /** One folder the console's Access tab opens in this viewer. */
 export interface FolderViewerTarget {
@@ -160,6 +163,15 @@ export function FolderViewerDialog({
     }
   };
 
+  const download = async (path: string) => {
+    try {
+      const name = await downloadSharedFile(path);
+      toast.success(`Downloaded ${name}`);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Download failed");
+    }
+  };
+
   // Breadcrumb segments from the viewer's root to the current directory.
   const root = target.path.replace(/\/+$/, "");
   const relSegments =
@@ -271,6 +283,14 @@ export function FolderViewerDialog({
               <span className="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground">
                 {preview.name}
               </span>
+              <Button
+                variant="ghost"
+                size="xs"
+                onClick={() => void download(preview.path)}
+              >
+                <Download className="size-3" />
+                Download
+              </Button>
             </div>
             <ScrollArea className="h-72 rounded-lg border bg-muted/30">
               {preview.content !== null ? (
@@ -325,6 +345,26 @@ export function FolderViewerDialog({
                   <span className="shrink-0 text-[10px] text-muted-foreground">
                     {entry.isDir ? "folder" : formatBytes(entry.size)}
                   </span>
+                  {!entry.isDir && (
+                    <span
+                      role="button"
+                      tabIndex={0}
+                      className="shrink-0 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                      title={`Download ${entry.name}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void download(entry.path);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ") {
+                          e.stopPropagation();
+                          void download(entry.path);
+                        }
+                      }}
+                    >
+                      <Download className="size-3.5" />
+                    </span>
+                  )}
                 </button>
               ))}
             </div>
