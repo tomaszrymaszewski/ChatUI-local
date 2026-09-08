@@ -65,7 +65,16 @@ function serializeMessages(messages: Message[]) {
       content: m.content,
       timestamp: m.timestamp.toISOString(),
       model: m.model,
-      attachments: m.attachments,
+      // data: preview URLs (base64 screenshots) are the biggest payload here
+      // by far and are rebuildable from the IndexedDB blob store on load, so
+      // they are never persisted. Short blob:/http(s): URLs are kept as-is.
+      attachments: (m.attachments ?? []).map((a) => ({
+        ...a,
+        previewUrl:
+          typeof a.previewUrl === "string" && a.previewUrl.startsWith("data:")
+            ? undefined
+            : a.previewUrl,
+      })),
       session_id: m.session_id,
       parent_id: m.parent_id,
       is_temporary: m.is_temporary,
@@ -78,8 +87,94 @@ function serializeMessages(messages: Message[]) {
   );
 }
 
+const RECENCY_KEY = "chatui:messages:recency";
+const RECENCY_CAP = 500;
+
+function readRecency(): Record<string, number> {
+  try {
+    return JSON.parse(localStorage.getItem(RECENCY_KEY) ?? "{}") as Record<string, number>;
+  } catch {
+    return {};
+  }
+}
+
+/** Best-effort write-recency index so quota eviction drops stale chats first. */
+function touchRecency(sessionId: string): void {
+  try {
+    const recency = readRecency();
+    recency[sessionId] = Date.now();
+    const ids = Object.keys(recency);
+    if (ids.length > RECENCY_CAP) {
+      ids
+        .sort((a, b) => (recency[a] ?? 0) - (recency[b] ?? 0))
+        .slice(0, ids.length - RECENCY_CAP)
+        .forEach((id) => delete recency[id]);
+    }
+    localStorage.setItem(RECENCY_KEY, JSON.stringify(recency));
+  } catch {
+    // non-fatal bookkeeping
+  }
+}
+
+function messageStoreKeys(exceptSessionId: string): string[] {
+  const keys: string[] = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && key.startsWith("chatui:messages:") && key !== storageKey(exceptSessionId) && key !== RECENCY_KEY) {
+        keys.push(key);
+      }
+    }
+  } catch {
+    // listing failed — nothing to evict
+  }
+  return keys;
+}
+
+/**
+ * Persist a session's messages without ever throwing: localStorage is a
+ * single ~5MB store shared by every chat, so once old chats fill it even a
+ * brand-new chat's first save throws QuotaExceededError and the crash
+ * boundary takes down the app. On quota pressure the least-recently-written
+ * sessions are evicted (oldest first) until the write fits; when even the
+ * current session alone does not fit, it stays in memory for this run.
+ */
 function saveMessages(sessionId: string, messages: Message[]) {
-  localStorage.setItem(storageKey(sessionId), serializeMessages(messages));
+  const key = storageKey(sessionId);
+  const payload = serializeMessages(messages);
+  try {
+    localStorage.setItem(key, payload);
+    touchRecency(sessionId);
+    return;
+  } catch {
+    // quota pressure — fall through to eviction
+  }
+  try {
+    const recency = readRecency();
+    const others = messageStoreKeys(sessionId).sort(
+      (a, b) =>
+        (recency[a.slice("chatui:messages:".length)] ?? 0) -
+        (recency[b.slice("chatui:messages:".length)] ?? 0),
+    );
+    for (const other of others) {
+      try {
+        localStorage.removeItem(other);
+      } catch {
+        continue;
+      }
+      try {
+        localStorage.setItem(key, payload);
+        touchRecency(sessionId);
+        console.warn(`[chatui] storage full — evicted ${other} to save the current chat`);
+        return;
+      } catch {
+        // still full — keep evicting
+      }
+    }
+  } catch {
+    // eviction bookkeeping failed
+  }
+  console.warn("[chatui] storage full — current chat will not persist after reload");
 }
 
 /**
@@ -89,7 +184,7 @@ function saveMessages(sessionId: string, messages: Message[]) {
  */
 export function appendMessageHeadless(sessionId: string, msg: Message) {
   const next = [...loadMessages(sessionId), msg];
-  localStorage.setItem(storageKey(sessionId), serializeMessages(next));
+  saveMessages(sessionId, next);
   window.dispatchEvent(new Event(MESSAGES_EVENT));
   return msg;
 }
@@ -101,9 +196,9 @@ export function updateMessageHeadless(
 ) {
   const loaded = loadMessages(sessionId);
   if (!loaded.some((m) => m.id === messageId)) return;
-  localStorage.setItem(
-    storageKey(sessionId),
-    serializeMessages(loaded.map((m) => (m.id === messageId ? { ...m, ...updates } : m))),
+  saveMessages(
+    sessionId,
+    loaded.map((m) => (m.id === messageId ? { ...m, ...updates } : m)),
   );
   window.dispatchEvent(new Event(MESSAGES_EVENT));
 }

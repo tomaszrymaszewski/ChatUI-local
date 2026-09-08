@@ -1,12 +1,32 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   buildRunDigest,
   estimateMessageTokens,
+  MAX_HISTORY_TOKENS,
+  resolveHistoryBudget,
   toHistoryMessage,
   truncateMessagesToBudget,
 } from "./history";
 import type { AgentMessage } from "./runtime";
-import type { Message } from "@/types";
+import type { Message, Provider } from "@/types";
+
+vi.mock("@/lib/model-capabilities", () => ({ getModelContextWindow: vi.fn() }));
+
+import { getModelContextWindow } from "@/lib/model-capabilities";
+
+const mockedContextWindow = vi.mocked(getModelContextWindow);
+
+const provider = (baseUrl: string): Provider => ({
+  id: "p1",
+  name: "Test",
+  baseUrl,
+  models: [],
+  hasKey: true,
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
 
 const msg = (chars: number) => ({ role: "user" as const, content: "x".repeat(chars) });
 
@@ -121,6 +141,31 @@ describe("truncateMessagesToBudget", () => {
     expect(out).toHaveLength(1);
     expect(out[0].content).toBe("continue");
   });
+
+  it("replays an empty message's thought process so the next run can continue it", () => {
+    const messages: AgentMessage[] = [
+      { role: "user", content: "explain black holes" },
+      { role: "assistant", content: "", meta: { reasoning: "cut off mid-thought about event horizons" } },
+      { role: "user", content: "continue" },
+    ];
+    const out = truncateMessagesToBudget(messages, 5000);
+    expect(out).toHaveLength(3);
+    expect(String(out[1].content)).toContain("Thought process:");
+    expect(String(out[1].content)).toContain("event horizons");
+  });
+
+  it("skips an over-budget empty shell instead of blocking older context", () => {
+    const messages: AgentMessage[] = [
+      { role: "user", content: "o".repeat(400) },
+      { role: "assistant", content: "", meta: { reasoning: "r".repeat(8000) } },
+      { role: "user", content: "continue" },
+    ];
+    // Fits the old + new user messages, but not the ~2k-char thought digest.
+    const out = truncateMessagesToBudget(messages, 200);
+    expect(out).toHaveLength(2);
+    expect(out[0].content).toBe("o".repeat(400));
+    expect(out[1].content).toBe("continue");
+  });
 });
 
 describe("buildRunDigest", () => {
@@ -184,6 +229,37 @@ describe("buildRunDigest", () => {
     });
     expect(digest).toContain("## Research Report (markdown)");
     expect(digest).toContain("# Report\nbody");
+  });
+});
+
+describe("resolveHistoryBudget", () => {
+  it("caps huge model windows at 250k", async () => {
+    mockedContextWindow.mockResolvedValueOnce(1_000_000);
+    await expect(resolveHistoryBudget(provider("https://api.example.com"), "big")).resolves.toBe(
+      MAX_HISTORY_TOKENS,
+    );
+    expect(MAX_HISTORY_TOKENS).toBe(250000);
+  });
+
+  it("subtracts a realistic system+tools reserve from smaller windows", async () => {
+    mockedContextWindow.mockResolvedValueOnce(128_000);
+    await expect(resolveHistoryBudget(provider("https://api.example.com"), "mid")).resolves.toBe(
+      128_000 - 16384,
+    );
+  });
+
+  it("floors tiny local windows at the minimum instead of going negative", async () => {
+    mockedContextWindow.mockResolvedValueOnce(null);
+    await expect(resolveHistoryBudget(provider("http://localhost:11434"), "local")).resolves.toBe(
+      1024,
+    );
+  });
+
+  it("falls back to the default window when the catalog lookup fails", async () => {
+    mockedContextWindow.mockRejectedValueOnce(new Error("offline"));
+    await expect(resolveHistoryBudget(provider("https://api.example.com"), "x")).resolves.toBe(
+      32768 - 16384,
+    );
   });
 });
 

@@ -68,14 +68,15 @@ function MessageScrollerItem({
   scrollAnchor = false,
   ...props
 }: React.ComponentProps<typeof MessageScrollerPrimitive.Item>) {
+  // NOTE: no content-visibility here on purpose. Skipped subtrees report
+  // estimated sizes, so every rect the scroller measures during churn (a run
+  // finishing, boxes collapsing, the artifact panel opening) is a lie — and
+  // the viewport jumps, sometimes all the way to the top.
   return (
     <MessageScrollerPrimitive.Item
       data-slot="message-scroller-item"
       scrollAnchor={scrollAnchor}
-      className={cn(
-        "min-w-0 shrink-0 [contain-intrinsic-size:auto_10rem] [content-visibility:auto]",
-        className
-      )}
+      className={cn("min-w-0 shrink-0", className)}
       {...props}
     />
   )

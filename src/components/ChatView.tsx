@@ -1263,6 +1263,19 @@ export function ChatView() {
           completionMessages.push(toHistoryMessage(n.message));
         }
       }
+      // A cut-off reply (empty text, but thought process / findings /
+      // artifacts recorded) rides along so the new run continues the thinking
+      // instead of starting blind. Non-empty replies stay excluded —
+      // regenerating those means redoing the answer, not continuing it.
+      if (
+        !msg.content.trim() &&
+        (msg.reasoning ||
+          (msg.reasoningStreams?.length ?? 0) > 0 ||
+          (msg.activities?.length ?? 0) > 0 ||
+          (msg.artifacts?.length ?? 0) > 0)
+      ) {
+        completionMessages.push(toHistoryMessage(msg));
+      }
 
       const ctrl = getAgentController(activeSessionId);
       const assistantMsg = await addMessage(

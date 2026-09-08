@@ -4,8 +4,20 @@ import { getModelContextWindow } from "@/lib/model-capabilities";
 import type { AgentMessage, AgentMessageRunMeta } from "./runtime";
 
 const CHARS_PER_TOKEN = 4;
-/** Reserved for system prompt + tool schemas + the model's reply. */
-const OVERHEAD_RESERVE_TOKENS = 4096;
+/**
+ * Reserved for the system prompt + tool schemas + the model's reply. Tool
+ * schemas alone (built-ins plus one entry per MCP tool, each carrying its
+ * JSON schema) run well into five figures, so a 4k reserve routinely let the
+ * real prompt overshoot the window and killed runs mid-task.
+ */
+const OVERHEAD_RESERVE_TOKENS = 16384;
+/**
+ * Hard ceiling on replayed history in normal chat: the estimate sent per
+ * request never exceeds 250k tokens no matter how large the model's window
+ * is. Keeps runs inside the window providers actually serve reliably and the
+ * per-send cost minimal; older turns are dropped first.
+ */
+export const MAX_HISTORY_TOKENS = 250000;
 /** Local runtimes (Ollama/LM Studio) load small contexts by default. */
 const LOCAL_FALLBACK_CONTEXT = 8192;
 const DEFAULT_FALLBACK_CONTEXT = 32768;
@@ -23,7 +35,8 @@ function isLocalBaseUrl(baseUrl: string): boolean {
 /**
  * How many estimated tokens of replayed conversation history to allow.
  * Uses the models.dev context limit when known, a conservative budget for
- * local runtimes, and a moderate default otherwise.
+ * local runtimes, and a moderate default otherwise — always capped at
+ * MAX_HISTORY_TOKENS so normal chat never exceeds a 250k context.
  */
 export async function resolveHistoryBudget(
   provider: Provider,
@@ -32,7 +45,7 @@ export async function resolveHistoryBudget(
   const known = await getModelContextWindow(provider, modelName).catch(() => null);
   const contextWindow =
     known ?? (isLocalBaseUrl(provider.baseUrl) ? LOCAL_FALLBACK_CONTEXT : DEFAULT_FALLBACK_CONTEXT);
-  return Math.max(1024, contextWindow - OVERHEAD_RESERVE_TOKENS);
+  return Math.min(MAX_HISTORY_TOKENS, Math.max(1024, contextWindow - OVERHEAD_RESERVE_TOKENS));
 }
 
 export function estimateMessageTokens(
@@ -155,10 +168,14 @@ export function toHistoryMessage(m: Message, content?: string | ContentPart[]): 
 /**
  * Drop the oldest messages so the estimated total fits the budget. Assistant
  * messages carrying run metadata are expanded with the findings/reasoning
- * digest first; when the expanded form does not fit a tight budget, the plain
- * message is kept instead before dropping history. The most recent message is
- * always kept, even if it alone exceeds the budget (the provider's error will
- * surface to the user instead of silent confusion).
+ * digest first — that digest is what lets the next run continue a cut-off
+ * reply's thinking. When the expanded form does not fit a tight budget, the
+ * plain message is kept instead before dropping history — unless the plain
+ * message is itself empty (a cut-off shell with no text), in which case it is
+ * dropped outright: an empty shell carries no thought and would only evict
+ * older, real context. The most recent message is always kept, even if it
+ * alone exceeds the budget (the provider's error will surface to the user
+ * instead of silent confusion).
  */
 export function truncateMessagesToBudget(
   messages: AgentMessage[],
@@ -171,6 +188,11 @@ export function truncateMessagesToBudget(
     const tokens = estimateMessageTokens(expanded[i]);
     if (kept.length > 0 && used + tokens > budgetTokens) {
       const plain = messages[i];
+      if (isEmptyContent(plain.content)) {
+        // A cut-off shell with no text carries no thought — skip just this
+        // message and keep scanning older ones instead of stopping the window.
+        continue;
+      }
       if (plain !== expanded[i]) {
         const plainTokens = estimateMessageTokens(plain);
         if (used + plainTokens <= budgetTokens) {
@@ -185,4 +207,11 @@ export function truncateMessagesToBudget(
     used += tokens;
   }
   return kept;
+}
+
+function isEmptyContent(content: string | ContentPart[]): boolean {
+  if (typeof content === "string") return content.trim().length === 0;
+  return content.every((part) =>
+    part.type === "image_url" ? false : (part.text ?? "").trim().length === 0,
+  );
 }

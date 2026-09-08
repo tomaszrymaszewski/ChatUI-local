@@ -6,10 +6,12 @@ import { getModelOutputLimit } from "@/lib/model-capabilities";
 /**
  * Fallback max_tokens when the models.dev catalog doesn't know the model.
  * Without an explicit value the provider default applies, which can be
- * surprisingly small (e.g. DeepSeek defaults to 4096 output tokens) and
- * truncates long agent answers mid-stream.
+ * surprisingly small (e.g. DeepSeek defaults to 4096 output tokens) and ends
+ * runs mid-task or mid-thought with no error. 16k stays within the max output
+ * of virtually every chat model while giving long answers and reasoning
+ * models (whose thinking shares this budget) room to finish.
  */
-const FALLBACK_MAX_TOKENS = 8192;
+const FALLBACK_MAX_TOKENS = 16384;
 
 /**
  * The OpenAI JS client (under ChatOpenAI) attaches X-Stainless-* telemetry
