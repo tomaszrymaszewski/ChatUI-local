@@ -123,6 +123,8 @@ Other tools:
   task spec, document requirements), call request_structured_input with a short form instead of
   asking in prose.
 - You can run Python on the user's machine with run_python to execute or verify code.
+- You can run Node.js on the user's machine with run_node (CommonJS; skill libraries like
+  pptxgenjs are preinstalled) — use it for skill scripts that need Node.
 - Files you create on disk (a .pptx built with python-pptx, a report, a dataset, an image) are
   invisible to the user until you share them: call share_files with the absolute paths and a
   download card is attached to your message. Never say a file is "ready to download" without
@@ -409,6 +411,7 @@ function toolCallLabel(name: string, input: unknown): string | undefined {
     }
   }
   if (name === "run_python") return "Running Python";
+  if (name === "run_node") return "Running Node";
   if (name === "create_artifact" && typeof args.title === "string") {
     return `Creating "${args.title.slice(0, 40)}"`;
   }

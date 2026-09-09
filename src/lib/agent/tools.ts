@@ -4,6 +4,7 @@ import { tool, type StructuredTool } from "langchain";
 import { executeTool } from "@/lib/tools";
 import { runPython } from "@/lib/run-python";
 import { runCommand } from "@/lib/run-command";
+import { runNode } from "@/lib/run-node";
 import {
   detectCodingAgents,
   resolveCodingAgent,
@@ -280,6 +281,31 @@ export function buildAgentTools(
           "Use to execute or verify code you wrote (calculations, data processing, quick checks).",
         schema: z.object({
           code: z.string().describe("Complete Python script to execute."),
+        }),
+      },
+    ),
+    tool(
+      async ({ code, cwd }: { code: string; cwd?: string }) => {
+        const result = await runNode(code, cwd);
+        const parts: string[] = [];
+        if (result.stdout) parts.push(`stdout:\n${result.stdout.slice(0, 8000)}`);
+        if (result.stderr) parts.push(`stderr:\n${result.stderr.slice(0, 4000)}`);
+        if (result.timedOut) parts.push("(execution timed out)");
+        parts.push(`exit code: ${result.exitCode}`);
+        return parts.join("\n\n");
+      },
+      {
+        name: "run_node",
+        description:
+          "Run Node.js (JavaScript) code on the user's system node and return stdout/stderr. " +
+          "Use for skill scripts that need Node (e.g. pptxgenjs decks for the pptx skill). " +
+          "Common skill libraries like pptxgenjs are preinstalled — require() them directly.",
+        schema: z.object({
+          code: z.string().describe("Complete Node.js script to execute (CommonJS, use require())."),
+          cwd: z
+            .string()
+            .optional()
+            .describe("Working directory (absolute path) — use for skill scripts and output files."),
         }),
       },
     ),

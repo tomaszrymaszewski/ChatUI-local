@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -135,6 +135,18 @@ function ThinkingBlock({
   label?: string;
 }) {
   const [open, setOpen] = useState(true);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const pinnedRef = useRef(true);
+
+  // Autoscroll: follow the live reasoning stream to the bottom, but stop
+  // pinning as soon as the user scrolls up inside the block — and resume
+  // when they scroll back near the bottom.
+  useEffect(() => {
+    if (!live || !open) return;
+    const el = bodyRef.current;
+    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
+  }, [reasoning, live, open]);
+
   if (!reasoning) return null;
 
   const defaultLabel = live
@@ -162,7 +174,14 @@ function ThinkingBlock({
         {open ? <ChevronDown className="size-2.5" /> : <ChevronRight className="size-2.5" />}
       </button>
       {open && (
-        <div className="mt-1 max-h-60 overflow-y-auto rounded-lg border bg-muted/20 p-3">
+        <div
+          ref={bodyRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 24;
+          }}
+          className="mt-1 max-h-60 overflow-y-auto rounded-lg border bg-muted/20 p-3"
+        >
           <MarkdownRenderer content={reasoning} className="text-xs text-muted-foreground" />
         </div>
       )}

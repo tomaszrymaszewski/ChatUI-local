@@ -67,6 +67,7 @@ import {
   AttachmentTitle,
 } from "@/components/ui/attachment";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
+import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -166,6 +167,7 @@ import {
 import { prepareAttachmentContext, rebuildAttachmentContent, buildProjectFilesContext } from "@/lib/attachment-context";
 import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
+import { ensureNodeLibs } from "@/lib/run-node";
 import { getModelCapabilities } from "@/lib/model-capabilities";
 import { buildMemoryContext, extractAndSaveMemory, loadMemory } from "@/lib/memory";
 
@@ -259,6 +261,7 @@ export function ChatView() {
   const inProgressMsgIds = useRef<Map<string, string>>(new Map());
   const [inputText, setInputText] = useState("");
   const [files, setFiles] = useState<PendingFile[]>([]);
+  const [draggingFiles, setDraggingFiles] = useState(false);
   const [webFetchEnabled, setWebFetchEnabled] = useState(true);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
@@ -344,6 +347,7 @@ export function ChatView() {
   // without asking the user to download anything.
   useEffect(() => {
     scheduleKnowledgeSweep(15_000);
+    void ensureNodeLibs();
     void ensureCuratedSkillContent()
       .then(() => ensureAllCuratedSkillsInstalled())
       .then(() => scheduleKnowledgeSweep(2_000))
@@ -719,36 +723,56 @@ export function ChatView() {
     setIsEditingTitle(false);
   };
 
+  const addFiles = (selected: File[]) => {
+    if (selected.length === 0) return;
+    setFiles((prev) => [
+      ...prev,
+      ...selected.map((file) => {
+        const id = generateId();
+        // Persist the bytes (plus eagerly extracted text for documents) so
+        // the attachment survives restarts and stays in context on replay.
+        if (file.type.startsWith("image/")) {
+          void putFileBlob(id, file);
+        } else {
+          void extractFileText(file)
+            .then((text) => putFileBlob(id, file, { extractedText: text }))
+            .catch(() => {});
+        }
+        return {
+          id,
+          name: file.name,
+          size: file.size,
+          type: file.type,
+          previewUrl: file.type.startsWith("image/")
+            ? URL.createObjectURL(file)
+            : undefined,
+          file,
+        };
+      }),
+    ]);
+  };
+
   const handleFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = Array.from(e.target.files ?? []);
-    if (selected.length > 0) {
-      setFiles((prev) => [
-        ...prev,
-        ...selected.map((file) => {
-          const id = generateId();
-          // Persist the bytes (plus eagerly extracted text for documents) so
-          // the attachment survives restarts and stays in context on replay.
-          if (file.type.startsWith("image/")) {
-            void putFileBlob(id, file);
-          } else {
-            void extractFileText(file)
-              .then((text) => putFileBlob(id, file, { extractedText: text }))
-              .catch(() => {});
-          }
-          return {
-            id,
-            name: file.name,
-            size: file.size,
-            type: file.type,
-            previewUrl: file.type.startsWith("image/")
-              ? URL.createObjectURL(file)
-              : undefined,
-            file,
-          };
-        }),
-      ]);
-    }
+    addFiles(Array.from(e.target.files ?? []));
     e.target.value = "";
+  };
+
+  /** HTML5 drag & drop from Finder onto a composer (Tauri dragDropEnabled is off). */
+  const composerDropHandlers = {
+    onDragOver: (e: React.DragEvent) => {
+      if (!e.dataTransfer.types.includes("Files")) return;
+      e.preventDefault();
+      setDraggingFiles(true);
+    },
+    onDragLeave: (e: React.DragEvent) => {
+      if (e.currentTarget.contains(e.relatedTarget as Node | null)) return;
+      setDraggingFiles(false);
+    },
+    onDrop: (e: React.DragEvent) => {
+      e.preventDefault();
+      setDraggingFiles(false);
+      addFiles(Array.from(e.dataTransfer?.files ?? []));
+    },
   };
 
   const removeFile = (id: string) => {
@@ -2591,52 +2615,61 @@ export function ChatView() {
                 <MessageScrollerViewport>
                   <MessageScrollerContent className="mx-auto w-full max-w-3xl px-4 py-6">
                     {activePath.map((node) => {
-                      // Hide the in-progress assistant message while its live
-                      // streaming bubble (below) is showing the same run.
+                      // The in-progress assistant message renders its live
+                      // streaming bubble in place — the same MessageScrollerItem
+                      // the finished message will occupy. Swapping a separate
+                      // "thinking" item for the real one on completion was a
+                      // same-count child swap that made the message scroller
+                      // treat it as a new scroll anchor and jump the chat to
+                      // the top; keeping one item avoids any childList change.
                       if (
                         agent?.isRunning &&
                         node.message.id === inProgressMsgIds.current.get(activeSessionId ?? "")
                       ) {
-                        return null;
+                        return (
+                          <MessageScrollerItem
+                            key={node.message.id}
+                            messageId={node.message.id}
+                          >
+                            <Message>
+                              <MessageContent>
+                                {agent?.streamingContent ||
+                                agent?.streamingReasoning ||
+                                agent?.activities.length > 0 ? (
+                                  <>
+                                    <MessageStream
+                                      content={agent?.streamingContent}
+                                      activities={agent?.activities}
+                                      reasoning={agent?.streamingReasoning}
+                                      reasoningStreams={agent?.reasoningStreams}
+                                      todos={agent?.todos}
+                                      live
+                                    />
+                                    <div
+                                      className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground"
+                                      role="status"
+                                    >
+                                      <Loader2 className="size-3.5 animate-spin" />
+                                      <span className="shimmer">Working…</span>
+                                    </div>
+                                  </>
+                                ) : (
+                                  <Marker role="status">
+                                    <MarkerIcon>
+                                      <Spinner />
+                                    </MarkerIcon>
+                                    <MarkerContent className="shimmer">
+                                      Thinking…
+                                    </MarkerContent>
+                                  </Marker>
+                                )}
+                              </MessageContent>
+                            </Message>
+                          </MessageScrollerItem>
+                        );
                       }
                       return renderMessage(node.message);
                     })}
-
-                    {agent?.isRunning && (
-                      <MessageScrollerItem messageId="thinking">
-                        <Message>
-                          <MessageContent>
-                            {agent?.streamingContent || agent?.streamingReasoning || agent?.activities.length > 0 ? (
-                              <>
-                                <MessageStream
-                                  content={agent?.streamingContent}
-                                  activities={agent?.activities}
-                                  reasoning={agent?.streamingReasoning}
-                                  reasoningStreams={agent?.reasoningStreams}
-                                  todos={agent?.todos}
-                                  live
-                                />
-                                {isAgentTab && (
-                                  <div className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground" role="status">
-                                    <Loader2 className="size-3.5 animate-spin" />
-                                    <span className="shimmer">Working…</span>
-                                  </div>
-                                )}
-                              </>
-                            ) : (
-                              <Marker role="status">
-                                <MarkerIcon>
-                                  <Spinner />
-                                </MarkerIcon>
-                                <MarkerContent className="shimmer">
-                                  Thinking…
-                                </MarkerContent>
-                              </Marker>
-                            )}
-                          </MessageContent>
-                        </Message>
-                      </MessageScrollerItem>
-                    )}
                   </MessageScrollerContent>
                 </MessageScrollerViewport>
                 <MessageScrollerButton />
@@ -2679,9 +2712,15 @@ export function ChatView() {
                       onApplyAgentConfig={handleApplyAgentConfig}
                     />
                  ) : (
-                 <InputGroup className={isTemporary ? "border-dashed" : undefined}>
-                  {files.length > 0 && (
-                    <InputGroupAddon align="block-start">
+                 <InputGroup
+                   className={cn(
+                     isTemporary && "border-dashed",
+                     draggingFiles && "border-ring ring-[3px] ring-ring/50",
+                   )}
+                   {...composerDropHandlers}
+                 >
+                   {files.length > 0 && (
+                     <InputGroupAddon align="block-start">
                       <AttachmentGroup className="w-full">
                         {files.map((file) => (
                           <Attachment key={file.id} size="xs">
@@ -2903,7 +2942,7 @@ export function ChatView() {
               <div className="relative flex min-h-0 min-w-0 flex-1 flex-col border-r">
                 <PatternBackground pattern={settings.backgroundPattern} />
                 <div className="relative shrink-0 p-4">
-                  <InputGroup className={isTemporary ? "border-dashed" : undefined}>
+                 <InputGroup className={isTemporary ? "border-dashed" : undefined}>
                     <InputGroupTextarea
                       value={projectInputText}
                       onChange={(e) => setProjectInputText(e.currentTarget.value)}
@@ -3242,7 +3281,14 @@ export function ChatView() {
                     onApplyAgentConfig={handleApplyAgentConfig}
                   />
               ) : (
-              <InputGroup className={`bg-card/60 backdrop-blur-sm ${isTemporary ? "border-dashed" : ""}`}>
+              <InputGroup
+                className={cn(
+                  "bg-card/60 backdrop-blur-sm",
+                  isTemporary && "border-dashed",
+                  draggingFiles && "border-ring ring-[3px] ring-ring/50",
+                )}
+                {...composerDropHandlers}
+              >
                 {files.length > 0 && (
                   <InputGroupAddon align="block-start">
                     <AttachmentGroup className="w-full">

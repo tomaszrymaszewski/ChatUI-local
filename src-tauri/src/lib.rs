@@ -1790,6 +1790,131 @@ async fn run_command(
     .map_err(|e| e.to_string())?
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeRunResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: i32,
+    pub timed_out: bool,
+}
+
+/// Run a Node.js script with the user's system node (the agent's run_node
+/// tool — skills like pptx expect Node). Spawned through a login shell
+/// (`sh -lc`) so homebrew/nvm PATHs resolve — GUI apps get a minimal PATH —
+/// and `exec` replaces the shell so the timeout kill reaches node itself.
+/// NODE_PATH points at the app-owned node-libs folder so skill scripts can
+/// `require("pptxgenjs")` without any project setup. Same safety pattern as
+/// run_python: pipes drained on separate threads, try_wait polling, kill on
+/// timeout.
+#[tauri::command]
+async fn run_node(
+    code: String,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+) -> Result<NodeRunResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000));
+
+        if let Some(dir) = cwd.as_deref() {
+            let meta = fs::metadata(dir).map_err(|e| format!("Working directory {}: {}", dir, e))?;
+            if !meta.is_dir() {
+                return Err(format!("Working directory is not a folder: {}", dir));
+            }
+        }
+
+        let script_path = std::env::temp_dir().join(format!(
+            "chatui-node-{}-{}.js",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::write(&script_path, &code)
+            .map_err(|e| format!("Failed to write temp script: {}", e))?;
+
+        let mut cmd = Command::new("sh");
+        cmd.arg("-lc")
+            // exec replaces the shell with node, so kill() on the child
+            // reaches node and not just the wrapper shell.
+            .arg(format!("exec node '{}'", script_path.display()));
+        if let Ok(base) = chat_ui_base_dir() {
+            cmd.env("NODE_PATH", base.join("node-libs").join("node_modules"));
+        }
+        if let Some(dir) = cwd.as_deref() {
+            cmd.current_dir(dir);
+        }
+
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                let _ = fs::remove_file(&script_path);
+                format!("Failed to start node: {}", e)
+            })?;
+
+        let stdout_handle = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = out.read_to_string(&mut s);
+                s
+            })
+        });
+        let stderr_handle = child.stderr.take().map(|mut err| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = err.read_to_string(&mut s);
+                s
+            })
+        });
+
+        let start = std::time::Instant::now();
+        let mut timed_out = false;
+        let mut final_status: Option<std::process::ExitStatus> = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    final_status = Some(status);
+                    break;
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        timed_out = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&script_path);
+                    return Err(format!("Failed to wait on node: {}", e));
+                }
+            }
+        }
+
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+
+        let exit_code = final_status.and_then(|s| s.code()).unwrap_or(-1);
+
+        let _ = fs::remove_file(&script_path);
+
+        // Bound the payloads crossing IPC.
+        let stdout: String = stdout.chars().take(200_000).collect();
+        let stderr: String = stderr.chars().take(200_000).collect();
+
+        Ok(NodeRunResult { stdout, stderr, exit_code, timed_out })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // ─── Local file access (sandboxed agents' read_file / write_file) ──────────
 
 /// How much of a file is read from disk before byte truncation kicks in.
@@ -2997,6 +3122,26 @@ mod tests {
         assert!(!obj.contains_key("timed_out"));
     }
 
+    // The frontend reads result.exitCode / result.timedOut (src/lib/run-node.ts);
+    // a snake_case payload would silently break the run_node tool.
+    #[test]
+    fn node_run_result_serializes_to_camel_case() {
+        let value = serde_json::to_value(NodeRunResult {
+            stdout: "hi".into(),
+            stderr: "".into(),
+            exit_code: 0,
+            timed_out: false,
+        })
+        .unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("stdout"));
+        assert!(obj.contains_key("stderr"));
+        assert!(obj.contains_key("exitCode"));
+        assert!(obj.contains_key("timedOut"));
+        assert!(!obj.contains_key("exit_code"));
+        assert!(!obj.contains_key("timed_out"));
+    }
+
     // Skills-dir migration copies whole skill folders (nested files included)
     // from the legacy location into the app-owned one.
     #[test]
@@ -3442,6 +3587,7 @@ pub fn run() {
             relaunch_app,
             run_python,
             run_command,
+            run_node,
             read_local_file,
             write_local_file,
             read_shared_file,

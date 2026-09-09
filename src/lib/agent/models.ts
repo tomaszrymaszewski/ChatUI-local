@@ -14,6 +14,28 @@ import { getModelOutputLimit } from "@/lib/model-capabilities";
 const FALLBACK_MAX_TOKENS = 16384;
 
 /**
+ * Hard ceiling on the max_tokens we send for any model. Some catalog entries
+ * report absurd output limits (models.dev listed z-ai/glm-5.3 on OpenRouter
+ * at 943,718), which lets reasoning models think essentially forever; 64k
+ * still allows very long answers while keeping runs finite.
+ */
+const MAX_OUTPUT_TOKENS_CAP = 65536;
+
+/**
+ * GLM models (z.ai): thinking is forced (GLM-5.3 cannot even disable it) and
+ * its depth is controlled by reasoning_effort, which the provider defaults to
+ * "max" — by far the longest thinking. The provider only accepts low/high/max
+ * for GLM-5.3, so map the app's effort onto that enum and always send an
+ * explicit value: default and low → "low" (shortest thinking unless the user
+ * asks for more), medium → "high", high → "max".
+ */
+function glmReasoningEffort(effort: ReasoningEffort | undefined): "low" | "high" | "max" {
+  if (effort === "high") return "max";
+  if (effort === "medium") return "high";
+  return "low";
+}
+
+/**
  * The OpenAI JS client (under ChatOpenAI) attaches X-Stainless-* telemetry
  * headers and a custom User-Agent to every request. Those extra headers
  * trigger CORS preflights that many OpenAI-compatible providers reject,
@@ -46,6 +68,12 @@ export async function createChatModel(
 ): Promise<ChatOpenAI> {
   const apiKey = await getProviderApiKey(provider.id);
   const outputLimit = await getModelOutputLimit(provider, modelName).catch(() => null);
+  const isGlm = /glm/i.test(modelName);
+  const maxTokens = Math.min(
+    outputLimit ?? (isGlm ? MAX_OUTPUT_TOKENS_CAP : FALLBACK_MAX_TOKENS),
+    MAX_OUTPUT_TOKENS_CAP,
+  );
+  const effort = isGlm ? glmReasoningEffort(reasoningEffort) : reasoningEffort;
   return new ChatOpenAI({
     model: modelName,
     apiKey: apiKey || "no-key",
@@ -53,11 +81,11 @@ export async function createChatModel(
       baseURL: provider.baseUrl.replace(/\/$/, ""),
       fetch: corsSafeFetch,
     },
-    maxTokens: outputLimit ?? FALLBACK_MAX_TOKENS,
+    maxTokens,
     // Reasoning-capable models only; providers without support reject the
     // unknown field's semantics but tolerate the parameter or ignore it.
-    ...(reasoningEffort && reasoningEffort !== "default"
-      ? { reasoningEffort: reasoningEffort as "low" | "medium" | "high" }
+    ...(effort && effort !== "default"
+      ? { reasoningEffort: effort as "low" | "medium" | "high" | "max" }
       : {}),
     maxRetries: 1,
     timeout: 300_000,
