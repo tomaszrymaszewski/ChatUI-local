@@ -56,6 +56,7 @@ function settings(overrides: Partial<UserSettings> = {}): UserSettings {
     embeddingEndpoint: null,
     knowledgeEnabled: true,
     knowledgeSources: { chats: true, files: true, images: true, memories: true },
+    contextCompression: false,
     ...overrides,
   };
 }

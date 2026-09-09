@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { DynamicStructuredTool, type StructuredTool } from "langchain";
+import { invoke } from "@tauri-apps/api/core";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -9,6 +10,44 @@ import { getAccessToken } from "@/lib/mcp-auth";
 
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60);
+}
+
+/** Response of the mcp_http_post Tauri command. */
+interface McpProxyResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+}
+
+/**
+ * Fetch implementation that routes requests through the Rust mcp_http_post
+ * command (CORS-free — same trick as http_post_json for the headroom proxy).
+ * Local MCP servers (the Playwright browser server) send no CORS headers, so
+ * the webview's fetch() cannot reach them cross-origin. The Rust side
+ * collects the full response body, which is fine for Streamable HTTP: a
+ * POST's response stream (JSON or SSE) always terminates.
+ */
+export function corsFreeMcpFetch(): (url: string | URL, init?: RequestInit) => Promise<Response> {
+  return async (url, init) => {
+    const method = (init?.method ?? "GET").toUpperCase();
+    // The client probes GET /mcp for a server→client SSE stream; a POST-only
+    // server answers 405 per spec and the SDK falls back to POST-only mode.
+    if (method !== "POST" && method !== "DELETE") {
+      return new Response(null, { status: 405 });
+    }
+    const headers: Record<string, string> = {};
+    new Headers(init?.headers).forEach((value, key) => {
+      headers[key] = value;
+    });
+    const body = typeof init?.body === "string" ? init.body : "";
+    const resp = await invoke<McpProxyResponse>("mcp_http_post", {
+      url: String(url),
+      body,
+      headers,
+      timeoutMs: 300_000,
+    });
+    return new Response(resp.body, { status: resp.status, headers: resp.headers });
+  };
 }
 
 /**
@@ -35,9 +74,22 @@ export function apiKeyHeadersForEntry(
   };
 }
 
-async function connectClient(entry: McpServerEntry, headers: Record<string, string>): Promise<Client> {
+async function connectClient(
+  entry: McpServerEntry,
+  headers: Record<string, string>,
+  corsFree?: boolean,
+): Promise<Client> {
   const client = new Client({ name: "chatui", version: "0.1.0" });
   const url = new URL(entry.url!);
+  if (corsFree) {
+    await client.connect(
+      new StreamableHTTPClientTransport(url, {
+        requestInit: { headers },
+        fetch: corsFreeMcpFetch(),
+      }),
+    );
+    return client;
+  }
   try {
     await client.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers } }));
     return client;
@@ -75,6 +127,12 @@ export async function loadMcpTools(
     if (allowedServers && !allowedServers.includes(serverName)) continue;
     if (!entry.url || !/^https?:\/\//.test(entry.url)) continue;
     try {
+      const corsFree = getCatalogEntry(serverName)?.corsFree === true;
+      if (corsFree) {
+        // Warm the local sidecar before connecting: an instant port probe
+        // when it's already up, a real spawn (up to ~15s) on first use.
+        await invoke("browser_mcp_start").catch(() => {});
+      }
       // API-key servers: the key collected at add time goes on the wire
       // (explicit entry headers win over the derived ones). OAuth servers:
       // attach the token from the app's token store (written by the native
@@ -91,7 +149,7 @@ export async function loadMcpTools(
         if (token) headers.Authorization = `Bearer ${token}`;
       }
       const client = await Promise.race([
-        connectClient(entry, headers),
+        connectClient(entry, headers, corsFree),
         new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("MCP connect timeout")), 10000),
         ),

@@ -97,7 +97,8 @@ export type AgentEvent =
   | { type: "todos"; todos: TodoItem[] }
   | { type: "artifact"; artifact: Artifact }
   | { type: "files"; files: SharedFile[] }
-  | { type: "suggestion"; suggestion: SuggestionRequest };
+  | { type: "suggestion"; suggestion: SuggestionRequest }
+  | { type: "agent_created"; agentId: string; agentName: string };
 
 export interface ReasoningStream {
   id: string;

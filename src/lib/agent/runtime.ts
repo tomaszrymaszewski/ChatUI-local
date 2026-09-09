@@ -23,6 +23,11 @@ import type {
   StructuredInputRequest,
   TodoItem,
 } from "@/lib/agent/types";
+import {
+  compressHistoryMessages,
+  toolCompressionMiddleware,
+} from "@/lib/agent/compression";
+import { emptyResponseGuardMiddleware } from "@/lib/agent/empty-response-guard";
 
 /**
  * deepagents ships its own filesystem tools (ls, read_file, write_file, …)
@@ -429,6 +434,7 @@ export class DeepAgentSession {
     private threadId: string,
     private skillFiles: Record<string, SkillFile>,
     private historyBudget: number,
+    private modelName: string,
     private mcp: McpToolsResult,
     private runCtx: { current: RunContext | null } = { current: null },
   ) {}
@@ -467,13 +473,17 @@ export class DeepAgentSession {
       model,
       tools: [...tools, ...mcp.tools],
       systemPrompt: buildAgentSystemPrompt(opts),
-      middleware: [todoListMiddleware()],
+      middleware: [
+        todoListMiddleware(),
+        toolCompressionMiddleware(opts.modelName),
+        emptyResponseGuardMiddleware(),
+      ],
       skills: ["/skills/"],
       checkpointer: new MemorySaver(),
       name: profile === "chat" ? "chatui-assistant" : `chatui-${profile}`,
     });
 
-    return new DeepAgentSession(agent, crypto.randomUUID(), skillFiles, historyBudget, mcp, runCtx);
+    return new DeepAgentSession(agent, crypto.randomUUID(), skillFiles, historyBudget, opts.modelName, mcp, runCtx);
   }
 
   /** Close MCP clients opened for this session. */
@@ -481,11 +491,11 @@ export class DeepAgentSession {
     await this.mcp.dispose();
   }
 
-  firstInput(messages: AgentMessage[]): Record<string, unknown> {
+  async firstInput(messages: AgentMessage[]): Promise<Record<string, unknown>> {
+    const bounded = truncateMessagesToBudget(messages, this.historyBudget);
+    const compressed = await compressHistoryMessages(bounded, this.modelName);
     return {
-      messages: toLangChainMessages(
-        truncateMessagesToBudget(messages, this.historyBudget),
-      ),
+      messages: toLangChainMessages(compressed),
       files: this.skillFiles,
     };
   }

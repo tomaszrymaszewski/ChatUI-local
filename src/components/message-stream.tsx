@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -123,6 +123,14 @@ function ActivityChip({ item }: { item: ActivityItem }) {
   );
 }
 
+// Live reasoning can grow to tens of thousands of characters on reasoning
+// models, and every throttled controller update re-parses the full text
+// through MarkdownRenderer (remark + KaTeX + Prism, all synchronous). Parse
+// cost is linear in length, so an unbounded live stream saturates the main
+// thread and freezes the app. While live, only a bounded tail is rendered;
+// the full text renders once when the stream ends (ms set).
+const MAX_LIVE_REASONING_CHARS = 4_000;
+
 function ThinkingBlock({
   reasoning,
   reasoningMs,
@@ -137,6 +145,17 @@ function ThinkingBlock({
   const [open, setOpen] = useState(true);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const pinnedRef = useRef(true);
+
+  // Bounded tail while streaming (cut at a line boundary so the markdown
+  // never starts mid-fence); the complete reasoning once the stream ended.
+  let display = reasoning;
+  let truncated = false;
+  if (live && reasoning.length > MAX_LIVE_REASONING_CHARS) {
+    const tail = reasoning.slice(-MAX_LIVE_REASONING_CHARS);
+    const firstLine = tail.indexOf("\n");
+    display = firstLine > 0 ? tail.slice(firstLine + 1) : tail;
+    truncated = true;
+  }
 
   // Autoscroll: follow the live reasoning stream to the bottom, but stop
   // pinning as soon as the user scrolls up inside the block — and resume
@@ -182,7 +201,12 @@ function ThinkingBlock({
           }}
           className="mt-1 max-h-60 overflow-y-auto rounded-lg border bg-muted/20 p-3"
         >
-          <MarkdownRenderer content={reasoning} className="text-xs text-muted-foreground" />
+          {truncated && (
+            <div className="mb-1 text-[11px] text-muted-foreground/70">
+              … earlier reasoning hidden while streaming
+            </div>
+          )}
+          <MarkdownRenderer content={display} className="text-xs text-muted-foreground" />
         </div>
       )}
     </div>
@@ -322,7 +346,10 @@ export interface MessageStreamProps {
  * Sub-agent activities (kind === "subagent") are rendered as collapsible boxes
  * containing their child tool calls, source links, reasoning, and output text.
  */
-export function MessageStream({
+// Memoized: one instance per persisted message; without it every ChatView
+// re-render (each keystroke in the composer, each streaming tick) re-renders
+// and re-parses every message's markdown.
+export const MessageStream = memo(function MessageStream({
   content,
   activities,
   reasoning,
@@ -479,4 +506,4 @@ export function MessageStream({
       ))}
     </div>
   );
-}
+});

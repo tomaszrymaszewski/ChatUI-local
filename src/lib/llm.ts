@@ -176,49 +176,6 @@ export async function updateModelDisplayName(
   saveProviders(providers);
 }
 
-const EXPORT_KEY_PREFIXES = ["chatui:messages:"];
-
-const EXPORT_BASE_KEYS = [
-  "chatui:providers",
-  "chatui:settings",
-  "chatui:projects",
-  "chatui:sessions",
-  "chatui:agents",
-  "chatui_last_project_dir",
-  "chatui_imported_dirs",
-  "chatui_active_project_dir",
-];
-
-export function exportAllData(): string {
-  const data: Record<string, string | null> = {};
-  for (const key of EXPORT_BASE_KEYS) {
-    data[key] = localStorage.getItem(key);
-  }
-  // Include all per-session message stores
-  for (let i = 0; i < localStorage.length; i++) {
-    const key = localStorage.key(i);
-    if (key && EXPORT_KEY_PREFIXES.some((p) => key.startsWith(p))) {
-      data[key] = localStorage.getItem(key);
-    }
-  }
-  return JSON.stringify({ __chatui_export__: true, data, version: 2 }, null, 2);
-}
-
-export function importAllData(jsonString: string): void {
-  const parsed = JSON.parse(jsonString);
-  if (!parsed.__chatui_export__) {
-    throw new Error("Invalid export file format");
-  }
-  const data = parsed.data as Record<string, string | null>;
-  for (const [key, value] of Object.entries(data)) {
-    if (value === null) {
-      localStorage.removeItem(key);
-    } else {
-      localStorage.setItem(key, value);
-    }
-  }
-}
-
 function loadUserSettings(): UserSettings | null {
   try {
     const raw = localStorage.getItem("chatui:settings");

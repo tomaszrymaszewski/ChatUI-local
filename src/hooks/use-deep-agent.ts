@@ -104,6 +104,12 @@ function lastUserText(messages: AgentMessage[]): string {
   return "";
 }
 
+/** A local action awaiting a decision, with its approval-card/activity id. */
+export interface PendingApproval {
+  id: string;
+  request: ApprovalRequest;
+}
+
 export interface AgentControllerApi {
   isRunning: boolean;
   streamingContent: string;
@@ -114,14 +120,17 @@ export interface AgentControllerApi {
   files: SharedFile[];
   pendingInput: StructuredInputRequest | null;
   pendingSuggestion: SuggestionRequest | null;
-  pendingApproval: ApprovalRequest | null;
+  /** All local actions awaiting a decision — one approve/deny card each. */
+  pendingApprovals: PendingApproval[];
   reasoningStreams: ReasoningStream[];
+  /** Agent created during the most recent run (agent-builder setup), if any. */
+  createdAgent: { agentId: string; agentName: string } | null;
   run: (opts: DeepAgentRunOptions) => Promise<AgentRunResult>;
   submitInput: (values: Record<string, unknown>) => void;
   skipInput: () => void;
   dismissSuggestion: () => void;
-  approveCommand: () => void;
-  rejectCommand: () => void;
+  approveCommand: (id: string) => void;
+  rejectCommand: (id: string) => void;
   stop: () => void;
 }
 
@@ -137,8 +146,9 @@ class AgentController implements AgentControllerApi {
   files: SharedFile[] = [];
   pendingInput: StructuredInputRequest | null = null;
   pendingSuggestion: SuggestionRequest | null = null;
-  pendingApproval: ApprovalRequest | null = null;
+  pendingApprovals: PendingApproval[] = [];
   reasoningStreams: ReasoningStream[] = [];
+  createdAgent: { agentId: string; agentName: string } | null = null;
 
   private version = 0;
   private listeners = new Set<() => void>();
@@ -152,7 +162,10 @@ class AgentController implements AgentControllerApi {
   private filesRef: SharedFile[] = [];
   private abortRef: AbortController | null = null;
   private inputResolverRef: ((r: InputResolution) => void) | null = null;
-  private approvalResolverRef: ((approved: boolean) => void) | null = null;
+  /** One resolver per pending approval card, keyed by its activity id. */
+  private approvalResolvers = new Map<string, (approved: boolean) => void>();
+  /** Monotonic id for approval activity rows (one row per requested action). */
+  private approvalSeq = 0;
   /** Session-level: the user approved one command in "task" approval mode. */
   private commandsApprovedForTask = false;
   /** Headless runs never surface prompts — see DeepAgentRunOptions.unattended. */
@@ -213,10 +226,13 @@ class AgentController implements AgentControllerApi {
   private schedulePublishReasoningStreams() {
     if (this.reasoningStreamsNotifyQueued) return;
     this.reasoningStreamsNotifyQueued = true;
+    // 100ms (~10fps): reasoning streams can be numerous (one per sub-agent)
+    // and each one re-renders a ThinkingBlock on publish, so they get a
+    // wider batch window than token events to keep the main thread free.
     setTimeout(() => {
       this.reasoningStreamsNotifyQueued = false;
       this.publishReasoningStreams();
-    }, 50);
+    }, 100);
   }
 
   private emit = (event: AgentEvent) => {
@@ -267,7 +283,7 @@ class AgentController implements AgentControllerApi {
             ...event.activity,
             textOffset: existing.textOffset,
             seq: existing.seq,
-            label: existing.label ?? event.activity.label,
+            label: event.activity.label ?? existing.label,
           });
         }
         if (event.activity.status === "done" || event.activity.status === "error") {
@@ -304,6 +320,9 @@ class AgentController implements AgentControllerApi {
         this.pendingSuggestion = event.suggestion;
         this.notify();
         break;
+      case "agent_created":
+        this.createdAgent = { agentId: event.agentId, agentName: event.agentName };
+        break;
     }
   };
 
@@ -326,7 +345,9 @@ class AgentController implements AgentControllerApi {
     this.files = [];
     this.pendingInput = null;
     this.pendingSuggestion = null;
-    this.pendingApproval = null;
+    this.pendingApprovals = [];
+    this.approvalResolvers.clear();
+    this.createdAgent = null;
     this.reasoningStreams = [];
     this.notify();
   }
@@ -385,10 +406,15 @@ class AgentController implements AgentControllerApi {
 
   /**
    * Approval gate for local shell commands (run_command / run_coding_task
-   * permissions). Applies the user's terminal-approval setting:
+   * permissions) and local file access. Applies the user's terminal-approval
+   * setting:
    * - "auto": approve immediately.
    * - "task": approve after the first approval in this session.
    * - "ask": show an approve/deny card every time.
+   *
+   * Tool calls in one turn run in parallel (ToolNode Promise.all), so several
+   * approval-gated actions can arrive at once. Each gets its OWN card —
+   * pendingApprovals holds them all and each is decided independently by id.
    */
   private promptForApproval = (request: ApprovalRequest): Promise<ApprovalResolution> => {
     const mode = loadUserSettings().terminalApproval;
@@ -401,7 +427,7 @@ class AgentController implements AgentControllerApi {
       this.emit({
         type: "activity",
         activity: {
-          id: "command-approval",
+          id: `command-approval-${++this.approvalSeq}`,
           kind: "input",
           name: label,
           status: "done",
@@ -410,26 +436,32 @@ class AgentController implements AgentControllerApi {
       });
       return Promise.resolve({ approved: false });
     }
+    if (this.abortRef?.signal.aborted) {
+      // The run was stopped before this card could be answered — deny
+      // instead of showing a card for a dead run.
+      return Promise.resolve({ approved: false });
+    }
+    const id = `command-approval-${++this.approvalSeq}`;
     const label = request.command.split("\n")[0].slice(0, 60);
     this.emit({
       type: "activity",
       activity: {
-        id: "command-approval",
+        id,
         kind: "input",
         name: label,
         status: "running",
         label: "Waiting for your approval",
       },
     });
-    this.pendingApproval = request;
+    this.pendingApprovals = [...this.pendingApprovals, { id, request }];
     this.notify();
-    return new Promise((resolve) => {
-      this.approvalResolverRef = (approved: boolean) => {
+    return new Promise<ApprovalResolution>((resolve) => {
+      this.approvalResolvers.set(id, (approved: boolean) => {
         if (approved && mode === "task") this.commandsApprovedForTask = true;
         this.emit({
           type: "activity",
           activity: {
-            id: "command-approval",
+            id,
             kind: "input",
             name: label,
             status: "done",
@@ -437,7 +469,7 @@ class AgentController implements AgentControllerApi {
           },
         });
         resolve({ approved });
-      };
+      });
     });
   };
 
@@ -514,7 +546,7 @@ class AgentController implements AgentControllerApi {
         });
 
         await session.stream(
-          session.firstInput(opts.messages),
+          await session.firstInput(opts.messages),
           this.emit,
           controller.signal,
           this.promptForInput,
@@ -533,13 +565,13 @@ class AgentController implements AgentControllerApi {
         try { await session.dispose(); } catch { /* best-effort */ }
       }
       this.inputResolverRef = null;
-      this.approvalResolverRef = null;
+      this.approvalResolvers.clear();
       this.abortRef = null;
       this.isRunning = false;
       this.unattended = false;
       this.pendingInput = null;
       this.pendingSuggestion = null;
-      this.pendingApproval = null;
+      this.pendingApprovals = [];
       setRetrievedDocIds([]);
       // The run changed (or added) chats/messages/files — re-index shortly.
       scheduleKnowledgeSweep();
@@ -610,30 +642,32 @@ class AgentController implements AgentControllerApi {
     this.notify();
   };
 
-  approveCommand = () => {
-    this.approvalResolverRef?.(true);
-    this.approvalResolverRef = null;
-    this.pendingApproval = null;
-    this.notify();
+  approveCommand = (id: string) => {
+    this.approvalResolvers.get(id)?.(true);
+    this.settleApproval(id);
   };
 
-  rejectCommand = () => {
-    this.approvalResolverRef?.(false);
-    this.approvalResolverRef = null;
-    this.pendingApproval = null;
-    this.notify();
+  rejectCommand = (id: string) => {
+    this.approvalResolvers.get(id)?.(false);
+    this.settleApproval(id);
   };
+
+  /** Remove a decided card (the resolver already fired and emitted its row). */
+  private settleApproval(id: string) {
+    this.approvalResolvers.delete(id);
+    this.pendingApprovals = this.pendingApprovals.filter((p) => p.id !== id);
+    this.notify();
+  }
 
   stop = () => {
     if (this.inputResolverRef) {
       this.inputResolverRef({ cancelled: true });
       this.inputResolverRef = null;
     }
-    if (this.approvalResolverRef) {
-      this.approvalResolverRef(false);
-      this.approvalResolverRef = null;
-      this.pendingApproval = null;
-    }
+    // Deny every outstanding approval card, not just one.
+    for (const resolve of this.approvalResolvers.values()) resolve(false);
+    this.approvalResolvers.clear();
+    this.pendingApprovals = [];
     this.abortRef?.abort();
   };
 }

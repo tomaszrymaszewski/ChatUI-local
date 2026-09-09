@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   ArrowUp,
@@ -33,6 +34,10 @@ import {
   SignalMedium,
   SignalLow,
   Download,
+  File as FileIcon,
+  FileSpreadsheet,
+  ArrowDownToLine,
+  type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AppSidebar, type AgentConsoleTab } from "@/components/app-sidebar";
@@ -144,7 +149,7 @@ import {
   globalSkillsDirectory,
 } from "@/lib/skills-library";
 import { useAgents } from "@/hooks/use-agents";
-import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController } from "@/hooks/use-deep-agent";
+import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController, type AgentControllerApi } from "@/hooks/use-deep-agent";
 import { useScheduler } from "@/hooks/use-scheduler";
 import type { AgentMode, AgentRunResult } from "@/lib/agent/types";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
@@ -187,6 +192,23 @@ function formatBytes(bytes: number) {
   );
   const value = bytes / 1024 ** i;
   return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+/**
+ * Cheap change signature of a run's streaming snapshot. The periodic
+ * crash-safety save skips ticks where nothing moved, so a run sitting in a
+ * long tool call or approval wait doesn't re-serialize and re-write the
+ * whole session to localStorage every 2.5s.
+ */
+function streamSaveSignature(ctrl: AgentControllerApi): string {
+  return [
+    ctrl.streamingContent.length,
+    ctrl.streamingReasoning.length,
+    ctrl.artifacts.length,
+    ctrl.files.length,
+    ctrl.activities.map((a) => `${a.id}:${a.status}`).join(","),
+    ctrl.reasoningStreams.map((s) => `${s.id}:${s.text.length}`).join(","),
+  ].join("|");
 }
 
 type PendingFile = MessageAttachment & { file?: File };
@@ -262,6 +284,9 @@ export function ChatView() {
   const [inputText, setInputText] = useState("");
   const [files, setFiles] = useState<PendingFile[]>([]);
   const [draggingFiles, setDraggingFiles] = useState(false);
+  // Full-screen drag & drop overlay shown while files hover over the window.
+  const [fileDropOverlay, setFileDropOverlay] = useState(false);
+  const fileDropCounter = useRef(0);
   const [webFetchEnabled, setWebFetchEnabled] = useState(true);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
@@ -304,6 +329,8 @@ export function ChatView() {
   const [historyRenameDraft, setHistoryRenameDraft] = useState("");
   // Session id for the "this conversation moved to the Agents tab" notice.
   const [movedNoticeId, setMovedNoticeId] = useState<string | null>(null);
+  // After an agent-builder run creates an agent, offer to delete the setup chat.
+  const [deleteSetupDialog, setDeleteSetupDialog] = useState<{ sessionId: string; agentName: string } | null>(null);
   const [projectInputText, setProjectInputText] = useState("");
   const [selectedModel, setSelectedModel] = useState<string>("");
   // Reasoning effort for the current session ("default" sends nothing).
@@ -560,7 +587,7 @@ export function ChatView() {
   const chatComposerPlaceholder = isAgentTab
     ? currentAgentDef
       ? `Message ${currentAgentDef.name}…`
-      : "Describe the task — the agent works locally on your Mac…"
+      : "Describe the task and the agent will start working..."
     : isTemporary
       ? "This message and response will be forgotten when you close the chat"
       : "Ask anything";
@@ -569,7 +596,7 @@ export function ChatView() {
       ? "Describe what this agent should do…"
       : pendingAgentName
         ? `Message ${pendingAgentName}…`
-        : "Describe the task — the agent works locally on your Mac…"
+        : "Describe the task and the agent will start working..."
     : isTemporary
       ? "This message and response will be forgotten when you close the chat"
       : "Ask anything";
@@ -677,7 +704,10 @@ export function ChatView() {
     window.addEventListener("mouseup", onUp);
   };
 
-  const handleOpenArtifactFromContent = (content: string, language: string) => {
+  // Stable identity: it is passed to memoized MarkdownRenderer/MessageStream
+  // below, where a fresh closure per render would defeat the memo and
+  // re-parse every message's markdown on every keystroke.
+  const handleOpenArtifactFromContent = useCallback((content: string, language: string) => {
     const title = language.charAt(0).toUpperCase() + language.slice(1);
     const artifact: Artifact = {
       id: `inline-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -689,7 +719,7 @@ export function ChatView() {
     setArtifactPanel({ artifacts: [artifact], activeIndex: 0 });
     setArtifactWindowMode("open");
     setTimeout(() => window.dispatchEvent(new Event("resize")), 50);
-  };
+  }, []);
 
   const handleDownloadSharedFile = async (path: string) => {
     try {
@@ -756,6 +786,59 @@ export function ChatView() {
     addFiles(Array.from(e.target.files ?? []));
     e.target.value = "";
   };
+
+  /**
+   * Full-screen drag & drop: any Finder drag over the window raises the
+   * overlay; dropping anywhere attaches the files to the composer. Uses a
+   * nested-enter counter so moving between child elements never flickers the
+   * overlay, and a ref to addFiles so the listeners attach exactly once.
+   */
+  const addFilesRef = useRef(addFiles);
+  addFilesRef.current = addFiles;
+  useEffect(() => {
+    const hasFiles = (dt: DataTransfer | null) =>
+      !!dt && Array.prototype.includes.call(dt.types || [], "Files");
+
+    const onDragEnter = (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer)) return;
+      fileDropCounter.current += 1;
+      setFileDropOverlay(true);
+    };
+    const onDragOver = (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer)) return;
+      // Continuously allow the drop (dragover must be prevented to accept it).
+      e.preventDefault();
+    };
+    const onDragLeave = (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer)) return;
+      fileDropCounter.current = Math.max(0, fileDropCounter.current - 1);
+      if (fileDropCounter.current === 0) {
+        setFileDropOverlay(false);
+        setDraggingFiles(false);
+      }
+    };
+    const onDrop = (e: DragEvent) => {
+      if (!hasFiles(e.dataTransfer)) return;
+      e.preventDefault();
+      fileDropCounter.current = 0;
+      setFileDropOverlay(false);
+      setDraggingFiles(false);
+      if (e.dataTransfer?.files?.length) {
+        addFilesRef.current(Array.from(e.dataTransfer.files));
+      }
+    };
+
+    window.addEventListener("dragenter", onDragEnter);
+    window.addEventListener("dragover", onDragOver);
+    window.addEventListener("dragleave", onDragLeave);
+    window.addEventListener("drop", onDrop);
+    return () => {
+      window.removeEventListener("dragenter", onDragEnter);
+      window.removeEventListener("dragover", onDragOver);
+      window.removeEventListener("dragleave", onDragLeave);
+      window.removeEventListener("drop", onDrop);
+    };
+  }, []);
 
   /** HTML5 drag & drop from Finder onto a composer (Tauri dragDropEnabled is off). */
   const composerDropHandlers = {
@@ -1022,7 +1105,11 @@ export function ChatView() {
         isTemporary,
       );
       inProgressMsgIds.current.set(sessionId, assistantMsg.id);
+      let lastSaveSig = "";
       const saveInterval = setInterval(() => {
+        const sig = streamSaveSignature(ctrl);
+        if (sig === lastSaveSig) return;
+        lastSaveSig = sig;
         updateMessage(sessionId, assistantMsg.id, {
           content: ctrl.streamingContent,
           reasoning: ctrl.streamingReasoning || undefined,
@@ -1050,6 +1137,12 @@ export function ChatView() {
       } finally {
         clearInterval(saveInterval);
         inProgressMsgIds.current.delete(sessionId);
+      }
+
+      // An agent-builder run that created an agent: the setup conversation is
+      // no longer useful, so offer to delete it.
+      if (ctrl.createdAgent && sessionId) {
+        setDeleteSetupDialog({ sessionId, agentName: ctrl.createdAgent.agentName });
       }
 
       if ((mode === "research" || mode === "council") && result.completed) {
@@ -1208,7 +1301,11 @@ export function ChatView() {
         isTemporary,
       );
       inProgressMsgIds.current.set(activeSessionId, assistantMsg.id);
+      let lastSaveSig = "";
       const saveInterval = setInterval(() => {
+        const sig = streamSaveSignature(ctrl);
+        if (sig === lastSaveSig) return;
+        lastSaveSig = sig;
         updateMessage(activeSessionId, assistantMsg.id, {
           content: ctrl.streamingContent,
           reasoning: ctrl.streamingReasoning || undefined,
@@ -1312,7 +1409,11 @@ export function ChatView() {
         msgIsTemporary,
       );
       inProgressMsgIds.current.set(activeSessionId, assistantMsg.id);
+      let lastSaveSig = "";
       const saveInterval = setInterval(() => {
+        const sig = streamSaveSignature(ctrl);
+        if (sig === lastSaveSig) return;
+        lastSaveSig = sig;
         updateMessage(activeSessionId, assistantMsg.id, {
           content: ctrl.streamingContent,
           reasoning: ctrl.streamingReasoning || undefined,
@@ -1634,7 +1735,7 @@ export function ChatView() {
     deleteAgent(id);
     if (agentSettingsId === id) setAgentSettingsId(null);
     if (activeAgentConsoleId === id) setActiveAgentConsoleId(null);
-    toast("Agent deleted — its sessions stay as task sessions");
+    toast("Agent deleted (sessions stay as task sessions)");
   };
 
   /**
@@ -2102,6 +2203,13 @@ export function ChatView() {
 
   return (
     <OpenCodeProvider>
+    {/* Full-screen file drop overlay (portaled to body so it sits above everything). */}
+    {createPortal(
+      fileDropOverlay ? (
+        <DropOverlay />
+      ) : null,
+      document.body,
+    )}
     <SidebarProvider
       className="relative h-dvh min-h-0 overflow-hidden"
       style={{ "--sidebar-width-icon": "3rem" } as React.CSSProperties}
@@ -2684,12 +2792,17 @@ export function ChatView() {
                     onSubmit={(values) => agent?.submitInput(values)}
                     onSwitchToText={() => agent?.skipInput()}
                   />
-                ) : agent?.pendingApproval ? (
-                  <ApprovalCard
-                    request={agent.pendingApproval}
-                    onApprove={() => agent?.approveCommand()}
-                    onDeny={() => agent?.rejectCommand()}
-                  />
+                ) : agent?.pendingApprovals.length ? (
+                  <div className="grid gap-2">
+                    {agent.pendingApprovals.map(({ id, request }) => (
+                      <ApprovalCard
+                        key={id}
+                        request={request}
+                        onApprove={() => agent?.approveCommand(id)}
+                        onDeny={() => agent?.rejectCommand(id)}
+                      />
+                    ))}
+                  </div>
                  ) : agent?.pendingSuggestion ? (
                    <SuggestionCard
                      suggestion={agent.pendingSuggestion}
@@ -3253,12 +3366,17 @@ export function ChatView() {
                   onSubmit={(values) => agent?.submitInput(values)}
                   onSwitchToText={() => agent?.skipInput()}
                 />
-              ) : agent?.pendingApproval ? (
-                <ApprovalCard
-                  request={agent.pendingApproval}
-                  onApprove={() => agent?.approveCommand()}
-                  onDeny={() => agent?.rejectCommand()}
-                />
+              ) : agent?.pendingApprovals.length ? (
+                <div className="grid gap-2">
+                  {agent.pendingApprovals.map(({ id, request }) => (
+                    <ApprovalCard
+                      key={id}
+                      request={request}
+                      onApprove={() => agent?.approveCommand(id)}
+                      onDeny={() => agent?.rejectCommand(id)}
+                    />
+                  ))}
+                </div>
               ) : agent?.pendingSuggestion ? (
                 <SuggestionCard
                   suggestion={agent.pendingSuggestion}
@@ -3527,6 +3645,40 @@ export function ChatView() {
         </DialogContent>
       </Dialog>
 
+      {/* Agent-builder cleanup: after creating an agent, the setup chat is useless. */}
+      <Dialog open={!!deleteSetupDialog} onOpenChange={(open) => { if (!open) setDeleteSetupDialog(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Trash2 className="size-5" />
+              {deleteSetupDialog ? `"${deleteSetupDialog.agentName}" is ready` : "Agent is ready"}
+            </DialogTitle>
+          </DialogHeader>
+          <p className="pt-1 text-sm text-muted-foreground">
+            This chat was only used to set up your new agent, so it has no ongoing
+            conversation value. Delete it to keep your chat list clean? The agent
+            itself is safe — it lives in the Agents tab and can be edited there.
+          </p>
+          <div className="flex justify-end gap-2 pt-2">
+            <Button variant="outline" size="sm" onClick={() => setDeleteSetupDialog(null)}>
+              Keep this chat
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => {
+                const target = deleteSetupDialog;
+                setDeleteSetupDialog(null);
+                if (target) void handleDeleteSession(target.sessionId);
+              }}
+            >
+              <Trash2 />
+              Delete this chat
+            </Button>
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {(() => {
         const settingsAgent = agents.find((a) => a.id === agentSettingsId);
         return settingsAgent ? (
@@ -3629,7 +3781,11 @@ export function ChatView() {
         isTemporary,
       );
       inProgressMsgIds.current.set(newSession.id, assistantMsg.id);
+      let lastSaveSig = "";
       const saveInterval = setInterval(() => {
+        const sig = streamSaveSignature(ctrl);
+        if (sig === lastSaveSig) return;
+        lastSaveSig = sig;
         updateMessage(newSession.id, assistantMsg.id, {
           content: ctrl.streamingContent,
           reasoning: ctrl.streamingReasoning || undefined,
@@ -3700,4 +3856,65 @@ export function ChatView() {
       );
     }
   }
+}
+
+/** A stylized document card used in the drop overlay's graphic. */
+function DroppedFileCard({
+  icon: Icon,
+  className,
+}: {
+  icon: LucideIcon;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cn(
+        "w-36 rounded-xl border bg-card p-3 shadow-xl ring-1 ring-ring/10",
+        className,
+      )}
+    >
+      <div className="mb-2.5 flex items-center gap-2">
+        <Icon className="size-4 shrink-0 text-primary" />
+        <span className="h-2 w-14 rounded-full bg-foreground/25" />
+      </div>
+      <div className="space-y-1.5">
+        <div className="h-1.5 w-full rounded-full bg-foreground/10" />
+        <div className="h-1.5 w-4/5 rounded-full bg-foreground/10" />
+        <div className="h-1.5 w-3/5 rounded-full bg-foreground/10" />
+      </div>
+    </div>
+  );
+}
+
+/** Nice full-screen graphic shown while the user drags files over the window. */
+function DropOverlay() {
+  return (
+    <div className="fixed inset-0 z-[9999] flex select-none flex-col items-center justify-center gap-12 bg-background/80 backdrop-blur-md">
+      {/* Fan of document cards */}
+      <div className="relative h-44 w-72" aria-hidden>
+        <DroppedFileCard
+          icon={FileSpreadsheet}
+          className="absolute left-3 top-9 z-0 -rotate-12 opacity-70"
+        />
+        <DroppedFileCard
+          icon={FileText}
+          className="absolute right-3 top-9 z-0 rotate-12 opacity-80"
+        />
+        <DroppedFileCard
+          icon={FileIcon}
+          className="absolute left-1/2 top-0 z-10 -translate-x-1/2"
+        />
+      </div>
+
+      <div className="flex flex-col items-center gap-3 text-center">
+        <span className="flex items-center gap-2.5 text-2xl font-semibold tracking-tight">
+          <ArrowDownToLine className="size-7 text-primary" />
+          Drop to add to chat
+        </span>
+        <span className="max-w-sm text-sm text-muted-foreground">
+          Files are attached to your message and sent along with it
+        </span>
+      </div>
+    </div>
+  );
 }

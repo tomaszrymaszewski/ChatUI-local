@@ -41,6 +41,12 @@ export interface McpCatalogEntry {
   apiKeyHeader?: string;
   /** Extra search keywords that the agent's search_connectors tool matches against. */
   keywords?: string[];
+  /**
+   * Local servers send no CORS headers, so the webview cannot reach them with
+   * plain fetch — this connector's traffic is routed through the Rust
+   * mcp_http_post command instead (CORS-free, like the headroom proxy).
+   */
+  corsFree?: boolean;
   install: { type: "remote"; url: string };
   /** Optional registry namespace for validation/lookup. */
   registryName?: string;
@@ -258,6 +264,18 @@ export const MCP_CATALOG: McpCatalogEntry[] = [
     auth: "none",
     install: { type: "remote", url: "https://learn.microsoft.com/api/mcp" },
     registryName: "com.microsoft/microsoft-learn-mcp",
+  },
+  {
+    id: "playwright-browser",
+    name: "Browser (Playwright)",
+    tagline: "Let the AI browse in a real browser — read JavaScript-heavy pages, follow links, click, and fill forms. Runs locally on your machine.",
+    category: "Search & Research",
+    vendor: "Microsoft",
+    auth: "none",
+    corsFree: true,
+    keywords: ["browser", "web browsing", "headless", "playwright", "chrome", "navigate", "click", "scrape", "webpage", "javascript-rendered", "registry"],
+    install: { type: "remote", url: "http://localhost:8931/mcp" },
+    registryName: "io.github.microsoft/playwright-mcp",
   },
 ];
 

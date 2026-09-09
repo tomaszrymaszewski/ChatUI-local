@@ -57,6 +57,14 @@ pub struct OpenCodeStatus {
     pub url: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeadroomStatus {
+    pub installed: bool,
+    pub serving: bool,
+    pub url: String,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct SessionMetadata {
     pub id: String,
@@ -81,6 +89,16 @@ pub struct HttpFetchResponse {
     pub status: u16,
     pub status_text: String,
     pub content_type: String,
+    pub body: String,
+}
+
+/// Response of mcp_http_post — like HttpFetchResponse but carries the full
+/// response header map (the MCP client needs mcp-session-id / content-type).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpProxyResponse {
+    pub status: u16,
+    pub headers: std::collections::HashMap<String, String>,
     pub body: String,
 }
 
@@ -667,6 +685,345 @@ fn wait_for_health_blocking() -> Result<(), String> {
         std::thread::sleep(Duration::from_millis(500));
     }
     Err("OpenCode server did not start within 30 seconds".to_string())
+}
+
+// ─── Headroom proxy (context compression) ─────────────────────────────────
+
+const HEADROOM_PORT: &str = "8787";
+const HEADROOM_URL: &str = "http://localhost:8787";
+
+static HEADROOM_PID: Mutex<Option<u32>> = Mutex::new(None);
+
+/// Prefer the headroom installed by `uv tool install "headroom-ai[all]"`
+/// (~/.local/bin/headroom), fall back to PATH.
+fn headroom_bin() -> String {
+    if let Some(home) = dirs::home_dir() {
+        let candidate = home.join(".local").join("bin").join("headroom");
+        if candidate.exists() {
+            return candidate.to_string_lossy().to_string();
+        }
+    }
+    "headroom".to_string()
+}
+
+fn headroom_exists() -> bool {
+    PathBuf::from(headroom_bin()).exists()
+        || Command::new("which")
+            .arg("headroom")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+}
+
+fn headroom_health() -> bool {
+    let url = format!("{}/health", HEADROOM_URL);
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .ok()
+        .and_then(|client| client.get(&url).send().ok())
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false)
+}
+
+fn kill_tracked_headroom() {
+    if let Some(pid) = *HEADROOM_PID.lock().unwrap() {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+        *HEADROOM_PID.lock().unwrap() = None;
+    }
+}
+
+/// Adopt an already-running proxy on our port so quitting the app stops it.
+/// Idempotent: never overwrites a PID we already track.
+fn adopt_headroom_if_needed() {
+    if HEADROOM_PID.lock().unwrap().is_none() {
+        if let Some(pid) = pid_listening_on(HEADROOM_PORT) {
+            *HEADROOM_PID.lock().unwrap() = Some(pid);
+        }
+    }
+}
+
+fn headroom_log_path() -> Option<PathBuf> {
+    chat_ui_base_dir().ok().map(|b| b.join("logs").join("headroom-proxy.log"))
+}
+
+fn spawn_headroom_proxy() -> Result<(), String> {
+    // If a healthy proxy already owns our port, adopt it rather than killing it.
+    if headroom_health() {
+        adopt_headroom_if_needed();
+        return Ok(());
+    }
+    // Evict any non-responsive squatter on our port so the fresh spawn can bind.
+    if let Some(pid) = pid_listening_on(HEADROOM_PORT) {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+    }
+    std::thread::sleep(Duration::from_millis(300));
+
+    let mut cmd = Command::new(headroom_bin());
+    // Local-first: never emit the anonymous usage beacon from this app.
+    cmd.env("HEADROOM_BEACON", "off");
+    cmd.env("DO_NOT_TRACK", "1");
+    // Pin the port so health/compress calls match the frontend.
+    cmd.args(["proxy", "--port", HEADROOM_PORT]);
+
+    // Capture stderr to a log file so spawn failures are diagnosable.
+    let log_path = headroom_log_path();
+    let stderr: Stdio = if let Some(ref log) = log_path {
+        if let Some(parent) = log.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .map(|f| Stdio::from(f))
+            .unwrap_or_else(|_| Stdio::null())
+    } else {
+        Stdio::null()
+    };
+    cmd.stdout(Stdio::null());
+    cmd.stderr(stderr);
+
+    let child = cmd.spawn().map_err(|e| format!("Failed to start headroom proxy: {}", e))?;
+    *HEADROOM_PID.lock().unwrap() = Some(child.id());
+    // Detach: dropping the Child does not kill it in std.
+    drop(child);
+    Ok(())
+}
+
+fn wait_for_headroom_health_blocking() -> Result<(), String> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < 60 {
+        if headroom_health() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Err("Headroom proxy did not start within 60 seconds".to_string())
+}
+
+#[tauri::command]
+async fn headroom_status() -> Result<HeadroomStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let installed = headroom_exists();
+        let serving = installed && headroom_health();
+        // Adopt an already-running proxy so quitting the app stops it cleanly.
+        if serving {
+            adopt_headroom_if_needed();
+        }
+        Ok(HeadroomStatus {
+            installed,
+            serving,
+            url: HEADROOM_URL.to_string(),
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn headroom_start() -> Result<(), String> {
+    // spawn_blocking: headroom_health() uses reqwest's blocking client, which
+    // must not run on an async runtime thread.
+    tauri::async_runtime::spawn_blocking(|| {
+        if !headroom_exists() {
+            return Err(r#"Headroom is not installed. Install the proxy with: pip install "headroom-ai[proxy]""#.to_string());
+        }
+        if headroom_health() {
+            adopt_headroom_if_needed();
+            return Ok(());
+        }
+        ensure_chat_ui_directory()?;
+        spawn_headroom_proxy()?;
+        wait_for_headroom_health_blocking()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn headroom_stop() -> Result<(), String> {
+    kill_tracked_headroom();
+    Ok(())
+}
+
+// ─── Browser MCP (local Playwright server) ─────────────────────────────────
+
+const BROWSER_MCP_PORT: &str = "8931";
+
+static BROWSER_MCP_PID: Mutex<Option<u32>> = Mutex::new(None);
+
+/// The Playwright MCP server (started with --port) serves Streamable HTTP on
+/// /mcp; a bare GET answers 400 by design, so "any HTTP response at all" means
+/// it's up while a connection error means it isn't.
+fn browser_mcp_serving() -> bool {
+    let url = format!("http://localhost:{}/mcp", BROWSER_MCP_PORT);
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok()
+        .and_then(|client| client.get(&url).send().ok())
+        .is_some()
+}
+
+fn browser_mcp_log_path() -> Option<PathBuf> {
+    chat_ui_base_dir().ok().map(|b| b.join("logs").join("browser-mcp.log"))
+}
+
+/// npx resolves through the user's login-shell PATH (same approach as run_node).
+fn npx_exists() -> bool {
+    Command::new("sh")
+        .arg("-lc")
+        .arg("command -v npx")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn kill_tracked_browser_mcp() {
+    if let Some(pid) = *BROWSER_MCP_PID.lock().unwrap() {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+        *BROWSER_MCP_PID.lock().unwrap() = None;
+    }
+    // npx runs the actual server as a child process; also take the port
+    // owner so quitting the app never leaves an orphaned server behind.
+    if let Some(pid) = pid_listening_on(BROWSER_MCP_PORT) {
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+    }
+}
+
+fn spawn_browser_mcp() -> Result<(), String> {
+    if !npx_exists() {
+        return Err("npx was not found — install Node.js to use the browser connector".to_string());
+    }
+
+    let mut cmd = Command::new("sh");
+    cmd.arg("-lc").arg(format!(
+        // exec replaces the shell with npx, so the tracked PID is the server
+        // process and not just a wrapper. --browser chrome uses the installed
+        // Google Chrome (no separate Chromium download); the profile is
+        // persistent so agent sign-ins survive restarts.
+        "exec npx -y @playwright/mcp@latest --port {} --headless --browser chrome",
+        BROWSER_MCP_PORT
+    ));
+
+    // Capture stdout+stderr to a log file so spawn failures are diagnosable.
+    let log_path = browser_mcp_log_path();
+    let log_file = if let Some(ref log) = log_path {
+        if let Some(parent) = log.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .ok()
+    } else {
+        None
+    };
+    match &log_file {
+        // Both streams share one appended file: clone the handle for stdout.
+        Some(file) => {
+            cmd.stdout(Stdio::from(file.try_clone().map_err(|e| e.to_string())?));
+            cmd.stderr(Stdio::from(file.try_clone().map_err(|e| e.to_string())?));
+        }
+        None => {
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+        }
+    }
+
+    let child = cmd.spawn().map_err(|e| format!("Failed to start browser MCP: {}", e))?;
+    *BROWSER_MCP_PID.lock().unwrap() = Some(child.id());
+    // Detach: dropping the Child does not kill it in std.
+    drop(child);
+    Ok(())
+}
+
+fn wait_for_browser_mcp_blocking() -> Result<(), String> {
+    let start = std::time::Instant::now();
+    while start.elapsed().as_secs() < 15 {
+        if browser_mcp_serving() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    Err("Browser MCP did not start within 15 seconds — see logs/browser-mcp.log".to_string())
+}
+
+/// Ensure the local Playwright MCP server is serving on its port. Called
+/// right before the webview connects to it (a no-op that only probes the
+/// port when it's already up). Cold start via npx can take a few seconds.
+#[tauri::command]
+async fn browser_mcp_start() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        if browser_mcp_serving() {
+            // Adopt an already-running server on our port so quitting the
+            // app stops it.
+            if let Some(pid) = pid_listening_on(BROWSER_MCP_PORT) {
+                *BROWSER_MCP_PID.lock().unwrap() = Some(pid);
+            }
+            return Ok(());
+        }
+        spawn_browser_mcp()?;
+        wait_for_browser_mcp_blocking()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn browser_mcp_stop() -> Result<(), String> {
+    kill_tracked_browser_mcp();
+    Ok(())
+}
+
+/// POST to a local MCP server from the Rust side (CORS-free). Like
+/// http_post_json, but passes arbitrary request headers through (the MCP
+/// client sends mcp-session-id / mcp-protocol-version) and returns the
+/// response headers (the server assigns the session id on initialize).
+#[tauri::command]
+async fn mcp_http_post(
+    url: String,
+    body: String,
+    headers: Option<std::collections::HashMap<String, String>>,
+    timeout_ms: Option<u64>,
+) -> Result<McpProxyResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(timeout_ms.unwrap_or(300_000)))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut req = client.post(&url);
+        for (k, v) in headers.unwrap_or_default() {
+            if k.eq_ignore_ascii_case("content-length") || k.eq_ignore_ascii_case("host") {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()),
+                reqwest::header::HeaderValue::from_str(&v),
+            ) {
+                req = req.header(name, value);
+            }
+        }
+        let resp = req.body(body).send().map_err(|e| e.to_string())?;
+
+        let status = resp.status().as_u16();
+        let mut resp_headers = std::collections::HashMap::new();
+        for (name, value) in resp.headers().iter() {
+            if let Ok(v) = value.to_str() {
+                resp_headers.insert(name.to_string(), v.to_string());
+            }
+        }
+        let body = resp.text().unwrap_or_default();
+        // Bound the payload crossing IPC; tool snapshots can be large but the
+        // caller truncates further anyway.
+        let body: String = body.chars().take(2_000_000).collect();
+
+        Ok(McpProxyResponse { status, headers: resp_headers, body })
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ─── MCP OAuth (native — no external auth process) ─────────────────────────
@@ -1567,6 +1924,41 @@ async fn http_fetch(url: String, timeout_ms: Option<u64>) -> Result<HttpFetchRes
                 "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15",
             )
             .header(reqwest::header::ACCEPT, "text/html, text/plain, */*")
+            .send()
+            .map_err(|e| e.to_string())?;
+
+        let status = resp.status().as_u16();
+        let status_text = resp.status().canonical_reason().unwrap_or("").to_string();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.text().unwrap_or_default();
+        // Bound the payload crossing IPC; callers truncate further themselves.
+        let body: String = body.chars().take(500_000).collect();
+
+        Ok(HttpFetchResponse { status, status_text, content_type, body })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// POST a JSON body from the Rust side (CORS-free, mirrors http_fetch). Used by
+/// the headroom client to call the local proxy's /v1/compress endpoint, which
+/// the webview's fetch() could not reach with the tauri://localhost origin.
+#[tauri::command]
+async fn http_post_json(url: String, body: String, timeout_ms: Option<u64>) -> Result<HttpFetchResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(timeout_ms.unwrap_or(30000)))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let resp = client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
             .send()
             .map_err(|e| e.to_string())?;
 
@@ -3082,6 +3474,13 @@ mod tests {
         assert!(!obj.contains_key("content_type"));
     }
 
+    #[test]
+    fn headroom_health_uses_localhost_port() {
+        assert_eq!(super::HEADROOM_PORT, "8787");
+        assert_eq!(super::HEADROOM_URL, "http://localhost:8787");
+        assert_eq!(format!("{}/health", super::HEADROOM_URL), "http://localhost:8787/health");
+    }
+
     // The frontend reads result.exitCode / result.timedOut (src/lib/run-python.ts);
     // a snake_case payload would silently break the run_python tool.
     #[test]
@@ -3584,6 +3983,13 @@ pub fn run() {
             refresh_mcp_token,
             detect_coding_agents,
             http_fetch,
+            http_post_json,
+            headroom_status,
+            headroom_start,
+            headroom_stop,
+            browser_mcp_start,
+            browser_mcp_stop,
+            mcp_http_post,
             relaunch_app,
             run_python,
             run_command,
@@ -3617,6 +4023,8 @@ pub fn run() {
         tauri::RunEvent::Exit => {
             kill_tracked_server();
             kill_scaffold_child();
+            kill_tracked_headroom();
+            kill_tracked_browser_mcp();
         }
         // macOS: the Dock icon was clicked. If the process is alive but the
         // window was lost (e.g. after a sleep/wake cycle or a stalled quit),

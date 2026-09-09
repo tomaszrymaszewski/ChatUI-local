@@ -122,20 +122,27 @@ function MermaidBlock({ code }: { code: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Debounced: while a ```mermaid fence is still streaming in, the code
+  // changes on every tick and each change would otherwise re-run mermaid's
+  // synchronous main-thread layout on partial source. The timer resets with
+  // every code change, so rendering only starts once the source is stable.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const { default: mermaid } = await import("mermaid");
-        mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
-        const rendered = await mermaid.render(id, code);
-        if (!cancelled) setSvg(rendered.svg);
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      }
-    })();
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const { default: mermaid } = await import("mermaid");
+          mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+          const rendered = await mermaid.render(id, code);
+          if (!cancelled) setSvg(rendered.svg);
+        } catch (err) {
+          if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+        }
+      })();
+    }, 300);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [code, id]);
 

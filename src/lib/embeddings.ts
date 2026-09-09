@@ -1,6 +1,7 @@
-// Local-first embeddings via transformers.js.
-// Lazy-loaded so it doesn't bloat the initial bundle. Falls back to a
-// lightweight hash embedding if the model can't be loaded (e.g. offline).
+// Local-first embeddings via transformers.js. Inference runs in a dedicated
+// Web Worker (embeddings-worker.ts) so knowledge-index sweeps never block
+// the main thread. Falls back to a lightweight hash embedding when the
+// worker or the model can't be loaded (e.g. offline, or non-worker runtimes).
 
 export interface EmbeddingModelOption {
   id: string;
@@ -50,41 +51,86 @@ function getDims(): number {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let pipelinePromise: Promise<any> | null = null;
-let useFallback = false;
+type RpcPending = {
+  resolve: (value: any) => void;
+  reject: (err: Error) => void;
+  onProgress?: (info: EmbeddingProgressInfo) => void;
+};
 
-/** Switch the embedding model at runtime (clears the pipeline cache). */
+const pendingRpc = new Map<string, RpcPending>();
+let rpcSeq = 0;
+let worker: Worker | null = null;
+let workerBroken = false;
+
+function getWorker(): Worker | null {
+  if (workerBroken) return null;
+  if (worker) return worker;
+  try {
+    worker = new Worker(new URL("./embeddings-worker.ts", import.meta.url), { type: "module" });
+  } catch {
+    workerBroken = true;
+    return null;
+  }
+  worker.addEventListener("message", (event: MessageEvent) => {
+    const data = event.data as
+      | { kind: "embed" | "preload"; id: string; vectors?: number[][]; error?: string }
+      | { kind: "progress"; id: string; info: EmbeddingProgressInfo };
+    const pending = pendingRpc.get(data?.id);
+    if (!pending) return;
+    if (data.kind === "progress") {
+      pending.onProgress?.(data.info);
+      return;
+    }
+    pendingRpc.delete(data.id);
+    if (data.error !== undefined) pending.reject(new Error(data.error));
+    else pending.resolve(data.vectors ?? null);
+  });
+  worker.addEventListener("error", () => {
+    workerBroken = true;
+    for (const [, pending] of pendingRpc) pending.reject(new Error("embeddings worker failed"));
+    pendingRpc.clear();
+    worker?.terminate();
+    worker = null;
+  });
+  return worker;
+}
+
+function embedRpc(modelId: string, texts: string[]): Promise<number[][] | null> {
+  const w = getWorker();
+  if (!w) return Promise.reject(new Error("embeddings worker unavailable"));
+  return new Promise((resolve, reject) => {
+    const id = `rpc-${++rpcSeq}`;
+    pendingRpc.set(id, { resolve, reject });
+    w.postMessage({ kind: "embed", id, modelId, texts });
+  });
+}
+
+function preloadRpc(
+  modelId: string,
+  onProgress?: (info: EmbeddingProgressInfo) => void,
+): Promise<void> {
+  const w = getWorker();
+  if (!w) return Promise.reject(new Error("embeddings worker unavailable"));
+  return new Promise((resolve, reject) => {
+    const id = `rpc-${++rpcSeq}`;
+    pendingRpc.set(id, { resolve, reject, onProgress });
+    w.postMessage({ kind: "preload", id, modelId });
+  });
+}
+
+/** Switch the embedding model at runtime (the worker caches per model id). */
 export function setEmbeddingModel(modelId: string) {
   if (currentModelId === modelId) return;
   currentModelId = modelId;
-  pipelinePromise = null;
-  useFallback = false;
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function getExtractor(): Promise<any> {
-  if (useFallback) throw new Error("fallback mode");
-  const modelId = getModelId();
-  if (!pipelinePromise) {
-    pipelinePromise = import("@huggingface/transformers").then((mod) => {
-      mod.env.allowLocalModels = false;
-      return mod.pipeline("feature-extraction", modelId);
-    }).catch((err) => {
-      useFallback = true;
-      throw err;
-    });
-  }
-  return pipelinePromise;
 }
 
 /** Embed an array of texts. Returns one vector per text (normalized). */
 export async function embed(texts: string[]): Promise<number[][]> {
   if (texts.length === 0) return [];
   try {
-    const extractor = await getExtractor();
-    const output = await extractor(texts, { pooling: "mean", normalize: true });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    return (output.tolist() as number[][]);
+    const vectors = await embedRpc(getModelId(), texts);
+    if (vectors && vectors.length === texts.length) return vectors;
+    throw new Error("embeddings worker returned a malformed response");
   } catch {
     return texts.map((t) => hashEmbed(t));
   }
@@ -105,27 +151,17 @@ export interface EmbeddingProgressInfo {
 }
 
 /**
- * Eagerly download + warm up an embedding model (used right after the
- * onboarding step so the first file attachment doesn't pay the download
- * cost). Reports per-file download progress; throws on failure (the caller
- * can fall back to the lazy first-use download).
+ * Eagerly download + warm up an embedding model in the worker (used right
+ * after the onboarding step so the first file attachment doesn't pay the
+ * download cost). Reports per-file download progress; throws on failure (the
+ * caller can fall back to the lazy first-use download).
  */
 export async function preloadEmbeddingModel(
   modelId: string,
   onProgress?: (info: EmbeddingProgressInfo) => void,
 ): Promise<void> {
-  const mod = await import("@huggingface/transformers");
-  mod.env.allowLocalModels = false;
-  const options: Record<string, unknown> = onProgress
-    ? { progress_callback: (data: EmbeddingProgressInfo) => onProgress(data) }
-    : {};
-  const extractor = await mod.pipeline("feature-extraction", modelId, options);
-  // Warm-up inference so the first real embed is instant.
-  await extractor(["warm-up"], { pooling: "mean", normalize: true });
-  // Make the loaded pipeline the live one for this model.
+  await preloadRpc(modelId, onProgress);
   currentModelId = modelId;
-  pipelinePromise = Promise.resolve(extractor);
-  useFallback = false;
 }
 
 export function cosineSimilarity(a: number[], b: number[]): number {

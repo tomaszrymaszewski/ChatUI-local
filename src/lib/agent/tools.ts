@@ -1051,6 +1051,12 @@ export function buildAgentTools(
           });
           // The agent's private on-disk workspace (~/Documents/chatUI/agents/<id>).
           void ensureAgentWorkspace(def.id).catch(() => {});
+          // Surface "an agent was created" so the UI can offer to discard the
+          // now-useless setup conversation.
+          const ctx = ctxFn();
+          if (ctx) {
+            ctx.emit({ type: "agent_created", agentId: def.id, agentName: def.name });
+          }
           return (
             `Agent "${def.name}" has been created and now appears in the sidebar under Agents. ` +
             `It runs sandboxed on-device: it gets a private workspace folder for its files, and the user can ` +

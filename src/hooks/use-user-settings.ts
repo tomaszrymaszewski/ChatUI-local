@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   embeddingEndpoint: null,
   knowledgeEnabled: true,
   knowledgeSources: DEFAULT_KNOWLEDGE_SOURCES,
+  contextCompression: false,
 };
 
 function loadSettings(): UserSettings {

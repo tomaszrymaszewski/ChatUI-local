@@ -277,4 +277,6 @@ export interface UserSettings {
   embeddingEndpoint: EmbeddingEndpointConfig | null;
   knowledgeEnabled: boolean;
   knowledgeSources: KnowledgeSourceToggles;
+  /** Compress tool outputs and chat history via the local Headroom proxy. */
+  contextCompression: boolean;
 }

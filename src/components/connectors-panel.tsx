@@ -101,6 +101,7 @@ const MCP_ICONS: Record<string, { Icon: IconComponent; tile: string }> = {
   exa: { Icon: Search, tile: "bg-violet-500/10 text-violet-600 dark:text-violet-400" },
   firecrawl: { Icon: Flame, tile: "bg-orange-500/10 text-orange-600 dark:text-orange-400" },
   "microsoft-learn": { Icon: MicrosoftLogo, tile: "bg-foreground/5" },
+  "playwright-browser": { Icon: Globe, tile: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400" },
   fetch: { Icon: Globe, tile: "bg-sky-500/10 text-sky-600 dark:text-sky-400" },
   memory: { Icon: Brain, tile: "bg-purple-500/10 text-purple-600 dark:text-purple-400" },
   "sequential-thinking": { Icon: Workflow, tile: "bg-cyan-500/10 text-cyan-600 dark:text-cyan-400" },

@@ -14,6 +14,8 @@ import {
   Eye,
   EyeOff,
   RotateCcw,
+  Wrench,
+  CircleDot,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
@@ -49,7 +51,14 @@ import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { useProjects } from "@/hooks/use-projects";
 import { useOpencodeContext } from "@/lib/opencode-context";
-import { exportAllData, importAllData, getTavilyApiKey, setTavilyApiKey } from "@/lib/llm";
+import { getTavilyApiKey, setTavilyApiKey } from "@/lib/llm";
+import {
+  exportChatUiBackup,
+  exportOpenAiConversations,
+  exportAnthropicConversations,
+  importData,
+  type ImportResult,
+} from "@/lib/data-transfer";
 import { getProviderMeta } from "@/lib/provider-meta";
 import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync } from "@/lib/model-capabilities";
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
@@ -62,6 +71,7 @@ import {
 } from "@/lib/knowledge-index";
 import { resetOnboarding } from "@/lib/onboarding";
 import { modelLabel } from "@/lib/model-display";
+import { headroomStart, headroomStatus, type HeadroomStatus } from "@/lib/headroom-client";
 import type { Provider, ProviderModel, UserSettings, KnowledgeSourceToggles } from "@/types";
 
 export type SettingsTab = "general" | "memory" | "models" | "skills" | "connectors" | "updates";
@@ -87,6 +97,31 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
   const [newMemoryText, setNewMemoryText] = useState("");
   const [knowledgeStats, setKnowledgeStats] = useState<KnowledgeIndexStats | null>(null);
   const [sweeping, setSweeping] = useState(false);
+  const [proxyStatus, setProxyStatus] = useState<HeadroomStatus | null>(null);
+  const [showExportDialog, setShowExportDialog] = useState(false);
+
+  const handleContextCompressionToggle = async (on: boolean) => {
+    updateSettings({ contextCompression: on });
+    if (!on) {
+      setProxyStatus(null);
+      return;
+    }
+    // Probe first; start the proxy if the user has it installed.
+    const fresh = await headroomStatus();
+    setProxyStatus(fresh);
+    if (fresh.serving) {
+      toast.success("Context compression is ready (Headroom proxy is running)");
+      return;
+    }
+    const err = await headroomStart();
+    if (err) {
+      toast.error(`Could not start Headroom: ${err}`);
+    } else {
+      const after = await headroomStatus();
+      setProxyStatus(after);
+      if (after.serving) toast.success("Context compression is ready");
+    }
+  };
 
   const refreshKnowledgeStats = useCallback(() => {
     void getKnowledgeIndexStats().then(setKnowledgeStats);
@@ -189,19 +224,56 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
     }
   };
 
-  const handleExport = () => {
+  const downloadJson = (json: string, filename: string) => {
+    const blob = new Blob([json], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const exportOptions: Array<{
+    id: "chatui" | "openai" | "anthropic";
+    label: string;
+    description: string;
+    filename: string;
+    run: () => string;
+  }> = [
+    {
+      id: "chatui",
+      label: "ChatUI backup (recommended)",
+      description:
+        "Everything: chats, agents, projects, providers, settings, schedules, workflows, and memories",
+      filename: `chatui-backup-${new Date().toISOString().slice(0, 10)}.json`,
+      run: exportChatUiBackup,
+    },
+    {
+      id: "openai",
+      label: "ChatGPT format",
+      description:
+        "Conversations only, in OpenAI's ChatGPT export format (conversations.json) for migrating to other apps",
+      filename: `chatui-chatgpt-${new Date().toISOString().slice(0, 10)}.json`,
+      run: exportOpenAiConversations,
+    },
+    {
+      id: "anthropic",
+      label: "Claude format",
+      description:
+        "Conversations only, in Anthropic's Claude export format (conversations.json) for migrating to other apps",
+      filename: `chatui-claude-${new Date().toISOString().slice(0, 10)}.json`,
+      run: exportAnthropicConversations,
+    },
+  ];
+
+  const handleExportOption = (option: (typeof exportOptions)[number]) => {
     try {
-      const json = exportAllData();
-      const blob = new Blob([json], { type: "application/json" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `chatui-export-${new Date().toISOString().slice(0, 10)}.json`;
-      a.click();
-      URL.revokeObjectURL(url);
-      toast.success("Data exported");
+      downloadJson(option.run(), option.filename);
+      toast.success(`${option.label} exported`);
+      setShowExportDialog(false);
     } catch (err) {
-      toast.error("Failed to export data");
+      toast.error(err instanceof Error ? err.message : "Failed to export data");
     }
   };
 
@@ -210,9 +282,20 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
     if (!file) return;
     try {
       const text = await file.text();
-      importAllData(text);
-      toast.success("Data imported. Reloading...");
-      setTimeout(() => window.location.reload(), 1000);
+      const result: ImportResult = importData(text);
+      if (result.kind === "chatui") {
+        toast.success("Data imported. Reloading...");
+        setTimeout(() => window.location.reload(), 1000);
+      } else {
+        const label = result.kind === "openai" ? "ChatGPT" : "Claude";
+        if (result.sessions === 0) {
+          toast.info(`All conversations from this ${label} export were already imported`);
+        } else {
+          toast.success(
+            `Imported ${result.sessions} conversation${result.sessions !== 1 ? "s" : ""} (${result.messages} messages) from a ${label} export`
+          );
+        }
+      }
     } catch (err) {
       toast.error(
         err instanceof Error ? err.message : "Failed to import data"
@@ -374,6 +457,51 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
 
               <Separator />
 
+              <div className="flex flex-col gap-4">
+                <div className="flex items-center justify-between gap-4">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-sm font-medium">Compress context (Headroom)</span>
+                    <span className="text-xs text-muted-foreground">
+                      Shrink tool outputs and chat history before they reach the model,
+                      using a local Headroom proxy. Turns off automatically if the proxy
+                      isn't installed.
+                    </span>
+                  </div>
+                  <Switch
+                    checked={settings.contextCompression}
+                    onCheckedChange={(v) => void handleContextCompressionToggle(v)}
+                  />
+                </div>
+                {settings.contextCompression && (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    {proxyStatus
+                      ? proxyStatus.serving ? (
+                        <>
+                          <CircleDot className="size-3.5 text-primary" />
+                          <span>{proxyStatus.url} — available</span>
+                        </>
+                      ) : proxyStatus.installed ? (
+                        <span>Proxy installed, starting…</span>
+                      ) : (
+                        <span>
+                          Proxy not installed — install it with{" "}
+                          <code className="rounded bg-muted px-1.5 py-0.5">
+                            pip install &quot;headroom-ai[proxy]&quot;
+                          </code>
+                        </span>
+                      )
+                      : (
+                        <>
+                          <Wrench className="size-3.5" />
+                          <span>Checking for a running proxy…</span>
+                        </>
+                      )}
+                  </div>
+                )}
+              </div>
+
+              <Separator />
+
               <div className="flex items-center justify-between">
                 <div className="flex flex-col gap-0.5">
                   <span className="text-sm font-medium">Replay setup</span>
@@ -392,6 +520,36 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                   <RotateCcw className="size-4" />
                   Replay
                 </Button>
+              </div>
+
+              <Separator />
+
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm font-semibold">Data &amp; migration</span>
+                  <span className="text-xs text-muted-foreground">
+                    Back up everything or take your conversations to another app.
+                    Import understands ChatUI backups as well as ChatGPT and
+                    Claude exports.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button variant="outline" onClick={() => setShowExportDialog(true)}>
+                    <Download className="size-4" />
+                    Export…
+                  </Button>
+                  <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
+                    <Upload className="size-4" />
+                    Import…
+                  </Button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="application/json,.json"
+                    className="hidden"
+                    onChange={handleImport}
+                  />
+                </div>
               </div>
             </div>
           </div>
@@ -699,29 +857,6 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                   })()}
                 </div>
               )}
-
-              <Separator />
-
-              <div className="flex items-center gap-2">
-                <Button variant="outline" onClick={handleExport}>
-                  <Download className="size-4" />
-                  Export Data
-                </Button>
-                <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
-                  <Upload className="size-4" />
-                  Import Data
-                </Button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="application/json"
-                  className="hidden"
-                  onChange={handleImport}
-                />
-              </div>
-              <p className="text-xs text-muted-foreground">
-                Export includes all providers, settings, projects, and conversation history
-              </p>
             </div>
           </div>
         )}
@@ -974,6 +1109,47 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
         )}
 
       </div>
+
+      {/* Export Format Dialog */}
+      <Dialog
+        open={showExportDialog}
+        onOpenChange={(o) => !o && setShowExportDialog(false)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Export your data</DialogTitle>
+            <DialogDescription>
+              Conversations always travel with the portable formats; the ChatUI
+              backup also keeps agents, providers, settings, schedules, and
+              memories.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-2 pt-2">
+            {exportOptions.map((option) => (
+              <div
+                key={option.id}
+                className="flex items-center justify-between gap-4 rounded-lg border p-3"
+              >
+                <div className="flex flex-col gap-0.5">
+                  <span className="text-sm font-medium">{option.label}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {option.description}
+                  </span>
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={() => handleExportOption(option)}
+                >
+                  <Download className="size-4" />
+                  Download
+                </Button>
+              </div>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Add/Edit Provider Dialog */}
       <Dialog
