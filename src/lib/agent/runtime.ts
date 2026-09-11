@@ -546,6 +546,12 @@ export class DeepAgentSession {
         for await (const call of run.toolCalls) {
           const id = `tool-${call.callId || call.name}-${Date.now()}`;
           const label = toolCallLabel(call.name, call.input);
+          // Visited websites carry their url so the UI can show a favicon.
+          const input = call.input as Record<string, unknown> | undefined;
+          const url =
+            call.name === "web_fetch" && typeof input?.url === "string"
+              ? input.url
+              : undefined;
           emit({
             type: "activity",
             activity: {
@@ -554,6 +560,7 @@ export class DeepAgentSession {
               name: call.name,
               status: "running",
               label,
+              url,
             },
           });
           void call.status.then(async (status: "running" | "finished" | "error") => {
@@ -577,6 +584,7 @@ export class DeepAgentSession {
                 status: status === "finished" ? "done" : "error",
                 detail,
                 label,
+                url,
               },
             });
           });

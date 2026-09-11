@@ -364,6 +364,7 @@ function buildResearcherTools(
             name: "web_fetch",
             status: "running",
             label: `${subagentLabel}: Reading ${hostname}`,
+            url,
             parentId: subagentId,
           },
         });
@@ -385,7 +386,7 @@ function buildResearcherTools(
         try {
           const resp = await httpFetch(url);
           if (resp.status < 200 || resp.status >= 300) {
-            emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "error", parentId: subagentId } });
+            emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "error", url, parentId: subagentId } });
             emit({ type: "activity", activity: { id: `${toolId}-src`, kind: "source", name: hostname, status: "error", url, title: hostname, parentId: subagentId } });
             return `Error: HTTP ${resp.status}`;
           }
@@ -410,11 +411,11 @@ function buildResearcherTools(
           } else {
             body = resp.body.slice(0, 8000);
           }
-          emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "done", parentId: subagentId } });
+          emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "done", url, parentId: subagentId } });
           emit({ type: "activity", activity: { id: `${toolId}-src`, kind: "source", name: hostname, status: "done", url, title: hostname, parentId: subagentId } });
           return body;
         } catch (err) {
-          emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "error", parentId: subagentId } });
+          emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "error", url, parentId: subagentId } });
           emit({ type: "activity", activity: { id: `${toolId}-src`, kind: "source", name: hostname, status: "error", url, title: hostname, parentId: subagentId } });
           return `Error: ${err instanceof Error ? err.message : String(err)}`;
         }

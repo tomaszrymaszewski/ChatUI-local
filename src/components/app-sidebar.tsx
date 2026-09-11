@@ -40,7 +40,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window"
 import { isMacOS } from "@/lib/platform"
 import { cn } from "@/lib/utils"
 import { NavChats } from "@/components/nav-chats"
-import { AgentAvatarRail, NavAgents } from "@/components/nav-agents"
+import { NavAgents } from "@/components/nav-agents"
 import {
   Sidebar,
   SidebarContent,
@@ -326,11 +326,6 @@ export function AppSidebar({
                 )}
               </SidebarMenu>
             </SidebarGroup>
-            <AgentAvatarRail
-              agents={agents}
-              activeAgentId={activeAgentConsole?.id ?? null}
-              onOpenAgentConsole={(agentId) => onOpenAgentConsole?.(agentId)}
-            />
           </SidebarContent>
 
           <Dialog

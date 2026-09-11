@@ -20,7 +20,7 @@ export function WelcomeStep({
 
   return (
     <div className="flex flex-col gap-8">
-      <StepHeader target={headerBox} title="Welcome to ChatUI" />
+      <StepHeader target={headerBox} title="Welcome to AI Studio" />
 
       <div className="grid gap-3 sm:grid-cols-3">
         <div className="flex flex-col gap-2 rounded-xl border p-4">

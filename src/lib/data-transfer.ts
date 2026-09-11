@@ -1,6 +1,6 @@
 import type { Message } from "@/types";
 
-// Data export/import: full ChatUI backups (a snapshot of every chatui* localStorage
+// Data export/import: full AI Studio backups (a snapshot of every chatui* localStorage
 // key — chats, agents, projects, providers, settings, schedules, workflows,
 // memories, connectors) plus portable conversation exports in the formats
 // ChatGPT (OpenAI) and Claude (Anthropic) use for their official data exports,
@@ -101,7 +101,7 @@ function epochSeconds(d: Date): number {
   return d.getTime() / 1000;
 }
 
-// ─── Full ChatUI backup (proprietary format, everything) ─────────────────────
+// ─── Full AI Studio backup (proprietary format, everything) ─────────────────
 
 export function exportChatUiBackup(): string {
   const data: Record<string, string> = {};
@@ -462,7 +462,7 @@ function looksLikeAnthropicExport(items: unknown[]): boolean {
 }
 
 /**
- * Import an export file, auto-detecting the format: a ChatUI backup
+ * Import an export file, auto-detecting the format: an AI Studio backup
  * (restores everything and needs an app reload) or a conversations.json from
  * ChatGPT/Claude (merged in as new chat sessions).
  */
@@ -505,6 +505,6 @@ export function importData(jsonString: string): ImportResult {
   }
 
   throw new Error(
-    "Unrecognized import format. Expected a ChatUI backup or a ChatGPT/Claude conversations.json export.",
+    "Unrecognized import format. Expected an AI Studio backup or a ChatGPT/Claude conversations.json export.",
   );
 }

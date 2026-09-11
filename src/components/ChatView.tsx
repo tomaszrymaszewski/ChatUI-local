@@ -29,6 +29,7 @@ import {
   Globe,
   GraduationCap,
   Loader2,
+  Menu,
   UsersRound,
   SignalHigh,
   SignalMedium,
@@ -151,7 +152,8 @@ import {
 import { useAgents } from "@/hooks/use-agents";
 import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController, type AgentControllerApi } from "@/hooks/use-deep-agent";
 import { useScheduler } from "@/hooks/use-scheduler";
-import type { AgentMode, AgentRunResult } from "@/lib/agent/types";
+import type { AgentMode, AgentRunResult, TodoItem } from "@/lib/agent/types";
+import { WidgetStack, TasksWidget } from "@/components/agent-widgets";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { ensureAgentWorkspace, removeAgentWorkspace } from "@/lib/agent/sandbox";
 import { applyAgentConfigPatch } from "@/lib/agent/tools";
@@ -357,6 +359,15 @@ export function ChatView() {
   const [artifactPanel, setArtifactPanel] = useState<{ artifacts: Artifact[]; activeIndex: number } | null>(null);
   const [artifactWindowMode, setArtifactWindowMode] = useState<"open" | "minimized" | "expanded">("open");
   const [artifactWidth, setArtifactWidth] = useState<number | null>(null);
+  // Master show/hide for the agent-view widget stack (hamburger in the header).
+  const [widgetsHidden, setWidgetsHidden] = useState(
+    () => localStorage.getItem("chatui:widgets-hidden") === "1",
+  );
+  const toggleWidgetsHidden = () =>
+    setWidgetsHidden((prev) => {
+      localStorage.setItem("chatui:widgets-hidden", prev ? "0" : "1");
+      return !prev;
+    });
   const sessionContainerRef = useRef<HTMLDivElement>(null);
   const autoOpenedArtifacts = useRef<Set<string>>(new Set());
   const autoModeRef = useRef<ChatMode>("none");
@@ -621,6 +632,37 @@ export function ChatView() {
     () => getActivePath(roots, nodeMap, selectedChildMap),
     [roots, nodeMap, selectedChildMap],
   );
+
+  // Agent-task view = an agent-mode session (task) is open in the main area.
+  const agentTaskView = isAgentTab && !!activeSession?.agentId;
+
+  // Current todo list for the tasks widget: the live run's todos, else the
+  // todo activities of the newest message that has them (persisted state).
+  const sessionTodos: TodoItem[] = (() => {
+    if (agent?.todos && agent.todos.length > 0) return agent.todos;
+    for (let i = activePath.length - 1; i >= 0; i--) {
+      const todos = (activePath[i]?.message.activities ?? []).filter(
+        (a) => a.kind === "todo",
+      );
+      if (todos.length > 0) {
+        return todos.map((a) => ({
+          content: a.name,
+          status:
+            a.status === "done"
+              ? ("completed" as const)
+              : a.status === "running"
+                ? ("in_progress" as const)
+                : ("pending" as const),
+        }));
+      }
+    }
+    return [];
+  })();
+
+  // Widgets shown = stack slid in; the chat column reserves matching
+  // right-hand space (widget 18rem + 0.75rem offset + 0.75rem gap) so no
+  // chat text is ever covered.
+  const widgetsVisible = agentTaskView && !artifactPanel && !widgetsHidden;
 
   useEffect(() => {
     setSelectedChildMap(new Map());
@@ -2707,13 +2749,32 @@ export function ChatView() {
               )}
             </div>
           )}
-          <div className="ml-auto flex items-center gap-2" />
+          <div className="ml-auto flex items-center gap-2">
+            {agentTaskView && (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                onMouseDown={(e) => e.stopPropagation()}
+                onClick={toggleWidgetsHidden}
+                aria-label={widgetsHidden ? "Show widgets" : "Hide widgets"}
+                className="shrink-0 -mr-2"
+              >
+                <Menu />
+              </Button>
+            )}
+          </div>
         </header>
 
         <div className="flex min-h-0 flex-1 flex-col">
         {(activeSession && (!isAgentTab || agentConsoleFocus === "session")) ? (
           <div ref={sessionContainerRef} className="relative flex min-h-0 flex-1 gap-2 overflow-hidden p-2">
-            <div className={`relative flex min-h-0 min-w-0 flex-1 flex-col transition-[flex] duration-300 ease-out${artifactWindowMode === "expanded" ? " hidden" : ""}`}>
+            <div
+              className={cn(
+                "relative flex min-h-0 min-w-0 flex-1 flex-col transition-[flex,margin] duration-300 ease-out",
+                widgetsVisible && "mr-[19.5rem]",
+                artifactWindowMode === "expanded" && "hidden",
+              )}
+            >
             <MessageScrollerProvider
               autoScroll
               defaultScrollPosition="last-anchor"
@@ -2750,7 +2811,7 @@ export function ChatView() {
                                       activities={agent?.activities}
                                       reasoning={agent?.streamingReasoning}
                                       reasoningStreams={agent?.reasoningStreams}
-                                      todos={agent?.todos}
+                                      todos={agentTaskView ? undefined : agent?.todos}
                                       live
                                     />
                                     <div
@@ -2995,6 +3056,14 @@ export function ChatView() {
               </div>
             </div>
             </div>
+            {/* Agent-view floating widgets (top-right). Stays mounted while
+                hidden so it can slide out of the right edge; the chat column
+                reserves matching space while visible, so nothing is covered. */}
+            {agentTaskView && !artifactPanel && (
+              <WidgetStack visible={!widgetsHidden}>
+                <TasksWidget todos={sessionTodos} />
+              </WidgetStack>
+            )}
             {artifactPanel && artifactWindowMode !== "minimized" && artifactWindowMode !== "expanded" && (
               <div
                 className="flex w-1.5 shrink-0 cursor-col-resize items-center justify-center rounded-full transition-colors hover:bg-primary/20 active:bg-primary/40"

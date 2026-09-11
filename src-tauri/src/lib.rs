@@ -1448,7 +1448,7 @@ fn oauth_callback_loop(
             write_response(
                 stream,
                 "200 OK",
-                "<html><body><h2>Sign-in failed</h2><p>The provider returned an error. Return to ChatUI and try again.</p></body></html>",
+                "<html><body><h2>Sign-in failed</h2><p>The provider returned an error. Return to AI Studio and try again.</p></body></html>",
             );
             return;
         }
@@ -1456,7 +1456,7 @@ fn oauth_callback_loop(
             write_response(
                 stream,
                 "400 Bad Request",
-                "<html><body><h2>Invalid or expired state parameter</h2><p>Return to ChatUI and start the sign-in again.</p></body></html>",
+                "<html><body><h2>Invalid or expired state parameter</h2><p>Return to AI Studio and start the sign-in again.</p></body></html>",
             );
             continue;
         }
@@ -1464,7 +1464,7 @@ fn oauth_callback_loop(
         write_response(
             stream,
             "200 OK",
-            "<html><body><h2>Sign-in complete</h2><p>You can close this tab and return to ChatUI.</p></body></html>",
+            "<html><body><h2>Sign-in complete</h2><p>You can close this tab and return to AI Studio.</p></body></html>",
         );
 
         let client = match reqwest::blocking::Client::builder()
@@ -1580,7 +1580,7 @@ async fn mcp_oauth_begin(name: String, server_url: String) -> Result<String, Str
                     let resp = client
                         .post(registration_endpoint)
                         .json(&serde_json::json!({
-                            "client_name": "ChatUI",
+                            "client_name": "AI Studio",
                             "redirect_uris": [format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT)],
                             "grant_types": ["authorization_code"],
                             "response_types": ["code"],
@@ -4046,7 +4046,7 @@ pub fn run() {
                         "main",
                         tauri::WebviewUrl::default(),
                     )
-                    .title("chatui")
+                    .title("AI Studio")
                     .inner_size(1280.0, 800.0)
                     .min_inner_size(800.0, 600.0)
                     .hidden_title(true)

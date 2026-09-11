@@ -24,6 +24,22 @@ const BING_RSS_SEARCH_URL = "https://www.bing.com/search";
 const DUCKDUCKGO_HTML_SEARCH_URL = "https://html.duckduckgo.com/html/";
 const TAVILY_SEARCH_URL = "https://api.tavily.com/search";
 
+// ─── Market-pinned search URLs ────────────────────────────────────────────
+//
+// Without an explicit market, both keyless backends localize results to the
+// requester's IP region — mixed-language and "nearby" noise for English
+// queries. Pinning the market keeps results stable regardless of network.
+
+/** Bing RSS search URL pinned to the en-US market. */
+export function bingRssUrl(query: string): string {
+  return `${BING_RSS_SEARCH_URL}?q=${encodeURIComponent(query)}&format=rss&mkt=en-US&setlang=en&cc=US`;
+}
+
+/** DuckDuckGo HTML search URL with the region set to "no region" (`wt-wt`). */
+export function ddgHtmlUrl(query: string): string {
+  return `${DUCKDUCKGO_HTML_SEARCH_URL}?q=${encodeURIComponent(query)}&kl=wt-wt`;
+}
+
 // ─── Bing RSS parser ──────────────────────────────────────────────────────
 
 /** Extract result items (title, url, snippet) from Bing's RSS (`?format=rss`) response. */
@@ -164,7 +180,6 @@ export async function webSearch(
   signal?: AbortSignal,
 ): Promise<SearchResult[]> {
   if (signal?.aborted) return [];
-  const encoded = encodeURIComponent(query);
 
   // 1. Tavily (if configured).
   const tavily = await tavilySearch(query, maxResults, signal);
@@ -172,20 +187,10 @@ export async function webSearch(
   if (tavily.length > 0) return tavily;
 
   // 2. Bing RSS (primary keyless).
-  const bing = await fetchAndParse(
-    `${BING_RSS_SEARCH_URL}?q=${encoded}&format=rss`,
-    extractBingRssResults,
-    maxResults,
-    signal,
-  );
+  const bing = await fetchAndParse(bingRssUrl(query), extractBingRssResults, maxResults, signal);
   if (signal?.aborted) return [];
   if (bing.length > 0) return bing;
 
   // 3. DuckDuckGo HTML (fallback).
-  return fetchAndParse(
-    `${DUCKDUCKGO_HTML_SEARCH_URL}?q=${encoded}`,
-    extractDuckDuckGoResults,
-    maxResults,
-    signal,
-  );
+  return fetchAndParse(ddgHtmlUrl(query), extractDuckDuckGoResults, maxResults, signal);
 }

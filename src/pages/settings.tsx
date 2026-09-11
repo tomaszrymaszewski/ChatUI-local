@@ -243,10 +243,10 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
   }> = [
     {
       id: "chatui",
-      label: "ChatUI backup (recommended)",
+      label: "AI Studio backup (recommended)",
       description:
         "Everything: chats, agents, projects, providers, settings, schedules, workflows, and memories",
-      filename: `chatui-backup-${new Date().toISOString().slice(0, 10)}.json`,
+      filename: `aistudio-backup-${new Date().toISOString().slice(0, 10)}.json`,
       run: exportChatUiBackup,
     },
     {
@@ -254,7 +254,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
       label: "ChatGPT format",
       description:
         "Conversations only, in OpenAI's ChatGPT export format (conversations.json) for migrating to other apps",
-      filename: `chatui-chatgpt-${new Date().toISOString().slice(0, 10)}.json`,
+      filename: `aistudio-chatgpt-${new Date().toISOString().slice(0, 10)}.json`,
       run: exportOpenAiConversations,
     },
     {
@@ -262,7 +262,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
       label: "Claude format",
       description:
         "Conversations only, in Anthropic's Claude export format (conversations.json) for migrating to other apps",
-      filename: `chatui-claude-${new Date().toISOString().slice(0, 10)}.json`,
+      filename: `aistudio-claude-${new Date().toISOString().slice(0, 10)}.json`,
       run: exportAnthropicConversations,
     },
   ];
@@ -529,7 +529,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                   <span className="text-sm font-semibold">Data &amp; migration</span>
                   <span className="text-xs text-muted-foreground">
                     Back up everything or take your conversations to another app.
-                    Import understands ChatUI backups as well as ChatGPT and
+                    Import understands AI Studio backups as well as ChatGPT and
                     Claude exports.
                   </span>
                 </div>
@@ -1119,7 +1119,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
           <DialogHeader>
             <DialogTitle>Export your data</DialogTitle>
             <DialogDescription>
-              Conversations always travel with the portable formats; the ChatUI
+              Conversations always travel with the portable formats; the AI Studio
               backup also keeps agents, providers, settings, schedules, and
               memories.
             </DialogDescription>

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { extractBingRssResults, extractDuckDuckGoResults } from "./web-search";
+import {
+  bingRssUrl,
+  ddgHtmlUrl,
+  extractBingRssResults,
+  extractDuckDuckGoResults,
+} from "./web-search";
 
 const SAMPLE_BING_RSS = `<?xml version="1.0" encoding="utf-8" ?><rss version="2.0"><channel><title>Bing: charity water</title><link>http://www.bing.com:80/search?q=charity+water</link><description>Search results</description>
 <item><title>charity: water</title><link>https://www.charitywater.org/</link><description>clean water for everyone</description></item>
@@ -85,5 +90,24 @@ describe("extractDuckDuckGoResults", () => {
     const results = extractDuckDuckGoResults(html, 5);
     expect(results).toHaveLength(1);
     expect(results[0].url).toBe("https://example.com/page");
+  });
+});
+
+describe("search url builders", () => {
+  it("pins Bing RSS to the en-US market (no IP-based geo results)", () => {
+    const url = new URL(bingRssUrl("charity water & clean"));
+    expect(url.origin + url.pathname).toBe("https://www.bing.com/search");
+    expect(url.searchParams.get("q")).toBe("charity water & clean");
+    expect(url.searchParams.get("format")).toBe("rss");
+    expect(url.searchParams.get("mkt")).toBe("en-US");
+    expect(url.searchParams.get("setlang")).toBe("en");
+    expect(url.searchParams.get("cc")).toBe("US");
+  });
+
+  it("pins DuckDuckGo to no-region so results follow the query, not the IP", () => {
+    const url = new URL(ddgHtmlUrl("charity water"));
+    expect(url.origin + url.pathname).toBe("https://html.duckduckgo.com/html/");
+    expect(url.searchParams.get("q")).toBe("charity water");
+    expect(url.searchParams.get("kl")).toBe("wt-wt");
   });
 });

@@ -4,53 +4,13 @@ import {
   ChevronDown,
   ChevronRight,
   Circle,
-  Globe,
   Network,
-  Pencil,
-  Search,
-  SquareTerminal,
-  Wrench,
   X,
 } from "lucide-react";
+import { ActivityIcon, Favicon, formatToolName } from "@/components/activity-icon";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import type { ActivityItem, ReasoningStream, TodoItem } from "@/lib/agent/types";
 import { cn } from "@/lib/utils";
-
-function ActivityChipIcon({ item }: { item: ActivityItem }) {
-  if (item.kind === "todo") {
-    return item.status === "done" ? (
-      <Check className="size-3 text-emerald-500" />
-    ) : item.status === "running" ? (
-      <Circle className="size-2.5 fill-blue-500/40 text-blue-500" />
-    ) : (
-      <Circle className="size-2.5 text-muted-foreground/50" />
-    );
-  }
-  if (item.status === "done") return <Check className="size-3 text-emerald-500" />;
-  if (item.status === "error") return <X className="size-3 text-red-500" />;
-  if (item.kind === "subagent") return <Network className="size-3 animate-pulse text-blue-500" />;
-  if (item.kind === "input") return <Pencil className="size-3 animate-pulse text-blue-500" />;
-  const name = item.name.toLowerCase();
-  if (name === "web_search") return <Search className="size-3 animate-pulse text-blue-500" />;
-  if (name === "web_fetch") return <Globe className="size-3 animate-pulse text-blue-500" />;
-  if (name === "run_python") return <SquareTerminal className="size-3 animate-pulse text-blue-500" />;
-  return <Wrench className="size-3 animate-pulse text-blue-500" />;
-}
-
-function Favicon({ url, className }: { url: string; className?: string }) {
-  const [failed, setFailed] = useState(false);
-  let hostname = "";
-  try { hostname = new URL(url).hostname; } catch { /* keep empty */ }
-  if (failed || !hostname) return <Globe className={className} />;
-  return (
-    <img
-      src={`https://icons.duckduckgo.com/ip3/${hostname}.ico`}
-      onError={() => setFailed(true)}
-      className={cn("object-contain", className)}
-      alt=""
-    />
-  );
-}
 
 function ActivityChip({ item }: { item: ActivityItem }) {
   const [expanded, setExpanded] = useState(false);
@@ -64,7 +24,7 @@ function ActivityChip({ item }: { item: ActivityItem }) {
         target="_blank"
         rel="noopener noreferrer"
         title={item.url}
-        className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs text-blue-500 transition-colors hover:bg-accent hover:text-blue-600"
+        className="group inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-xs text-blue-500 transition-colors hover:bg-accent hover:text-blue-600"
       >
         <span className="shrink-0">
           {item.status === "running" ? (
@@ -82,18 +42,42 @@ function ActivityChip({ item }: { item: ActivityItem }) {
     );
   }
 
-  const label = item.label ?? item.name;
+  const label = item.label ?? formatToolName(item.name);
   const doneLabel =
     item.status === "done"
       ? label.replace(/^Searching /, "Searched ").replace(/^Fetching /, "Fetched ").replace(/^Creating /, "Created ").replace(/^Running /, "Ran ")
       : label;
+
+  // Fetched websites render as plain links to the page — no expandable
+  // detail; clicking opens the site.
+  if (item.kind === "tool" && item.name === "web_fetch" && item.url) {
+    return (
+      <a
+        href={item.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={item.url}
+        className={cn(
+          "group my-1 inline-flex w-fit items-center gap-1.5 rounded-md px-2 py-0.5 text-xs transition-colors hover:bg-accent",
+          item.status === "error" ? "text-red-500" : "text-muted-foreground",
+        )}
+      >
+        <span className="shrink-0">
+          <ActivityIcon item={item} className="size-3" />
+        </span>
+        <span className={cn(item.status === "running" && "shimmer")}>
+          {item.status === "running" ? label : doneLabel}
+        </span>
+      </a>
+    );
+  }
 
   return (
     <div className="my-1">
       <button
         onClick={() => item.detail && setExpanded((p) => !p)}
         className={cn(
-          "inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs transition-colors",
+          "group inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs transition-colors",
           item.status === "error"
             ? "text-red-500"
             : item.status === "done"
@@ -103,7 +87,7 @@ function ActivityChip({ item }: { item: ActivityItem }) {
         )}
       >
         <span className="shrink-0">
-          <ActivityChipIcon item={item} />
+          <ActivityIcon item={item} className="size-3" />
         </span>
         <span className={cn(item.status === "running" && "shimmer")}>
           {item.status === "running" ? label : doneLabel}
@@ -115,7 +99,12 @@ function ActivityChip({ item }: { item: ActivityItem }) {
         )}
       </button>
       {expanded && item.detail && (
-        <div className="mt-0.5 ml-5 max-h-32 overflow-y-auto rounded-md border bg-muted/30 p-2 text-[11px] text-muted-foreground">
+        <div
+          className={cn(
+            "mt-0.5 ml-5 max-h-32 overflow-y-auto rounded-md border bg-muted/30 p-2 text-[11px]",
+            item.status === "error" ? "border-red-500/30 text-red-500/80" : "text-muted-foreground",
+          )}
+        >
           <pre className="whitespace-pre-wrap break-all font-sans">{item.detail}</pre>
         </div>
       )}
@@ -235,7 +224,7 @@ function SubagentBox({
     }
   }, [running, override]);
 
-  const label = item.label ?? item.name;
+  const label = item.label ?? formatToolName(item.name);
   const doneLabel =
     item.status === "done"
       ? label.replace(/^Researching: /, "Researched: ").replace(/^Filling gap: /, "Filled gap: ")
@@ -256,7 +245,7 @@ function SubagentBox({
             <Network className="size-3 animate-pulse text-blue-500" />
           )}
         </span>
-        <span className={cn("font-medium", item.status === "running" && "shimmer")}>
+        <span className={cn("font-medium", item.status === "running" && "shimmer", item.status === "error" && "text-red-500")}>
           {item.status === "running" ? label : doneLabel}
         </span>
         <span className="ml-auto shrink-0">
