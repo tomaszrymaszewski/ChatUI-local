@@ -81,6 +81,31 @@ const DIGEST_PREAMBLE =
   "sub-agent findings, and artifact contents. Use it to answer follow-ups and to " +
   "continue unfinished work — e.g. when asked to continue a report that was cut off.]";
 
+/**
+ * Per-section caps for buildRunThoughts (the get_task_thoughts replay): far
+ * larger than the inline digest, since the model pulls it on demand instead
+ * of paying for it on every turn.
+ */
+const THOUGHTS_SECTION_LIMIT = 24000;
+
+const THOUGHTS_PREAMBLE =
+  "[Full replay of the previous run — complete thought process, todo list, sub-agent " +
+  "findings, and artifacts, without the inline digest's truncation. Use it to resume " +
+  "or continue that work.]";
+
+function runReasoning(meta: AgentMessageRunMeta): string {
+  const streams = (meta.reasoningStreams ?? []).filter((s) => s.text && s.text.trim());
+  return streams.length > 0
+    ? streams.map((s) => `[${s.label}]\n${s.text.trim()}`).join("\n\n")
+    : (meta.reasoning ?? "").trim();
+}
+
+function runSubagentFindings(meta: AgentMessageRunMeta) {
+  return (meta.activities ?? []).filter(
+    (a) => a.kind === "subagent" && a.status !== "error" && a.output && a.output.trim(),
+  );
+}
+
 function clipHead(text: string, limit: number): string {
   if (text.length <= limit) return text;
   return `${text.slice(0, limit)}\n[…truncated…]`;
@@ -101,18 +126,12 @@ function clipHeadAndTail(text: string, limit: number): string {
 export function buildRunDigest(meta: AgentMessageRunMeta): string {
   const parts: string[] = [];
 
-  const streams = (meta.reasoningStreams ?? []).filter((s) => s.text && s.text.trim());
-  const reasoning =
-    streams.length > 0
-      ? streams.map((s) => `[${s.label}]\n${s.text.trim()}`).join("\n\n")
-      : (meta.reasoning ?? "").trim();
+  const reasoning = runReasoning(meta);
   if (reasoning) {
     parts.push(`Thought process:\n${clipHead(reasoning, DIGEST_REASONING_LIMIT)}`);
   }
 
-  const findings = (meta.activities ?? []).filter(
-    (a) => a.kind === "subagent" && a.status !== "error" && a.output && a.output.trim(),
-  );
+  const findings = runSubagentFindings(meta);
   if (findings.length > 0) {
     const per = Math.max(400, Math.floor(DIGEST_FINDINGS_LIMIT / findings.length));
     parts.push(
@@ -134,6 +153,57 @@ export function buildRunDigest(meta: AgentMessageRunMeta): string {
 
   if (parts.length === 0) return "";
   return `${DIGEST_PREAMBLE}\n\n${parts.join("\n\n")}`;
+}
+
+/**
+ * Uncapped counterpart of buildRunDigest, backing the get_task_thoughts tool:
+ * when a run was stopped or cut off and a later run resumes the task, the
+ * inline digest may be too small to continue from — this returns the previous
+ * run's complete thought process, todo list, findings, and artifacts on
+ * demand. Returns "" when the run left nothing worth replaying.
+ */
+export function buildRunThoughts(meta: AgentMessageRunMeta): string {
+  const parts: string[] = [];
+
+  const todos = (meta.activities ?? []).filter((a) => a.kind === "todo");
+  if (todos.length > 0) {
+    parts.push(
+      `Todo list (final state):\n${todos
+        .map((t) => {
+          const mark = t.status === "done" ? "[x]" : t.status === "running" ? "[~]" : "[ ]";
+          return `${mark} ${t.name}`;
+        })
+        .join("\n")}`,
+    );
+  }
+
+  const reasoning = runReasoning(meta);
+  if (reasoning) {
+    parts.push(`Thought process:\n${clipHead(reasoning, THOUGHTS_SECTION_LIMIT)}`);
+  }
+
+  const findings = runSubagentFindings(meta);
+  if (findings.length > 0) {
+    const per = Math.max(400, Math.floor(THOUGHTS_SECTION_LIMIT / findings.length));
+    parts.push(
+      `Sub-agent findings:\n${findings
+        .map((f) => `## ${f.name}\n${clipHeadAndTail((f.output ?? "").trim(), per)}`)
+        .join("\n\n")}`,
+    );
+  }
+
+  const artifacts = meta.artifacts ?? [];
+  if (artifacts.length > 0) {
+    const per = Math.max(400, Math.floor(THOUGHTS_SECTION_LIMIT / artifacts.length));
+    parts.push(
+      `Artifacts produced:\n${artifacts
+        .map((a) => `## ${a.title} (${a.language})\n${clipHeadAndTail(a.content, per)}`)
+        .join("\n\n")}`,
+    );
+  }
+
+  if (parts.length === 0) return "";
+  return `${THOUGHTS_PREAMBLE}\n\n${parts.join("\n\n")}`;
 }
 
 function expandAssistantMessage(m: AgentMessage): AgentMessage {

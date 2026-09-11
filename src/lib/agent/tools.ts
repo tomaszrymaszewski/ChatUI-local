@@ -885,6 +885,25 @@ export function buildAgentTools(
         }),
       },
     ),
+    tool(
+      async () => {
+        const ctx = ctxFn();
+        if (!ctx?.loadThoughts) {
+          return "Error: thought-process replay is not available in this context.";
+        }
+        return await ctx.loadThoughts();
+      },
+      {
+        name: "get_task_thoughts",
+        description:
+          "Retrieve the FULL thought process of the most recent previous run in this chat: its " +
+          "reasoning, todo list, sub-agent findings, and artifacts. Replayed history only carries " +
+          "a short digest of that run, so call this when continuing or resuming a task that was " +
+          "interrupted or stopped early (e.g. the user says 'continue'), or when a follow-up " +
+          "references earlier work and you need the details of what was already tried or done.",
+        schema: z.object({}),
+      },
+    ),
   ];
 
   if (profile === "task") {

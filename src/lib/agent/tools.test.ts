@@ -57,6 +57,13 @@ describe("automation tools", () => {
     }
   });
 
+  it("exposes get_task_thoughts in every profile", () => {
+    for (const profile of ["chat", "task", "setup"] as const) {
+      const names = buildAgentTools(true, () => null, profile, true).map((t) => t.name);
+      expect(names).toContain("get_task_thoughts");
+    }
+  });
+
   it("maps the tool's snake_case cadence onto the stored ScheduleCadence", () => {
     expect(
       cadenceFromToolInput({ kind: "weekly", time_hhmm: "09:00", weekdays: [1, 3] }),

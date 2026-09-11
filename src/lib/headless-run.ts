@@ -121,6 +121,7 @@ export async function runHeadlessTask(opts: {
 
   const messages: AgentMessage[] = [{ role: "user", content: opts.prompt }];
   const ctrl = getAgentController(sessionId);
+  ctrl.inProgressMessageId = assistantMsg.id;
 
   // Best-effort persistence while the run streams (same cadence as the UI).
   const saveInterval = setInterval(() => {

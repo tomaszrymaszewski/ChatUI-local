@@ -1147,6 +1147,7 @@ export function ChatView() {
         isTemporary,
       );
       inProgressMsgIds.current.set(sessionId, assistantMsg.id);
+      ctrl.inProgressMessageId = assistantMsg.id;
       let lastSaveSig = "";
       const saveInterval = setInterval(() => {
         const sig = streamSaveSignature(ctrl);
@@ -1343,6 +1344,7 @@ export function ChatView() {
         isTemporary,
       );
       inProgressMsgIds.current.set(activeSessionId, assistantMsg.id);
+      ctrl.inProgressMessageId = assistantMsg.id;
       let lastSaveSig = "";
       const saveInterval = setInterval(() => {
         const sig = streamSaveSignature(ctrl);
@@ -1451,6 +1453,7 @@ export function ChatView() {
         msgIsTemporary,
       );
       inProgressMsgIds.current.set(activeSessionId, assistantMsg.id);
+      ctrl.inProgressMessageId = assistantMsg.id;
       let lastSaveSig = "";
       const saveInterval = setInterval(() => {
         const sig = streamSaveSignature(ctrl);
@@ -3854,6 +3857,7 @@ export function ChatView() {
         isTemporary,
       );
       inProgressMsgIds.current.set(newSession.id, assistantMsg.id);
+      ctrl.inProgressMessageId = assistantMsg.id;
       let lastSaveSig = "";
       const saveInterval = setInterval(() => {
         const sig = streamSaveSignature(ctrl);

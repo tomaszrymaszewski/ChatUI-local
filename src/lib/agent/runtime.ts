@@ -515,8 +515,9 @@ export class DeepAgentSession {
     signal?: AbortSignal,
     requestInput?: RunContext["requestInput"],
     requestApproval?: RunContext["requestApproval"],
+    loadThoughts?: RunContext["loadThoughts"],
   ): Promise<StreamOutcome> {
-    this.runCtx.current = { emit, requestInput, requestApproval };
+    this.runCtx.current = { emit, requestInput, requestApproval, loadThoughts };
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const run = await (this.agent as any).streamEvents(input, {

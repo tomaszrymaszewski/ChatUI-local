@@ -6,6 +6,8 @@ import { DeepAgentSession, type AgentMessage } from "@/lib/agent/runtime";
 import { runDeepResearch } from "@/lib/agent/deep-research";
 import { runDiscuss } from "@/lib/agent/discuss";
 import { setRetrievedDocIds } from "@/lib/agent/run-context";
+import { buildRunThoughts, toHistoryMessage } from "@/lib/agent/history";
+import { loadMessages } from "@/hooks/use-messages";
 import { loadUserSettings } from "@/hooks/use-user-settings";
 import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
 import { retrieveKnowledgeContext } from "@/lib/knowledge-retrieval";
@@ -58,6 +60,25 @@ export interface DeepAgentRunOptions {
    */
   unattended?: boolean;
 }
+
+/**
+ * Safety cap on automatic continuations per run: a model that keeps ending its
+ * turn without finishing (or a persistently failing provider) cannot loop
+ * forever — after this many the run ends and the last output/error surfaces.
+ */
+const MAX_AUTO_CONTINUES = 5;
+
+/**
+ * Synthetic user turn injected when a run ends on its own with unfinished
+ * todos (or dies mid-task): it continues the SAME thread, so the model keeps
+ * its todo list, files, and prior tool results.
+ */
+const AUTO_CONTINUE_PROMPT =
+  "[Automatic continuation — your previous turn ended before the task was finished; this was " +
+  "not the user. The todo list still has unfinished items. Continue exactly where you left " +
+  "off: do not restart or repeat completed work, keep the todo statuses updated, and keep " +
+  "going until every item is done. If the work is actually already complete, mark the " +
+  "remaining todos completed and give the final summary instead.]";
 
 /** Best-effort char count of the run input (text parts only; images excluded). */
 function inputChars(messages: AgentMessage[]): number {
@@ -170,6 +191,13 @@ class AgentController implements AgentControllerApi {
   private commandsApprovedForTask = false;
   /** Headless runs never surface prompts — see DeepAgentRunOptions.unattended. */
   private unattended = false;
+  /**
+   * Id of the assistant message the current run streams into (set by the
+   * caller before run()): loadThoughts skips it, since the crash-safety save
+   * keeps this run's own partial output in storage where it would otherwise
+   * shadow the previous run's thoughts.
+   */
+  inProgressMessageId: string | null = null;
   private reasoningStartRef: number | null = null;
   private reasoningMsRef = 0;
   private reasoningStreamsRef = new Map<string, { text: string; label: string; startTime: number; endTime?: number; seq: number }>();
@@ -473,6 +501,25 @@ class AgentController implements AgentControllerApi {
     });
   };
 
+  /**
+   * Full (uncapped) replay of the most recent previous run's thought process
+   * in this chat — the backing for the get_task_thoughts tool. History replay
+   * only folds a short digest into context, so a run resuming after a stop or
+   * interruption pulls the complete reasoning here instead.
+   */
+  private loadThoughts = async (): Promise<string> => {
+    const messages = loadMessages(this.sessionId);
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role !== "assistant" || m.id === this.inProgressMessageId) continue;
+      const meta = toHistoryMessage(m).meta;
+      if (!meta) continue;
+      const thoughts = buildRunThoughts(meta);
+      if (thoughts) return thoughts;
+    }
+    return "No recorded thought process was found in this chat yet.";
+  };
+
   run = async (opts: DeepAgentRunOptions): Promise<AgentRunResult> => {
     this.resetState();
     this.isRunning = true;
@@ -557,13 +604,69 @@ class AgentController implements AgentControllerApi {
           sandbox: opts.taskProfile?.sandbox,
         });
 
-        await session.stream(
-          await session.firstInput(opts.messages),
-          this.emit,
-          controller.signal,
-          this.promptForInput,
-          this.promptForApproval,
-        );
+        // A run must not stop on its own while the todo list still has work:
+        // when the model ends its turn early (or the stream dies mid-task), it
+        // is continued on the same thread — todos, files, and tool results all
+        // persist — until the list is done. Only a user stop (or the
+        // continuation cap) ends the run unfinished.
+        let input: unknown = await session.firstInput(opts.messages);
+        let lastError: unknown = null;
+        for (let attempt = 0; ; attempt++) {
+          try {
+            await session.stream(
+              input,
+              this.emit,
+              controller.signal,
+              this.promptForInput,
+              this.promptForApproval,
+              this.loadThoughts,
+            );
+            lastError = null;
+          } catch (err) {
+            if (controller.signal.aborted) {
+              cancelled = true;
+              break;
+            }
+            lastError = err;
+          }
+          if (controller.signal.aborted) {
+            cancelled = true;
+            break;
+          }
+          if (
+            attempt >= MAX_AUTO_CONTINUES ||
+            !this.todosRef.some((t) => t.status !== "completed")
+          ) {
+            break;
+          }
+          this.emit({
+            type: "activity",
+            activity: {
+              id: `auto-continue-${attempt}`,
+              kind: "tool",
+              name: "auto_continue",
+              status: "done",
+              label: lastError
+                ? "Run failed mid-task — continuing"
+                : "Run stopped with unfinished todos — continuing",
+            },
+          });
+          if (lastError) {
+            // Brief pause before retrying a failed stream; the error still
+            // surfaces once the cap is hit with the task unfinished.
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            if (controller.signal.aborted) {
+              cancelled = true;
+              break;
+            }
+          }
+          // On an error the failed input is resent — it may never have reached
+          // the thread; on a clean stop the synthetic turn continues it.
+          if (!lastError) {
+            input = { messages: [{ role: "user" as const, content: AUTO_CONTINUE_PROMPT }] };
+          }
+        }
+        if (lastError) throw lastError;
       }
     } catch (err) {
       if (controller.signal.aborted) {

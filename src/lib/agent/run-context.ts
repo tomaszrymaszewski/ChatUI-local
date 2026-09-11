@@ -13,6 +13,12 @@ export interface RunContext {
   ) => Promise<{ cancelled: true } | { values: Record<string, unknown> }>;
   /** Pause the tool until the user approves (or denies) a local action. */
   requestApproval?: (request: ApprovalRequest) => Promise<{ approved: boolean }>;
+  /**
+   * Full (uncapped) thought-process replay of the most recent previous run in
+   * this chat — backing for the get_task_thoughts tool. Supplied by the
+   * session's controller.
+   */
+  loadThoughts?: () => Promise<string>;
 }
 
 let current: RunContext | null = null;

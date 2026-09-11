@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import {
   buildRunDigest,
+  buildRunThoughts,
   estimateMessageTokens,
   MAX_HISTORY_TOKENS,
   resolveHistoryBudget,
@@ -9,6 +10,7 @@ import {
 } from "./history";
 import type { AgentMessage } from "./runtime";
 import type { Message, Provider } from "@/types";
+import type { ActivityItem } from "@/lib/agent/types";
 
 vi.mock("@/lib/model-capabilities", () => ({ getModelContextWindow: vi.fn() }));
 
@@ -229,6 +231,55 @@ describe("buildRunDigest", () => {
     });
     expect(digest).toContain("## Research Report (markdown)");
     expect(digest).toContain("# Report\nbody");
+  });
+});
+
+describe("buildRunThoughts", () => {
+  it("returns empty string when there is nothing to replay", () => {
+    expect(buildRunThoughts({})).toBe("");
+    expect(
+      buildRunThoughts({
+        activities: [{ id: "t", kind: "tool", name: "web_search", status: "done" }],
+      }),
+    ).toBe("");
+  });
+
+  it("includes the todo list with status marks", () => {
+    const thoughts = buildRunThoughts({
+      activities: [
+        { id: "todo-0", kind: "todo", name: "Gather sources", status: "done" },
+        { id: "todo-1", kind: "todo", name: "Write draft", status: "running" },
+        { id: "todo-2", kind: "todo", name: "Review", status: "pending" as ActivityItem["status"] },
+      ],
+    });
+    expect(thoughts).toContain("Todo list (final state):");
+    expect(thoughts).toContain("[x] Gather sources");
+    expect(thoughts).toContain("[~] Write draft");
+    expect(thoughts).toContain("[ ] Review");
+  });
+
+  it("replays reasoning beyond the inline digest's cap", () => {
+    const reasoning = "a".repeat(2000) + "UNIQUE-TAIL-CONTENT";
+    const digest = buildRunDigest({ reasoning });
+    const thoughts = buildRunThoughts({ reasoning });
+    expect(digest).not.toContain("UNIQUE-TAIL-CONTENT"); // digest clips at 2000 chars
+    expect(thoughts).toContain("UNIQUE-TAIL-CONTENT");
+    expect(thoughts).toContain("Thought process:");
+  });
+
+  it("includes labeled reasoning streams, findings, and artifacts", () => {
+    const thoughts = buildRunThoughts({
+      reasoningStreams: [{ id: "s0", label: "Planner", text: "plan thoughts" }],
+      activities: [
+        { id: "r0", kind: "subagent", name: "Research: X", status: "done", output: "findings X" },
+        { id: "todo-0", kind: "todo", name: "Draft", status: "running" },
+      ],
+      artifacts: [{ id: "a1", title: "Report", language: "markdown", content: "# Report", index: 0 }],
+    });
+    expect(thoughts).toContain("[Planner]\nplan thoughts");
+    expect(thoughts).toContain("## Research: X\nfindings X");
+    expect(thoughts).toContain("[~] Draft");
+    expect(thoughts).toContain("## Report (markdown)");
   });
 });
 
