@@ -89,11 +89,15 @@ export function createAgentSessionHeadless(
 
 export function useSessions(type: "chat" | "agent") {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  // The unfiltered list — the Agents tab needs it for cross-tab pickers
+  // (e.g. the agent console's external-chats access grant).
+  const [allSessions, setAllSessions] = useState<ChatSession[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const load = () => {
       const all = loadSessions();
+      setAllSessions(all);
       // The chat tab also lists sessions moved to the Agents tab (grayed out,
       // click → redirect notice), so they don't vanish from where they started.
       const visible =
@@ -222,6 +226,7 @@ export function useSessions(type: "chat" | "agent") {
 
   const refetch = useCallback(() => {
     const all = loadSessions();
+    setAllSessions(all);
     const visible =
       type === "chat"
         ? all.filter((s) => s.type === "chat" || s.movedToAgent)
@@ -231,7 +236,7 @@ export function useSessions(type: "chat" | "agent") {
     ));
   }, [type]);
 
-  return { sessions, loading, createSession, deleteSession, updateSession, moveToAgentTab, refetch };
+  return { sessions, allSessions, loading, createSession, deleteSession, updateSession, moveToAgentTab, refetch };
 }
 
 /**

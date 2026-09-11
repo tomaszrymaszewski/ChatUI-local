@@ -80,16 +80,16 @@ describe("isSessionReadable (search_chats scope)", () => {
   const temp = { id: "s5", isTemporary: true };
 
   it("reads nothing when every scope is off", () => {
-    for (const session of [own, otherAgent, chat, temp]) {
+    for (const session of [otherAgent, chat, temp]) {
       expect(isSessionReadable(session, baseSandbox)).toBe(false);
     }
   });
 
-  it("readChats grants only the agent's own sessions", () => {
-    const sandbox: AgentSandbox = { ...baseSandbox, readChats: true };
-    expect(isSessionReadable(own, sandbox)).toBe(true);
-    expect(isSessionReadable(otherAgent, sandbox)).toBe(false);
-    expect(isSessionReadable(chat, sandbox)).toBe(false);
+  it("own sessions are always readable, externals stay off", () => {
+    expect(isSessionReadable(own, baseSandbox)).toBe(true);
+    expect(isSessionReadable(otherAgent, baseSandbox)).toBe(false);
+    expect(isSessionReadable(chat, baseSandbox)).toBe(false);
+    expect(isSessionReadable(temp, baseSandbox)).toBe(false);
   });
 
   it("externalChats=all grants everything except temporary chats", () => {
@@ -98,8 +98,7 @@ describe("isSessionReadable (search_chats scope)", () => {
     expect(isSessionReadable(chat, sandbox)).toBe(true);
     expect(isSessionReadable(task, sandbox)).toBe(true);
     expect(isSessionReadable(temp, sandbox)).toBe(false);
-    // Own sessions still need readChats, not the external scope.
-    expect(isSessionReadable(own, sandbox)).toBe(false);
+    expect(isSessionReadable(own, sandbox)).toBe(true);
   });
 
   it("externalChats=selected grants only the picked session ids", () => {
@@ -116,7 +115,6 @@ describe("isSessionReadable (search_chats scope)", () => {
   it("combines own + external access additively", () => {
     const sandbox: AgentSandbox = {
       ...baseSandbox,
-      readChats: true,
       externalChats: "all",
     };
     expect(isSessionReadable(own, sandbox)).toBe(true);

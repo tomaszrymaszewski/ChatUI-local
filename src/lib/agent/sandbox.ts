@@ -16,8 +16,6 @@ export interface AgentSandbox {
   /** The agent's private workspace dir (always allowed; also in allowedDirectories). */
   workspace?: string;
   allowedDirectories?: string[];
-  /** May search & read this agent's own past chat sessions (search_chats tool). */
-  readChats?: boolean;
   /** May read sessions that are not this agent's own: "all" | "selected" (undefined = off). */
   externalChats?: "all" | "selected";
   /** Session ids readable when externalChats === "selected". */
@@ -108,8 +106,8 @@ export interface ReadableSession {
 
 /**
  * True when the agent may read `session` via search_chats, given its sandbox:
- * its own past sessions need readChats; everything else (chats from the Chat
- * tab, other agents' and standalone task sessions) is external access,
+ * its own past sessions are always readable; everything else (chats from the
+ * Chat tab, other agents' and standalone task sessions) is external access,
  * granted wholesale ("all") or per session id ("selected"). Temporary
  * sessions are never readable.
  */
@@ -118,8 +116,7 @@ export function isSessionReadable(
   sandbox: AgentSandbox,
 ): boolean {
   if (session.isTemporary) return false;
-  const own = !!sandbox.agentId && session.agentId === sandbox.agentId;
-  if (own) return sandbox.readChats ?? false;
+  if (!!sandbox.agentId && session.agentId === sandbox.agentId) return true;
   if (sandbox.externalChats === "all") return true;
   if (sandbox.externalChats === "selected") {
     return (sandbox.allowedExternalSessions ?? []).includes(session.id);

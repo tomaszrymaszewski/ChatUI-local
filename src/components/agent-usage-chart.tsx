@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { BarChart3 } from "lucide-react";
 import {
   getAgentDailyUsage,
   subscribeToAgentUsage,
@@ -35,8 +34,6 @@ export function AgentUsageChart({ agentId }: { agentId: string }) {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-baseline gap-2">
-        <BarChart3 className="size-3.5 self-center text-muted-foreground" />
-        <span className="text-sm font-medium">Usage</span>
         <span className="ml-auto text-xs text-muted-foreground">
           {total === 0
             ? "no runs yet"

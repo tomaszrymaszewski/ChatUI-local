@@ -6,6 +6,7 @@ import {
   BarChart3,
   CalendarClock,
   Check,
+  FileText,
   Folder,
   FolderPlus,
   HardDrive,
@@ -15,7 +16,7 @@ import {
   Workflow as WorkflowIcon,
   X,
 } from "lucide-react";
-import type { AgentDefinition, AgentSchedule, AgentWorkflow, BackgroundPattern, ChatSession, Project } from "@/types";
+import type { AgentDefinition, AgentSchedule, AgentWorkflow, BackgroundPattern, ChatSession, MessageAttachment, Project } from "@/types";
 import type { AgentUpdatePatch } from "@/lib/agents";
 import { modelLabel } from "@/lib/model-display";
 import { describeCadence, deleteSchedule, loadSchedules, subscribeToSchedules, updateSchedule } from "@/lib/schedules";
@@ -38,6 +39,16 @@ import {
   InputGroupButton,
   InputGroupTextarea,
 } from "@/components/ui/input-group";
+import {
+  Attachment,
+  AttachmentAction,
+  AttachmentActions,
+  AttachmentContent,
+  AttachmentDescription,
+  AttachmentGroup,
+  AttachmentMedia,
+  AttachmentTitle,
+} from "@/components/ui/attachment";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -45,6 +56,16 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { loadUserSettings, saveUserSettings } from "@/hooks/use-user-settings";
+import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
 import { cn } from "@/lib/utils";
 
 function CardTitleRow({
@@ -63,6 +84,17 @@ function CardTitleRow({
       {action && <div className="ml-auto">{action}</div>}
     </div>
   );
+}
+
+function formatBytes(bytes: number) {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  );
+  const value = bytes / 1024 ** i;
+  return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
 function SectionCard({
@@ -171,8 +203,8 @@ function ScopeControl({
 }) {
   const options: Array<{ key: "off" | "all" | "selected"; label: string }> = [
     { key: "off", label: "Off" },
+    { key: "selected", label: "Select" },
     { key: "all", label: "All" },
-    { key: "selected", label: "Selected" },
   ];
   return (
     <div className="flex shrink-0 gap-0.5 rounded-lg bg-muted/70 p-1">
@@ -222,6 +254,8 @@ export function AgentConsole({
   onComposingChange,
   onUpdateAgent,
   onSend,
+  files = [],
+  onRemoveFile,
 }: {
   agent: AgentDefinition;
   /** All saved agents (for schedule/workflow step pickers). */
@@ -250,6 +284,9 @@ export function AgentConsole({
   onComposingChange: (composing: boolean) => void;
   onUpdateAgent: (id: string, patch: AgentUpdatePatch) => void;
   onSend: (text: string) => void;
+  /** Files dropped/attached for the new session (owned by ChatView's composer state). */
+  files?: MessageAttachment[];
+  onRemoveFile?: (id: string) => void;
 }) {
   const [inputText, setInputText] = useState("");
   const [schedules, setSchedules] = useState<AgentSchedule[]>(loadSchedules());
@@ -260,6 +297,10 @@ export function AgentConsole({
   const [editingWorkflow, setEditingWorkflow] = useState<AgentWorkflow | null>(null);
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerTarget, setViewerTarget] = useState<FolderViewerTarget | null>(null);
+  /** Confirm before granting "read every chat in the app" (embedding cost). */
+  const [allChatsConfirm, setAllChatsConfirm] = useState(false);
+  /** Confirm before granting "work in every project's folder". */
+  const [allProjectsConfirm, setAllProjectsConfirm] = useState(false);
 
   // Identity drafts (General tab) — resync when the record changes
   // externally (e.g. the agent editing itself mid-chat).
@@ -290,9 +331,26 @@ export function AgentConsole({
 
   const update = (patch: AgentUpdatePatch) => onUpdateAgent(agent.id, patch);
 
+  /** Grant "all" after the user confirmed the embedding/token cost. */
+  const allowAllChats = () => {
+    setAllChatsConfirm(false);
+    update({ externalChats: "all" });
+    // The granted chats are retrieved through the knowledge index — make sure
+    // chat embedding is on and sweep now so the embeddings exist.
+    const s = loadUserSettings();
+    if (!s.knowledgeEnabled || !s.knowledgeSources.chats) {
+      saveUserSettings({
+        ...s,
+        knowledgeEnabled: true,
+        knowledgeSources: { ...s.knowledgeSources, chats: true },
+      });
+    }
+    scheduleKnowledgeSweep(0);
+  };
+
   const send = () => {
     const text = inputText.trim();
-    if (!text) return;
+    if (!text && files.length === 0) return;
     setInputText("");
     onComposingChange(false);
     onSend(text);
@@ -314,6 +372,14 @@ export function AgentConsole({
     () => workflows.filter((w) => w.steps.some((s) => s.agentId === agent.id)),
     [workflows, agent.id],
   );
+
+  // Project access as a scope: "all projects" wins; a defined allowedProjects
+  // list (even empty) means "selected"; undefined means nothing granted yet.
+  const projectScope: "off" | "all" | "selected" = (agent.allProjects
+    ? "all"
+    : agent.allowedProjects !== undefined
+      ? "selected"
+      : "off");
 
   // Candidate sessions for the external chats/tasks picker: everything in
   // the app that isn't this agent's own and isn't a throwaway chat.
@@ -405,7 +471,7 @@ export function AgentConsole({
       <div className="relative z-10 flex min-h-0 flex-1 flex-col">
 
         <ScrollArea className="min-h-0 flex-1">
-          <div className="mx-auto flex min-h-full w-full max-w-6xl flex-col gap-4 px-4 py-4">
+          <div className="mx-auto flex min-h-full w-full max-w-6xl flex-col gap-4 px-4 pt-4 pb-24">
             <div
               className={cn(
                 "grid transition-all duration-500",
@@ -514,7 +580,7 @@ export function AgentConsole({
                 {/* ─── Usage ─── */}
                 <SectionCard
                   icon={<BarChart3 className="size-3.5 text-muted-foreground" />}
-                  title="Recent usage"
+                  title="Usage"
                 >
                   <AgentUsageChart agentId={agent.id} />
                 </SectionCard>
@@ -593,12 +659,11 @@ export function AgentConsole({
                   icon={<CalendarClock className="size-3.5 text-muted-foreground" />}
                   title="Visible chats & projects"
                 >
-                  <PermissionRow
-                    label="Read past chats"
-                    description={`Search and read this agent's own sessions (${sessions.length} session${sessions.length === 1 ? "" : "s"} with ${agent.name})`}
-                    checked={agent.readChats ?? false}
-                    onCheckedChange={(readChats) => update({ readChats })}
-                  />
+                  <p className="text-xs text-muted-foreground">
+                    {agent.name} can always search and read its own past sessions
+                    ({sessions.length} so far). Chats from the Chat tab and other
+                    agents' tasks are granted below.
+                  </p>
 
                   {/* External chats & tasks from the rest of the app */}
                   <div className="flex flex-col gap-2 rounded-lg border p-3">
@@ -611,13 +676,24 @@ export function AgentConsole({
                       </div>
                       <ScopeControl
                         value={agent.externalChats ?? "off"}
-                        onChange={(scope) =>
+                        onChange={(scope) => {
+                          if (scope === "all" && (agent.externalChats ?? "off") !== "all") {
+                            // Wide grant — confirm (every chat gets embedded).
+                            setAllChatsConfirm(true);
+                            return;
+                          }
                           update({
                             externalChats: scope === "off" ? undefined : scope,
-                          })
-                        }
+                          });
+                        }}
                       />
                     </div>
+                    {(agent.externalChats ?? "off") === "all" && (
+                      <p className="text-xs text-muted-foreground">
+                        Every chat and task is readable — {externalCandidates.length} so far,
+                        including ones created later.
+                      </p>
+                    )}
                     {(agent.externalChats ?? "off") === "selected" && (
                       <div className="flex flex-col gap-1.5">
                         {externalCandidates.length === 0 ? (
@@ -672,50 +748,78 @@ export function AgentConsole({
                     )}
                   </div>
 
-                  {/* Projects: all at once, or a per-project selection */}
-                  <div className="flex flex-col gap-1.5">
-                    <PermissionRow
-                      label="All projects"
-                      description="Work in every project's folder, including ones created later"
-                      checked={agent.allProjects ?? false}
-                      onCheckedChange={(allProjects) => update({ allProjects })}
-                    />
-                    {!agent.allProjects &&
-                      (projects.length === 0 ? (
-                        <p className="text-xs text-muted-foreground">
-                          No projects yet — create one in the Projects view.
-                        </p>
-                      ) : (
-                        <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-                          {projects.map((project) => {
-                            const checked = (agent.allowedProjects ?? []).includes(project.id);
-                            return (
-                              <button
-                                key={project.id}
-                                type="button"
-                                onClick={() =>
-                                  toggleListValue(agent.allowedProjects ?? [], project.id, (allowedProjects) =>
-                                    update({ allowedProjects }),
-                                  )
-                                }
-                                className="flex items-center gap-2 rounded-lg border p-2.5 text-left transition-colors hover:bg-accent"
-                              >
-                                <Checkbox
-                                  checked={checked}
-                                  tabIndex={-1}
-                                  className="pointer-events-none"
-                                />
-                                <div className="flex min-w-0 flex-col gap-0.5">
-                                  <span className="truncate text-xs font-medium">{project.name}</span>
-                                  <span className="truncate font-mono text-[10px] text-muted-foreground">
-                                    {project.directory?.replace(/^\/Users\/[^/]+/, "~") ?? "no folder linked"}
-                                  </span>
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      ))}
+                  <div className="flex flex-col gap-2 rounded-lg border p-3">
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 flex-col gap-0.5">
+                        <span className="text-sm font-medium">Work in projects</span>
+                        <span className="text-xs text-muted-foreground">
+                          Project folders {agent.name} may read and write in — granted folders are trusted, no approval cards
+                        </span>
+                      </div>
+                      <ScopeControl
+                        value={projectScope}
+                        onChange={(scope) => {
+                          if (scope === "all") {
+                            if (projectScope !== "all") {
+                              // Wide grant — confirm.
+                              setAllProjectsConfirm(true);
+                            }
+                            return;
+                          }
+                          update({
+                            allProjects: false,
+                            allowedProjects: scope === "selected" ? (agent.allowedProjects ?? []) : undefined,
+                          });
+                        }}
+                      />
+                    </div>
+                    {projectScope === "all" && (
+                      <p className="text-xs text-muted-foreground">
+                        Every project's folder is accessible — {projects.length} so far,
+                        including ones created later.
+                      </p>
+                    )}
+                    {projectScope === "selected" && (
+                      <div className="flex flex-col gap-1.5">
+                        {projects.length === 0 ? (
+                          <p className="text-xs text-muted-foreground">
+                            No projects yet — create one in the Projects view.
+                          </p>
+                        ) : (
+                          <ScrollArea className="h-44 rounded-lg border p-1">
+                            <div className="flex flex-col">
+                              {projects.map((project) => {
+                                const checked = (agent.allowedProjects ?? []).includes(project.id);
+                                return (
+                                  <button
+                                    key={project.id}
+                                    type="button"
+                                    onClick={() =>
+                                      toggleListValue(agent.allowedProjects ?? [], project.id, (allowedProjects) =>
+                                        update({ allowedProjects }),
+                                      )
+                                    }
+                                    className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-accent"
+                                  >
+                                    <Checkbox
+                                      checked={checked}
+                                      tabIndex={-1}
+                                      className="pointer-events-none"
+                                    />
+                                    <span className="min-w-0 flex-1 truncate text-xs">
+                                      {project.name}
+                                    </span>
+                                    <span className="max-w-44 shrink-0 truncate font-mono text-[10px] text-muted-foreground">
+                                      {project.directory?.replace(/^\/Users\/[^/]+/, "~") ?? "no folder linked"}
+                                    </span>
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          </ScrollArea>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </SectionCard>
               </>
@@ -884,14 +988,45 @@ export function AgentConsole({
         </ScrollArea>
       </div>
 
-      {/* ─── Start button / composer — pinned to the bottom ─── */}
-      <div className="relative z-10 shrink-0 bg-gradient-to-t from-background via-background/60 to-transparent pt-10">
-        <div className="mx-auto w-full max-w-6xl px-4 pb-4">
+      {/* ─── Start button / composer — pinned over the scrolling content,
+           fading it out under the gradient (pointer-events pass through the
+           fade zone so content beneath stays clickable) ─── */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 bg-gradient-to-t from-background via-background/60 to-transparent pt-10">
+        <div className="pointer-events-auto mx-auto w-full max-w-6xl px-4 pb-4">
           {composing ? (
             <InputGroup
               key="composer"
               className="animate-in fade-in slide-in-from-bottom-3 bg-card duration-500"
             >
+              {files.length > 0 && (
+                <InputGroupAddon align="block-start">
+                  <AttachmentGroup className="w-full">
+                    {files.map((file) => (
+                      <Attachment key={file.id} size="xs">
+                        <AttachmentMedia variant={file.previewUrl ? "image" : "icon"}>
+                          {file.previewUrl ? (
+                            <img src={file.previewUrl} alt={file.name} />
+                          ) : (
+                            <FileText />
+                          )}
+                        </AttachmentMedia>
+                        <AttachmentContent>
+                          <AttachmentTitle>{file.name}</AttachmentTitle>
+                          <AttachmentDescription>{formatBytes(file.size)}</AttachmentDescription>
+                        </AttachmentContent>
+                        <AttachmentActions>
+                          <AttachmentAction
+                            aria-label={`Remove ${file.name}`}
+                            onClick={() => onRemoveFile?.(file.id)}
+                          >
+                            <X />
+                          </AttachmentAction>
+                        </AttachmentActions>
+                      </Attachment>
+                    ))}
+                  </AttachmentGroup>
+                </InputGroupAddon>
+              )}
               <InputGroupTextarea
                 autoFocus
                 value={inputText}
@@ -925,7 +1060,7 @@ export function AgentConsole({
                   size="icon-xs"
                   className="rounded-lg"
                   onClick={send}
-                  disabled={!inputText.trim()}
+                  disabled={!inputText.trim() && files.length === 0}
                   aria-label="Send message"
                 >
                   <ArrowUp />
@@ -942,6 +1077,50 @@ export function AgentConsole({
           )}
         </div>
       </div>
+
+      <Dialog open={allChatsConfirm} onOpenChange={setAllChatsConfirm}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Read every chat and task?</DialogTitle>
+            <DialogDescription>
+              {agent.name} will be able to search and read every chat in the app —
+              your Chat-tab conversations and other agents' tasks included. For
+              cheap retrieval, every chat is embedded into the knowledge index,
+              which uses more tokens. Pick "Selected" instead to grant specific
+              chats one by one.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setAllChatsConfirm(false)}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={allowAllChats}>
+              Allow all
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={allProjectsConfirm} onOpenChange={setAllProjectsConfirm}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>Work in every project?</DialogTitle>
+            <DialogDescription>
+              {agent.name} will be able to read and write files in every project's
+              folder — including projects created later. Pick "Selected" instead to
+              grant specific projects one by one.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setAllProjectsConfirm(false)}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={() => { setAllProjectsConfirm(false); update({ allProjects: true }); }}>
+              Allow all
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <ScheduleDialog
         open={scheduleDialogOpen}

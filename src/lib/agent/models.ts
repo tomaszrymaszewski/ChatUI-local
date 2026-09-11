@@ -82,10 +82,14 @@ export async function createChatModel(
       fetch: corsSafeFetch,
     },
     maxTokens,
-    // Reasoning-capable models only; providers without support reject the
-    // unknown field's semantics but tolerate the parameter or ignore it.
+    // ChatOpenAI's own reasoningEffort field is dead weight here: LangChain
+    // only serializes it for OpenAI reasoning models (o-series, gpt-5*) and
+    // reads the per-call option, never the constructor field. modelKwargs is
+    // spread verbatim into the chat-completions body, so every OpenAI-
+    // compatible provider actually sees reasoning_effort (OpenRouter and z.ai
+    // both accept it flat). Reasoning-capable models only; others ignore it.
     ...(effort && effort !== "default"
-      ? { reasoningEffort: effort as "low" | "medium" | "high" | "max" }
+      ? { modelKwargs: { reasoning_effort: effort as "low" | "medium" | "high" | "max" } }
       : {}),
     maxRetries: 1,
     timeout: 300_000,

@@ -486,6 +486,16 @@ class AgentController implements AgentControllerApi {
     let session: DeepAgentSession | null = null;
     try {
       const mode = opts.mode ?? "chat";
+      // Mode-aware effort: research/council pipelines deliberate deeper by
+      // default. A user-selected effort always wins; "default" (or unset)
+      // picks "high" for the deep pipelines and stays untouched for plain
+      // chat/task runs (GLM maps "high" to its "max" tier in models.ts).
+      const reasoningEffort =
+        opts.reasoningEffort && opts.reasoningEffort !== "default"
+          ? opts.reasoningEffort
+          : mode === "research" || mode === "council"
+            ? "high"
+            : opts.reasoningEffort;
 
       if (mode === "research") {
         const pipeline = await runDeepResearch(
@@ -496,6 +506,7 @@ class AgentController implements AgentControllerApi {
             instructions: opts.instructions,
             webFetchEnabled: opts.webFetchEnabled,
             projectDir: opts.projectDir,
+            reasoningEffort,
           },
           this.emit,
           controller.signal,
@@ -513,6 +524,7 @@ class AgentController implements AgentControllerApi {
             projectDir: opts.projectDir,
             availableModels: opts.availableModels ?? [],
             providers: opts.providers ?? [],
+            reasoningEffort,
           },
           this.emit,
           controller.signal,
@@ -532,7 +544,7 @@ class AgentController implements AgentControllerApi {
         session = await DeepAgentSession.create({
           provider: opts.provider,
           modelName: opts.modelName,
-          reasoningEffort: opts.reasoningEffort,
+          reasoningEffort,
           instructions,
           mode: mode === "task" ? "task" : "chat",
           webFetchEnabled: opts.webFetchEnabled,

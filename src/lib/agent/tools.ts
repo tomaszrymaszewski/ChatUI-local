@@ -25,8 +25,21 @@ import {
   normalizePath,
   type AgentSandbox,
 } from "@/lib/agent/sandbox";
-import type { AgentConfigPatch } from "@/types";
+import type { AgentConfigPatch, AgentSchedule, ScheduleCadence } from "@/types";
 import { getRunContext, getRetrievedDocIds, type RunContext } from "@/lib/agent/run-context";
+import {
+  computeNextRun,
+  deleteSchedule,
+  describeCadence,
+  loadSchedules,
+  saveSchedule,
+  updateSchedule,
+} from "@/lib/schedules";
+import {
+  deleteWorkflow,
+  loadWorkflows,
+  saveWorkflow,
+} from "@/lib/workflows";
 import { webSearch } from "@/lib/agent/web-search";
 import {
   CURATED_SKILLS,
@@ -62,7 +75,6 @@ const agentPatchSchema = z.object({
   terminal: z.boolean().optional().describe("Whether the agent may run shell commands / delegate coding tasks."),
   web: z.boolean().optional().describe("Whether the agent may search/fetch the web."),
   files: z.boolean().optional().describe("Whether the agent may read/write local files (within its allowed folders)."),
-  read_chats: z.boolean().optional().describe("Whether the agent may search the user's past chats."),
 });
 
 type AgentPatchInput = z.infer<typeof agentPatchSchema>;
@@ -79,7 +91,6 @@ function toAgentPatch(input: AgentPatchInput): AgentConfigPatch {
   if (input.terminal !== undefined) patch.terminal = input.terminal;
   if (input.web !== undefined) patch.web = input.web;
   if (input.files !== undefined) patch.files = input.files;
-  if (input.read_chats !== undefined) patch.readChats = input.read_chats;
   return patch;
 }
 
@@ -95,7 +106,6 @@ export function summarizeAgentPatch(patch: AgentConfigPatch): string {
   if (patch.terminal !== undefined) lines.push(`terminal: ${patch.terminal ? "on" : "off"}`);
   if (patch.web !== undefined) lines.push(`web: ${patch.web ? "on" : "off"}`);
   if (patch.files !== undefined) lines.push(`files: ${patch.files ? "on" : "off"}`);
-  if (patch.readChats !== undefined) lines.push(`read chats: ${patch.readChats ? "on" : "off"}`);
   return lines.join("; ");
 }
 
@@ -106,11 +116,10 @@ export function applyAgentConfigPatch(
 ): { name: string } | null {
   const current = loadAgentDefinitions().find((a) => a.id === agentId);
   if (!current) return null;
-  const { terminal, web, files, readChats, model, ...rest } = patch;
+  const { terminal, web, files, model, ...rest } = patch;
   const updated = updateAgentDefinition(agentId, {
     ...rest,
     ...(model !== undefined ? { model: model ?? undefined } : {}),
-    ...(readChats !== undefined ? { readChats } : {}),
     capabilities: {
       ...current.capabilities,
       ...(terminal !== undefined ? { terminal } : {}),
@@ -119,6 +128,72 @@ export function applyAgentConfigPatch(
     },
   });
   return updated ? { name: updated.name } : null;
+}
+
+/** The cadence as the tool schema accepts it (snake_case, optional fields). */
+export type CadenceToolInput = {
+  kind: "daily" | "weekly" | "interval" | "once";
+  time_hhmm?: string;
+  weekdays?: number[];
+  interval_minutes?: number;
+  run_at?: string;
+};
+
+const CADENCE_SHAPES: Record<CadenceToolInput["kind"], string> = {
+  daily: `time_hhmm "HH:MM" (local)`,
+  weekly: `time_hhmm "HH:MM" plus weekdays 0-6 (Sunday=0)`,
+  interval: "interval_minutes > 0",
+  once: "run_at — a future ISO timestamp",
+};
+
+/** Map the tool's snake_case cadence into the stored ScheduleCadence. */
+export function cadenceFromToolInput(input: CadenceToolInput): ScheduleCadence {
+  const cadence: ScheduleCadence = { kind: input.kind };
+  if (input.time_hhmm !== undefined) cadence.timeHHMM = input.time_hhmm;
+  if (input.weekdays !== undefined) cadence.weekdays = input.weekdays;
+  if (input.interval_minutes !== undefined) cadence.intervalMinutes = input.interval_minutes;
+  if (input.run_at !== undefined) cadence.runAt = input.run_at;
+  return cadence;
+}
+
+/**
+ * Validate the tool input and create the stored schedule. Sandboxed agents
+ * always own their schedules (the run then uses their own sandbox and
+ * capabilities); plain runs schedule the standalone task agent.
+ * Returns { error } instead of throwing so the model can self-correct.
+ */
+export function scheduleFromToolInput(
+  args: { name: string; prompt?: string; workflow_id?: string; cadence: CadenceToolInput },
+  agentId: string | undefined,
+  now: Date,
+): { schedule?: AgentSchedule; error?: string } {
+  if (args.prompt && args.workflow_id) {
+    return { error: "Pass either prompt or workflow_id, not both." };
+  }
+  if (!args.prompt?.trim() && !args.workflow_id) {
+    return { error: "A schedule needs a prompt (what the agent should do each run) or a workflow_id." };
+  }
+  if (args.workflow_id && !loadWorkflows().some((w) => w.id === args.workflow_id)) {
+    return { error: `No workflow with id ${args.workflow_id} — create it with create_workflow first.` };
+  }
+  const cadence = cadenceFromToolInput(args.cadence);
+  const nextRun = computeNextRun(cadence, now);
+  if (!nextRun) {
+    return {
+      error:
+        `Cadence does not match its kind (needs ${CADENCE_SHAPES[args.cadence.kind]}) or is in the past — ` +
+        "fix it and retry.",
+    };
+  }
+  const schedule = saveSchedule({
+    name: args.name,
+    ...(agentId ? { agentId } : {}),
+    ...(args.workflow_id ? { workflowId: args.workflow_id } : { prompt: args.prompt }),
+    cadence,
+    enabled: true,
+    nextRun: nextRun.toISOString(),
+  });
+  return { schedule };
 }
 
 async function runLegacyTool(name: string, args: Record<string, unknown>): Promise<string> {
@@ -582,6 +657,234 @@ export function buildAgentTools(
         }),
       },
     ),
+    // ── Automations: schedules + workflows (Agent Console manages them) ──
+    tool(
+      async ({ name, prompt, workflow_id, cadence }: {
+        name: string;
+        prompt?: string;
+        workflow_id?: string;
+        cadence: CadenceToolInput;
+      }) => {
+        // Sandboxed agents only ever schedule themselves — the run then uses
+        // their own sandbox and capabilities. Plain runs use the standalone
+        // task agent.
+        const result = scheduleFromToolInput({ name, prompt, workflow_id, cadence }, sandbox?.agentId, new Date());
+        if (result.error || !result.schedule) {
+          return `Error: ${result.error ?? "could not create the schedule."}`;
+        }
+        const s = result.schedule;
+        return (
+          `Schedule "${s.name}" created — ${describeCadence(s.cadence)}, next run ` +
+          `${s.nextRun ? new Date(s.nextRun).toLocaleString() : "never"}. Each run ` +
+          `${s.workflowId ? `executes workflow ${s.workflowId}` : `sends the prompt: "${(s.prompt ?? "").slice(0, 100)}"`}` +
+          `${s.agentId ? ", run by you (your sandbox and capabilities apply)" : ", run by the standalone task agent"}. ` +
+          `Runs happen only while the app is open; transcripts land in the Agents tab. ` +
+          `Tell the user briefly what was scheduled and when it fires first.`
+        );
+      },
+      {
+        name: "schedule_task",
+        description:
+          "Create an automation: a prompt (or a workflow) that runs on a schedule while the app is " +
+          "open. Use whenever the user asks for something recurring or in the future ('every weekday " +
+          "at 9am give me …', 'weekly digest', 'in 2 hours remind me to …', 'every morning …'). " +
+          "The prompt should be a complete, self-contained instruction for that run. Confirm the " +
+          "cadence with the user before creating — this runs repeatedly without supervision.",
+        schema: z.object({
+          name: z.string().describe("Short name, e.g. 'Morning news digest'."),
+          prompt: z.string().optional().describe("The instruction for each run — self-contained, since the run starts fresh. Required unless workflow_id is set."),
+          workflow_id: z.string().optional().describe("A workflow id (from create_workflow) to run instead of a plain prompt."),
+          cadence: z.object({
+            kind: z.enum(["daily", "weekly", "interval", "once"]),
+            time_hhmm: z.string().optional().describe("daily/weekly: local time 'HH:MM', e.g. '09:00'."),
+            weekdays: z.array(z.number().int().min(0).max(6)).optional().describe("weekly: weekdays 0-6, Sunday=0, e.g. [1, 3] for Mon+Wed."),
+            interval_minutes: z.number().int().positive().optional().describe("interval: minutes between runs."),
+            run_at: z.string().optional().describe("once: future ISO timestamp, e.g. '2026-01-20T15:00:00'."),
+          }),
+        }),
+      },
+    ),
+    tool(
+      async () => {
+        const schedules = sandbox?.agentId
+          ? loadSchedules().filter((s) => s.agentId === sandbox.agentId)
+          : loadSchedules();
+        const workflows = loadWorkflows().filter((w) =>
+          w.steps.every((s) => !s.agentId || s.agentId === sandbox?.agentId),
+        );
+        if (schedules.length === 0 && workflows.length === 0) {
+          return "No schedules or workflows saved yet. Create one with schedule_task / create_workflow when the user asks for recurring or future work.";
+        }
+        const lines = schedules.map((s) => {
+          const action = s.workflowId
+            ? `workflow ${s.workflowId}`
+            : `prompt "${(s.prompt ?? "").slice(0, 100)}"`;
+          return `- "${s.name}" (${s.id}) — ${s.enabled ? "enabled" : "paused"}, ${describeCadence(s.cadence)}, next: ${s.nextRun ? new Date(s.nextRun).toLocaleString() : "none"} — runs ${action}`;
+        });
+        if (workflows.length > 0) {
+          lines.push("Workflows (schedule one with schedule_task + workflow_id):");
+          for (const w of workflows) {
+            lines.push(`- "${w.name}" (${w.id}) — ${w.steps.length} step(s): ${w.steps.map((s) => `"${s.prompt.slice(0, 60)}"`).join(" → ")}`);
+          }
+        }
+        return lines.join("\n");
+      },
+      {
+        name: "list_schedules",
+        description:
+          "List the user's automations: scheduled prompts/workflows (with ids, cadences, and next run) " +
+          "and saved workflows. Use before updating or deleting (you need the id), or when the user " +
+          "asks what automations exist.",
+        schema: z.object({}),
+      },
+    ),
+    tool(
+      async ({ schedule_id, name, prompt, cadence, enabled }: {
+        schedule_id: string;
+        name?: string;
+        prompt?: string;
+        cadence?: CadenceToolInput;
+        enabled?: boolean;
+      }) => {
+        const current = loadSchedules().find((s) => s.id === schedule_id);
+        if (!current) {
+          return `Error: no schedule with id ${schedule_id} — call list_schedules to see the current ones.`;
+        }
+        if (sandbox?.agentId && current.agentId !== sandbox.agentId) {
+          return "Error: you can only change schedules that run you.";
+        }
+        const patch: Partial<Omit<AgentSchedule, "id">> = {};
+        if (name !== undefined) patch.name = name;
+        if (prompt !== undefined) patch.prompt = prompt;
+        if (enabled !== undefined) patch.enabled = enabled;
+        if (cadence !== undefined) {
+          const c = cadenceFromToolInput(cadence);
+          const nextRun = computeNextRun(c, new Date());
+          if (!nextRun) {
+            return `Error: cadence does not match its kind (needs ${CADENCE_SHAPES[cadence.kind]}) or is in the past — nothing changed.`;
+          }
+          patch.cadence = c;
+          patch.nextRun = nextRun.toISOString();
+        }
+        if (Object.keys(patch).length === 0) {
+          return "Nothing to change — pass at least one of name, prompt, cadence, enabled.";
+        }
+        const updated = updateSchedule(schedule_id, patch);
+        return (
+          `Schedule "${updated?.name}" updated — ${updated?.enabled ? "enabled" : "paused"}, ` +
+          `${describeCadence(updated!.cadence)}, next run ${updated?.nextRun ? new Date(updated.nextRun).toLocaleString() : "none"}.`
+        );
+      },
+      {
+        name: "update_schedule",
+        description:
+          "Update an existing schedule: rename it, change its prompt or cadence, or pause/resume it " +
+          "(enabled=false pauses without deleting). Get the id from list_schedules first.",
+        schema: z.object({
+          schedule_id: z.string().describe("Id of the schedule to update (from list_schedules)."),
+          name: z.string().optional().describe("New name."),
+          prompt: z.string().optional().describe("New prompt for each run (plain schedules only)."),
+          cadence: z
+            .object({
+              kind: z.enum(["daily", "weekly", "interval", "once"]),
+              time_hhmm: z.string().optional(),
+              weekdays: z.array(z.number().int().min(0).max(6)).optional(),
+              interval_minutes: z.number().int().positive().optional(),
+              run_at: z.string().optional(),
+            })
+            .optional()
+            .describe("Full replacement cadence (same shape as schedule_task)."),
+          enabled: z.boolean().optional().describe("false pauses the schedule; true resumes it."),
+        }),
+      },
+    ),
+    tool(
+      async ({ schedule_id }: { schedule_id: string }) => {
+        const current = loadSchedules().find((s) => s.id === schedule_id);
+        if (!current) {
+          return `Error: no schedule with id ${schedule_id} — call list_schedules to see the current ones.`;
+        }
+        if (sandbox?.agentId && current.agentId !== sandbox.agentId) {
+          return "Error: you can only delete schedules that run you.";
+        }
+        deleteSchedule(schedule_id);
+        return `Schedule "${current.name}" deleted. Tell the user it is gone (mention they can recreate it anytime).`;
+      },
+      {
+        name: "delete_schedule",
+        description:
+          "Delete a schedule permanently (e.g. 'cancel my morning digest'). Get the id from " +
+          "list_schedules first. For a temporary pause prefer update_schedule with enabled=false.",
+        schema: z.object({
+          schedule_id: z.string().describe("Id of the schedule to delete (from list_schedules)."),
+        }),
+      },
+    ),
+    tool(
+      async ({ name, steps }: { name: string; steps: Array<{ prompt: string }> }) => {
+        if (steps.length === 0) {
+          return "Error: a workflow needs at least one step.";
+        }
+        const workflow = saveWorkflow({
+          id: "",
+          name,
+          // Sandboxed agents keep every step inside their own sandbox; plain
+          // runs use the standalone task agent.
+          steps: steps.map((s) => ({ ...(sandbox?.agentId ? { agentId: sandbox.agentId } : {}), prompt: s.prompt })),
+        });
+        return (
+          `Workflow "${workflow.name}" saved (${workflow.id}) with ${steps.length} step(s). ` +
+          `To run it on a schedule, call schedule_task with workflow_id "${workflow.id}". ` +
+          `Each step's prompt may reference the previous step's output as {{previous}}.`
+        );
+      },
+      {
+        name: "create_workflow",
+        description:
+          "Save a multi-step workflow: ordered prompts run in sequence, each step may reference the " +
+          "previous step's output via {{previous}}. Use for recurring multi-stage work the user wants " +
+          "automated (e.g. 'every morning: check X, then summarize Y'). Returns a workflow id to pass " +
+          "to schedule_task. Confirm the plan with the user before creating.",
+        schema: z.object({
+          name: z.string().describe("Short name, e.g. 'Daily repo digest'."),
+          steps: z
+            .array(z.object({ prompt: z.string().describe("Instruction for this step; may use {{previous}}.") }))
+            .min(1)
+            .max(8)
+            .describe("Ordered steps, each a self-contained instruction."),
+        }),
+      },
+    ),
+    tool(
+      async ({ workflow_id }: { workflow_id: string }) => {
+        const workflow = loadWorkflows().find((w) => w.id === workflow_id);
+        if (!workflow) {
+          return `Error: no workflow with id ${workflow_id} — call list_schedules to see workflows and schedule ids.`;
+        }
+        if (sandbox?.agentId && !workflow.steps.every((s) => !s.agentId || s.agentId === sandbox.agentId)) {
+          return "Error: you can only delete workflows whose steps run you.";
+        }
+        const referencing = loadSchedules().filter((s) => s.workflowId === workflow_id);
+        if (referencing.length > 0) {
+          return (
+            `Error: "${workflow.name}" is used by ${referencing.length} schedule(s): ` +
+            `${referencing.map((s) => `"${s.name}" (${s.id})`).join(", ")}. Delete those schedules first ` +
+            "(delete_schedule), then delete the workflow."
+          );
+        }
+        deleteWorkflow(workflow_id);
+        return `Workflow "${workflow.name}" deleted.`;
+      },
+      {
+        name: "delete_workflow",
+        description:
+          "Delete a saved workflow permanently. Fails while a schedule still references it — delete " +
+          "those schedules first. Ids come from list_schedules.",
+        schema: z.object({
+          workflow_id: z.string().describe("Id of the workflow to delete (from list_schedules)."),
+        }),
+      },
+    ),
   ];
 
   if (profile === "task") {
@@ -733,7 +1036,7 @@ export function buildAgentTools(
             name: "update_agent",
             description:
               "Update your own saved-agent settings: name, purpose, system prompt, model, skills, " +
-              "connectors, and permissions (terminal / web / files / read chats). Call this whenever " +
+              "connectors, and permissions (terminal / web / files). Call this whenever " +
               "the user asks you to change your setup by chatting (e.g. 'from now on, be more concise', " +
               "'use a different model'). Pass ONLY the fields that change. You cannot change your " +
               "folder, project, or knowledge-file access — those are user-only, so ask the user to " +
@@ -744,7 +1047,9 @@ export function buildAgentTools(
       );
     }
 
-    const hasChatAccess = !!sandbox && (!!sandbox.readChats || !!sandbox.externalChats);
+    // Saved agents can always read their own past sessions; externalChats
+    // adds chats from the Chat tab and other agents' tasks.
+    const hasChatAccess = !!sandbox;
     if (hasChatAccess) {
       tools.push(
         tool(
@@ -1033,7 +1338,6 @@ export function buildAgentTools(
           terminal?: boolean;
           web?: boolean;
           model?: string | null;
-          read_chats?: boolean;
         }) => {
           const def = saveAgentDefinition({
             name: input.name.trim(),
@@ -1047,7 +1351,6 @@ export function buildAgentTools(
               computerUse: false,
             },
             model: input.model ?? undefined,
-            readChats: input.read_chats ?? false,
           });
           // The agent's private on-disk workspace (~/Documents/chatUI/agents/<id>).
           void ensureAgentWorkspace(def.id).catch(() => {});
@@ -1080,7 +1383,6 @@ export function buildAgentTools(
             terminal: z.boolean().optional().describe("Whether it may run shell commands / delegate coding (default false)."),
             web: z.boolean().optional().describe("Whether it may search/fetch the web (default true)."),
             model: z.string().nullable().optional().describe("Model name this agent should always run on, or null for the app's default model."),
-            read_chats: z.boolean().optional().describe("Whether it may search the user's past chats (default false)."),
           }),
         },
       ),

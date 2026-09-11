@@ -28,6 +28,7 @@ import {
   toolCompressionMiddleware,
 } from "@/lib/agent/compression";
 import { emptyResponseGuardMiddleware } from "@/lib/agent/empty-response-guard";
+import { subagentErrorCaptureMiddleware } from "@/lib/agent/subagent-error-capture";
 
 /**
  * deepagents ships its own filesystem tools (ls, read_file, write_file, …)
@@ -134,6 +135,12 @@ Other tools:
   invisible to the user until you share them: call share_files with the absolute paths and a
   download card is attached to your message. Never say a file is "ready to download" without
   calling share_files first.
+- Automations: for recurring or future work ("every weekday at 9am …", "weekly on Monday …",
+  "in 2 hours remind me to …", "every morning …"), set it up with schedule_task (a self-contained
+  prompt or a multi-step workflow via create_workflow) instead of only answering in the moment.
+  Confirm the cadence with the user before creating. Runs happen only while the app is open;
+  the user manages everything in the Agent Console's Automations section (list_schedules,
+  update_schedule to pause/adjust, delete_schedule to remove).
 `.trim();
 
 const SUGGESTIONS_PROMPT = `
@@ -255,13 +262,11 @@ function buildAgentSandboxPrompt(sandbox: AgentSandbox): string {
         "outside your workspace, ask the user to add the folder in your agent settings (Access).",
     );
   }
-  const chatAccess: string[] = [];
-  if (sandbox.readChats) chatAccess.push("your own past sessions");
+  // Own sessions are always readable; externalChats widens the reach.
+  const chatAccess: string[] = ["your own past sessions"];
   if (sandbox.externalChats === "all") chatAccess.push("every chat and task in the app");
   else if (sandbox.externalChats === "selected") chatAccess.push("the specific chats and tasks the user selected");
-  if (chatAccess.length > 0) {
-    lines.push(`- search_chats: you may search and read ${chatAccess.join(" and ")}.`);
-  }
+  lines.push(`- search_chats: you may search and read ${chatAccess.join(" and ")}.`);
   lines.push(
     "- File access inside your workspace and granted folders is trusted (no approval cards); " +
       "shell commands still show the user an approve/deny card.",
@@ -477,6 +482,10 @@ export class DeepAgentSession {
         todoListMiddleware(),
         toolCompressionMiddleware(opts.modelName),
         emptyResponseGuardMiddleware(),
+        // Subagent (task tool) failures become tool results instead of
+        // aborting the run — parallel subagent failures used to surface as
+        // "Multiple errors occurred during superstep N".
+        subagentErrorCaptureMiddleware(),
       ],
       skills: ["/skills/"],
       checkpointer: new MemorySaver(),

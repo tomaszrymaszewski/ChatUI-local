@@ -361,12 +361,11 @@ export function AgentSettingsForm({
           checked={agent.capabilities.terminal}
           onCheckedChange={(terminal) => update({ capabilities: { terminal } })}
         />
-        <PermissionRow
-          label="Read past chats"
-          description="Search and read your chat history"
-          checked={agent.readChats ?? false}
-          onCheckedChange={(readChats) => update({ readChats })}
-        />
+        <p className="text-xs text-muted-foreground">
+          The agent can always search and read its own past sessions. Chats from
+          the Chat tab and other agents' tasks are granted in the agent
+          console's Access tab.
+        </p>
         <p className="text-xs text-muted-foreground">
           Folders are managed on the agent console's Folders card — granted
           folders are trusted for file access without approval cards.

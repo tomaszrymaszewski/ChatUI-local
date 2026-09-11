@@ -155,6 +155,7 @@ import type { AgentMode, AgentRunResult } from "@/lib/agent/types";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { ensureAgentWorkspace, removeAgentWorkspace } from "@/lib/agent/sandbox";
 import { applyAgentConfigPatch } from "@/lib/agent/tools";
+import { flattenAgentError } from "@/lib/agent/subagent-error-capture";
 import {
   buildLearnSystemPrompt,
   loadLearnPreferences,
@@ -255,7 +256,7 @@ const CONTAINER_PADDING_PX = 16;
 
 export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
-  const { sessions, createSession, deleteSession, updateSession, moveToAgentTab } =
+  const { sessions, allSessions, createSession, deleteSession, updateSession, moveToAgentTab } =
     useSessions(activeTab);
   const { projects, createProject, updateProject, deleteProject, addProjectFile, deleteProjectFile, addProjectImage, deleteProjectImage, refetch: refetchProjects } =
     useProjects();
@@ -554,7 +555,6 @@ export function ChatView() {
           ...(agentDef.allowedFolders ?? []),
           ...projectDirs,
         ],
-        readChats: agentDef.readChats ?? false,
         externalChats: agentDef.externalChats,
         allowedExternalSessions: agentDef.allowedExternalSessions,
       };
@@ -1198,7 +1198,7 @@ export function ChatView() {
       }
     } catch (err) {
       toast.error(
-        err instanceof Error ? err.message : "Failed to send message",
+        flattenAgentError(err) || "Failed to send message",
       );
     }
   };
@@ -1345,7 +1345,7 @@ export function ChatView() {
       }
     } catch (err) {
       toast.error(
-        err instanceof Error ? err.message : "Failed to regenerate response",
+        flattenAgentError(err) || "Failed to regenerate response",
       );
     }
   };
@@ -1454,7 +1454,7 @@ export function ChatView() {
       updateSession(activeSessionId, {});
     } catch (err) {
       toast.error(
-        err instanceof Error ? err.message : "Failed to regenerate response",
+        flattenAgentError(err) || "Failed to regenerate response",
       );
     }
   };
@@ -3323,7 +3323,7 @@ export function ChatView() {
               agent={activeAgentConsole}
               agents={agents}
               sessions={activeAgentSessions}
-              allSessions={sessions}
+              allSessions={allSessions}
               projects={projects}
              models={allModels}
              sendOnEnter={settings.sendOnEnter}
@@ -3335,9 +3335,11 @@ export function ChatView() {
                if (composing) enterAgentCompose();
                else setAgentConsoleComposing(false);
              }}
-             onUpdateAgent={updateAgent}
-             onSend={(text) => { void handleSend(text); }}
-           />
+              onUpdateAgent={updateAgent}
+              onSend={(text) => { void handleSend(text); }}
+              files={files}
+              onRemoveFile={removeFile}
+            />
          ) : isAgentTab && agentDashboardOpen ? (
            <AgentDashboard
              agents={agents}
@@ -3347,13 +3349,15 @@ export function ChatView() {
              modelSelect={modelSelect()}
              onOpenAgentConsole={handleOpenAgentConsole}
              onSelectSession={selectSession}
-             onSend={(mode: DashboardComposeMode, agentId, text) => {
-               void handleSend(text, {
-                 agentId: mode === "session" ? agentId : undefined,
-                 setup: mode === "agent",
-               });
-             }}
-           />
+              onSend={(mode: DashboardComposeMode, agentId, text) => {
+                void handleSend(text, {
+                  agentId: mode === "session" ? agentId : undefined,
+                  setup: mode === "agent",
+                });
+              }}
+              files={files}
+              onRemoveFile={removeFile}
+            />
          ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-4 pb-8">
             <h1 className="select-none cursor-default relative z-10 mb-12 text-center text-4xl font-semibold tracking-tight welcome-fade-in">
@@ -3852,7 +3856,7 @@ export function ChatView() {
       }
     } catch (err) {
       toast.error(
-        err instanceof Error ? err.message : "Failed to send message",
+        flattenAgentError(err) || "Failed to send message",
       );
     }
   }

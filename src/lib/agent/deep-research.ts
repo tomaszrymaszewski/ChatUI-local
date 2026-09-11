@@ -20,7 +20,7 @@
 
 import { createAgent, tool, toolCallLimitMiddleware } from "langchain";
 import { z } from "zod";
-import type { Provider } from "@/types";
+import type { Provider, ReasoningEffort } from "@/types";
 import type { ContentPart } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
 import { resolveHistoryBudget, truncateMessagesToBudget } from "@/lib/agent/history";
@@ -39,6 +39,8 @@ export interface DeepResearchOptions {
   instructions?: string;
   webFetchEnabled: boolean;
   projectDir?: string | null;
+  /** Reasoning effort for the pipeline's model (resolved in use-deep-agent). */
+  reasoningEffort?: ReasoningEffort;
 }
 
 type InputResolution = { cancelled: true } | { values: Record<string, unknown> };
@@ -432,7 +434,7 @@ export async function runDeepResearch(
   signal: AbortSignal,
   requestInput?: (req: StructuredInputRequest) => Promise<InputResolution>,
 ): Promise<{ completed: boolean }> {
-  const model = await createChatModel(opts.provider, opts.modelName);
+  const model = await createChatModel(opts.provider, opts.modelName, opts.reasoningEffort);
   const historyBudget = await resolveHistoryBudget(opts.provider, opts.modelName);
   let lcMessages = toLcMessages(
     truncateMessagesToBudget(opts.messages, historyBudget),

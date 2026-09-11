@@ -30,7 +30,7 @@
 
 import { createAgent, tool, toolCallLimitMiddleware } from "langchain";
 import { z } from "zod";
-import type { Provider } from "@/types";
+import type { Provider, ReasoningEffort } from "@/types";
 import type { ContentPart } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
 import { resolveHistoryBudget, truncateMessagesToBudget } from "@/lib/agent/history";
@@ -48,6 +48,8 @@ export interface DiscussOptions {
   projectDir?: string | null;
   availableModels: Array<{ name: string; providerId: string; displayName?: string }>;
   providers: Provider[];
+  /** Reasoning effort for the council's models (resolved in use-deep-agent). */
+  reasoningEffort?: ReasoningEffort;
 }
 
 type InputResolution = { cancelled: true } | { values: Record<string, unknown> };
@@ -295,10 +297,11 @@ function resolveRoleModels(
 async function resolveModel(
   modelName: string,
   providers: Provider[],
+  reasoningEffort?: ReasoningEffort,
 ): Promise<{ provider: Provider; model: Awaited<ReturnType<typeof createChatModel>> } | null> {
   for (const p of providers) {
     if (p.models.some((m) => m.name === modelName)) {
-      const model = await createChatModel(p, modelName);
+      const model = await createChatModel(p, modelName, reasoningEffort);
       return { provider: p, model };
     }
   }
@@ -430,6 +433,7 @@ async function runRoleAgent(
   webFetchEnabled: boolean,
   emit: (event: AgentEvent) => void,
   signal: AbortSignal,
+  reasoningEffort?: ReasoningEffort,
 ): Promise<string> {
   const actId = `role-${role}`;
   const roleLabel = role.replace(/_/g, " ");
@@ -445,8 +449,8 @@ async function runRoleAgent(
   });
 
   try {
-    const resolved = await resolveModel(modelName, providers);
-    const model = resolved?.model ?? (await createChatModel(providers[0], modelName));
+    const resolved = await resolveModel(modelName, providers, reasoningEffort);
+    const model = resolved?.model ?? (await createChatModel(providers[0], modelName, reasoningEffort));
 
     const agent = createAgent({
       model,
@@ -506,7 +510,7 @@ export async function runDiscuss(
   requestInput?: (req: StructuredInputRequest) => Promise<InputResolution>,
   _clearPendingInput?: () => void,
 ): Promise<{ completed: boolean }> {
-  const chairmanModel = await createChatModel(opts.provider, opts.modelName);
+  const chairmanModel = await createChatModel(opts.provider, opts.modelName, opts.reasoningEffort);
   const historyBudget = await resolveHistoryBudget(opts.provider, opts.modelName);
   const lcMessages = toLcMessages(
     truncateMessagesToBudget(opts.messages, historyBudget),
@@ -715,7 +719,7 @@ Rules:
   const questionBrief = buildQuestionBrief(originalQuery, revisedQuery, setupAnswers);
   const positions = await Promise.all(
     ROLE_NAMES.map((role) =>
-      runRoleAgent(role, roleModels[role], opts.providers, questionBrief, opts.webFetchEnabled, emit, signal),
+      runRoleAgent(role, roleModels[role], opts.providers, questionBrief, opts.webFetchEnabled, emit, signal, opts.reasoningEffort),
     ),
   );
 
@@ -795,7 +799,7 @@ Rules:
         },
       });
       try {
-        const resolved = await resolveModel(roleModels[critic], opts.providers);
+        const resolved = await resolveModel(roleModels[critic], opts.providers, opts.reasoningEffort);
         const model = resolved?.model ?? chairmanModel;
         const agent = createAgent({
           model,
@@ -887,7 +891,7 @@ Rules:
           },
         });
         try {
-          const resolved = await resolveModel(roleModels[responder], opts.providers);
+          const resolved = await resolveModel(roleModels[responder], opts.providers, opts.reasoningEffort);
           const model = resolved?.model ?? chairmanModel;
           const agent = createAgent({
             model,

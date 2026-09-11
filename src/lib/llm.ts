@@ -503,6 +503,10 @@ export async function generateChatTitle(
 
   // Try max_completion_tokens first (newer OpenAI/reasoning models require it),
   // fall back to max_tokens for broad OpenAI-compatible compatibility.
+  // The budget must leave some room for reasoning (thinking models spend
+  // tokens before any content is emitted — a tight cap returns empty content,
+  // which silently keeps the instant title); if content stays empty, the
+  // thinking process itself is an acceptable fallback source below.
   const tryRequest = async (maxField: string): Promise<Response> => {
     return fetch(url, {
       method: "POST",
@@ -510,7 +514,7 @@ export async function generateChatTitle(
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ ...baseBody, [maxField]: 200 }),
+      body: JSON.stringify({ ...baseBody, [maxField]: 500 }),
     });
   };
 

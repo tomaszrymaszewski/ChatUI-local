@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
-import { ArrowUp, Check, Plus } from "lucide-react";
-import type { AgentDefinition, ChatSession } from "@/types";
+import { ArrowUp, Check, FileText, Plus, X } from "lucide-react";
+import type { AgentDefinition, ChatSession, MessageAttachment } from "@/types";
 import { AgentAvatar } from "@/components/agent-avatar";
 import {
   DropdownMenu,
@@ -14,6 +14,16 @@ import {
   InputGroupButton,
   InputGroupTextarea,
 } from "@/components/ui/input-group";
+import {
+  Attachment,
+  AttachmentAction,
+  AttachmentActions,
+  AttachmentContent,
+  AttachmentDescription,
+  AttachmentGroup,
+  AttachmentMedia,
+  AttachmentTitle,
+} from "@/components/ui/attachment";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
@@ -26,6 +36,17 @@ function formatWhen(date: Date) {
   const sameDay = date.toDateString() === now.toDateString();
   if (sameDay) return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+function formatBytes(bytes: number) {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    units.length - 1,
+  );
+  const value = bytes / 1024 ** i;
+  return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
 /**
@@ -43,6 +64,8 @@ export function AgentDashboard({
   onOpenAgentConsole,
   onSelectSession,
   onSend,
+  files = [],
+  onRemoveFile,
 }: {
   agents: AgentDefinition[];
   /** Agent-tab sessions, newest first. */
@@ -54,6 +77,9 @@ export function AgentDashboard({
   onOpenAgentConsole: (agentId: string) => void;
   onSelectSession: (id: string) => void;
   onSend: (mode: DashboardComposeMode, agentId: string | undefined, text: string) => void;
+  /** Files dropped/attached for the next send (owned by ChatView's composer state). */
+  files?: MessageAttachment[];
+  onRemoveFile?: (id: string) => void;
 }) {
   const [mode, setMode] = useState<DashboardComposeMode>("task");
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
@@ -83,7 +109,8 @@ export function AgentDashboard({
   const selectedAgent = agents.find((a) => a.id === effectiveAgentId) ?? null;
 
   const canSend =
-    inputText.trim().length > 0 && (mode !== "session" || !!selectedAgent);
+    (inputText.trim().length > 0 || files.length > 0) &&
+    (mode !== "session" || !!selectedAgent);
 
   const send = () => {
     const text = inputText.trim();
@@ -259,6 +286,35 @@ export function AgentDashboard({
       <div className="relative shrink-0">
         <div className="mx-auto w-full max-w-5xl px-4 pb-4">
           <InputGroup>
+            {files.length > 0 && (
+              <InputGroupAddon align="block-start">
+                <AttachmentGroup className="w-full">
+                  {files.map((file) => (
+                    <Attachment key={file.id} size="xs">
+                      <AttachmentMedia variant={file.previewUrl ? "image" : "icon"}>
+                        {file.previewUrl ? (
+                          <img src={file.previewUrl} alt={file.name} />
+                        ) : (
+                          <FileText />
+                        )}
+                      </AttachmentMedia>
+                      <AttachmentContent>
+                        <AttachmentTitle>{file.name}</AttachmentTitle>
+                        <AttachmentDescription>{formatBytes(file.size)}</AttachmentDescription>
+                      </AttachmentContent>
+                      <AttachmentActions>
+                        <AttachmentAction
+                          aria-label={`Remove ${file.name}`}
+                          onClick={() => onRemoveFile?.(file.id)}
+                        >
+                          <X />
+                        </AttachmentAction>
+                      </AttachmentActions>
+                    </Attachment>
+                  ))}
+                </AttachmentGroup>
+              </InputGroupAddon>
+            )}
             <InputGroupTextarea
               value={inputText}
               onChange={(e) => setInputText(e.currentTarget.value)}

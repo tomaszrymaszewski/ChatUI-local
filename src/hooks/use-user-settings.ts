@@ -55,6 +55,14 @@ function saveSettings(settings: UserSettings) {
   window.dispatchEvent(new Event(SETTINGS_EVENT));
 }
 
+/**
+ * Persist a full settings object outside React (components that only flip a
+ * setting programmatically, e.g. the agent access confirmations).
+ */
+export function saveUserSettings(settings: UserSettings): void {
+  saveSettings(settings);
+}
+
 export function useUserSettings() {
   const [settings, setSettings] = useState<UserSettings>(DEFAULT_SETTINGS);
   const [loading, setLoading] = useState(true);

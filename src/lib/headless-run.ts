@@ -4,6 +4,7 @@ import type { AgentMessage } from "@/lib/agent/runtime";
 import type { AgentRunResult } from "@/lib/agent/types";
 import { getAgentController } from "@/hooks/use-deep-agent";
 import { loadAgentDefinitions } from "@/lib/agents";
+import { flattenAgentError } from "@/lib/agent/subagent-error-capture";
 import { fetchProviders } from "@/lib/llm";
 import { loadUserSettings } from "@/hooks/use-user-settings";
 import { loadProjectDirectories } from "@/hooks/use-projects";
@@ -153,7 +154,6 @@ export async function runHeadlessTask(opts: {
                 agentId: agentDef.id,
                 workspace,
                 allowedDirectories,
-                readChats: agentDef.readChats ?? false,
                 externalChats: agentDef.externalChats,
                 allowedExternalSessions: agentDef.allowedExternalSessions,
               },
@@ -163,7 +163,7 @@ export async function runHeadlessTask(opts: {
     });
   } catch (err) {
     clearInterval(saveInterval);
-    const message = err instanceof Error ? err.message : String(err);
+    const message = flattenAgentError(err) || String(err);
     updateMessageHeadless(sessionId, assistantMsg.id, {
       content: `⚠️ Run failed: ${message}`,
     });
