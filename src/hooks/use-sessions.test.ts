@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getSessionChatMode } from "@/hooks/use-sessions";
+import { createAgentSessionHeadless, getSessionChatMode } from "@/hooks/use-sessions";
 
 // The vitest environment is node — stub localStorage like the browser would.
 const storage = new Map<string, string>();
@@ -51,5 +51,22 @@ describe("getSessionChatMode", () => {
   it("survives corrupted storage", () => {
     storage.set("chatui:sessions", "{not json");
     expect(getSessionChatMode("s1")).toBeUndefined();
+  });
+});
+
+describe("saveSessions quota guard", () => {
+  it("never throws when the store is full", () => {
+    // A QuotaExceededError during a send used to escape through the React
+    // state updater into the crash boundary ("Something went wrong").
+    vi.stubGlobal("localStorage", {
+      getItem: (k: string) => storage.get(k) ?? null,
+      setItem: () => {
+        throw new Error("The quota has been exceeded.");
+      },
+      removeItem: (k: string) => void storage.delete(k),
+    });
+    vi.stubGlobal("window", { dispatchEvent: vi.fn() });
+    expect(() => createAgentSessionHeadless("Full store chat")).not.toThrow();
+    expect(storage.has("chatui:sessions")).toBe(false);
   });
 });

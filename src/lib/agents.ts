@@ -1,4 +1,6 @@
 import type { AgentDefinition } from "@/types";
+import { invoke } from "@tauri-apps/api/core";
+import { chatUiBaseDir, remapLegacyChatUiPath } from "@/lib/agent/sandbox";
 
 // Saved agents (created via the agent builder) — localStorage-backed, same
 // pattern as sessions/settings. The use-agents hook mirrors this storage into
@@ -6,6 +8,7 @@ import type { AgentDefinition } from "@/types";
 
 const STORAGE_KEY = "chatui:agents";
 const AGENTS_EVENT = "chatui:agents-changed";
+const PATHS_REMAPPED_KEY = "chatui:agents:paths-remapped";
 
 export function loadAgentDefinitions(): AgentDefinition[] {
   try {
@@ -28,6 +31,7 @@ export function loadAgentDefinitions(): AgentDefinition[] {
       return a;
     });
     if (migrated) persistAgents(next);
+    void remapLegacySandboxFolders();
     return next;
   } catch {
     return [];
@@ -37,6 +41,37 @@ export function loadAgentDefinitions(): AgentDefinition[] {
 function persistAgents(agents: AgentDefinition[]) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(agents));
   window.dispatchEvent(new Event(AGENTS_EVENT));
+}
+
+/**
+ * One-time remap of stored sandbox allowlist folders after the app moved its
+ * data out of ~/Documents/chatUI into the OS app-data dir: granted folders
+ * pointing into the old base would silently fall outside every sandbox.
+ * Idempotent; guarded by a localStorage flag so it parses once.
+ */
+async function remapLegacySandboxFolders(): Promise<void> {
+  if (localStorage.getItem(PATHS_REMAPPED_KEY)) return;
+  try {
+    const base = await chatUiBaseDir();
+    if (!base) return;
+    const home = await invoke<string>("get_home_dir").catch(() => null);
+    const data = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "[]") as AgentDefinition[];
+    let changed = false;
+    const next = (Array.isArray(data) ? data : []).map((a) => {
+      const allowed = a.allowedFolders;
+      if (!allowed?.length) return a;
+      const remapped = allowed.map((f) => remapLegacyChatUiPath(f, home, base));
+      if (remapped.some((f, i) => f !== allowed[i])) {
+        changed = true;
+        return { ...a, allowedFolders: remapped };
+      }
+      return a;
+    });
+    localStorage.setItem(PATHS_REMAPPED_KEY, "1");
+    if (changed) persistAgents(next);
+  } catch {
+    // best effort — retried on the next load while the flag is unset
+  }
 }
 
 export function saveAgentDefinition(

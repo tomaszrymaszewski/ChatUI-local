@@ -264,8 +264,8 @@ function clearAutoInstallSkip(name: string): void {
 }
 
 /**
- * The app-owned skills home: ~/Documents/chatUI/skills (kept alongside the
- * rest of the app's data — sessions, agents, projects). The skills folder
+ * The app-owned skills home: <app data dir>/skills (kept alongside the rest
+ * of the app's data — sessions, agents, deliverables). The skills folder
  * used to live at ~/.config/opencode/skills (shared with the legacy opencode
  * integration); anything found there is copied over once, and the legacy
  * folder is left untouched.
@@ -310,12 +310,41 @@ function projectSkillsDir(projectDir: string): string {
   return `${projectDir}/.chatui/skills`;
 }
 
+// ─── Skill usage tracking (caps the advertised skills list) ────────────────
+
+const SKILL_USAGE_KEY = "chatui:skills:usage";
+
+/** Note that a skill was just installed/used — feeds the MRU cap. */
+export function touchSkillUsage(name: string): void {
+  try {
+    const raw = localStorage.getItem(SKILL_USAGE_KEY);
+    const usage = raw ? (JSON.parse(raw) as Record<string, number>) : {};
+    usage[name] = Date.now();
+    localStorage.setItem(SKILL_USAGE_KEY, JSON.stringify(usage));
+  } catch {
+    // ignore quota errors
+  }
+}
+
+function readSkillUsage(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(SKILL_USAGE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, number>) : {};
+  } catch {
+    return {};
+  }
+}
+
+export { readSkillUsage };
+
+/** Install a bundled skill's body to disk. */
 export async function installBundledSkill(name: string, scope: "global" | "project", projectDir?: string): Promise<void> {
   const content = getBundledSkillContent(name);
   if (!content) throw new Error(`Unknown bundled skill: ${name}`);
   const base = scope === "global" ? await globalSkillsDir() : projectSkillsDir(projectDir!);
   await invoke("write_text_file", { path: `${base}/${name}/SKILL.md`, content });
   clearAutoInstallSkip(name);
+  touchSkillUsage(name);
 }
 
 export async function installAnthropicSkill(name: string, scope: "global" | "project", projectDir?: string): Promise<void> {
@@ -352,7 +381,39 @@ export async function deleteSkill(name: string, scope: "global" | "project", pro
   markAutoInstallSkip(name);
 }
 
-// ─── Generic GitHub skill installer (for any curated source repo) ───────────
+// ─── Generic GitHub skill installer (registry / curated / custom sources) ──
+
+/**
+ * Install a registry skill by fetching its files from GitHub and writing them
+ * to the skills directory. Works for any repo using the `skills/<name>/`
+ * convention (anthropics/skills, vercel-labs/agent-skills, obra/superpowers,
+ * mattpocock/skills, supabase/agent-skills, …) plus whole-repo skills
+ * (dir === "") and non-main branches.
+ */
+export async function installRegistrySkill(
+  skill: { name: string; repo: string; dir?: string; branch?: string },
+  scope: "global" | "project",
+  projectDir?: string,
+): Promise<void> {
+  const base = scope === "global" ? await globalSkillsDir() : projectSkillsDir(projectDir!);
+  const branch = skill.branch ?? "main";
+  const treeUrl = `https://api.github.com/repos/${skill.repo}/git/trees/${branch}?recursive=1`;
+  const res = await fetch(treeUrl);
+  if (!res.ok) throw new Error(`Failed to fetch skill file list from ${skill.repo}`);
+  const data = (await res.json()) as GitTree;
+  const prefix = skill.dir ? `${skill.dir}/` : "";
+  const files = data.tree.filter((t) => t.path.startsWith(prefix) && t.type === "blob");
+  if (files.length === 0) throw new Error(`No files found under ${prefix || "repo root"} in ${skill.repo}`);
+  for (const file of files) {
+    const raw = await fetch(`https://raw.githubusercontent.com/${skill.repo}/${branch}/${file.path}`);
+    if (!raw.ok) continue;
+    const content = await raw.text();
+    const relPath = file.path.slice(prefix.length);
+    await invoke("write_text_file", { path: `${base}/${skill.name}/${relPath}`, content });
+  }
+  clearAutoInstallSkip(skill.name);
+  touchSkillUsage(skill.name);
+}
 
 /**
  * Install a curated skill by fetching its files from GitHub and writing them
@@ -365,22 +426,7 @@ export async function installCuratedSkill(
   scope: "global" | "project",
   projectDir?: string,
 ): Promise<void> {
-  const base = scope === "global" ? await globalSkillsDir() : projectSkillsDir(projectDir!);
-  const treeUrl = `https://api.github.com/repos/${skill.repo}/git/trees/main?recursive=1`;
-  const res = await fetch(treeUrl);
-  if (!res.ok) throw new Error(`Failed to fetch skill file list from ${skill.repo}`);
-  const data = (await res.json()) as GitTree;
-  const prefix = `${skill.dir}/`;
-  const files = data.tree.filter((t) => t.path.startsWith(prefix) && t.type === "blob");
-  if (files.length === 0) throw new Error(`No files found under ${prefix} in ${skill.repo}`);
-  for (const file of files) {
-    const raw = await fetch(`https://raw.githubusercontent.com/${skill.repo}/main/${file.path}`);
-    if (!raw.ok) continue;
-    const content = await raw.text();
-    const relPath = file.path.slice(prefix.length);
-    await invoke("write_text_file", { path: `${base}/${skill.name}/${relPath}`, content });
-  }
-  clearAutoInstallSkip(skill.name);
+  await installRegistrySkill(skill, scope, projectDir);
 }
 
 // ─── Curated skill content cache (full SKILL.md bodies, fetched once) ──────
@@ -410,27 +456,35 @@ export function getCuratedSkillContent(name: string): string | null {
 }
 
 /**
- * One-time background fetch of every curated skill's SKILL.md from GitHub so
+ * One-time background fetch of every catalog skill's SKILL.md from GitHub so
  * the full instructions are searchable (and retrievable via RAG) before any
- * install. Fresh cache entries are kept for ~30 days; failures are silent
- * and retried on the next launch.
+ * install. Covers the in-bundle curated list plus any extra registry entries
+ * passed in; bodies are cached for ~30 days, failures are silent and retried
+ * on the next launch.
  */
-export async function ensureCuratedSkillContent(): Promise<void> {
+export async function ensureCuratedSkillContent(
+  extra: Array<{ name: string; repo: string; dir: string; branch?: string }> = [],
+): Promise<void> {
   const cache = readCuratedContentCache();
-  const pending = CURATED_SKILLS.filter((s) => {
-    const cached = cache[s.name];
+  const byName = new Map<string, { repo: string; dir: string; branch?: string }>();
+  for (const s of extra) byName.set(s.name, s);
+  for (const s of CURATED_SKILLS) byName.set(s.name, s);
+  const pending = [...byName.entries()].filter(([name, src]) => {
+    void src;
+    const cached = cache[name];
     return !cached?.content || Date.now() - cached.fetchedAt > CURATED_CONTENT_TTL_MS;
   });
   if (pending.length === 0) return;
   let changed = false;
-  for (const skill of pending) {
+  for (const [name, src] of pending) {
     try {
-      const url = `https://raw.githubusercontent.com/${skill.repo}/main/${skill.dir}/SKILL.md`;
+      const branch = src.branch ?? "main";
+      const url = `https://raw.githubusercontent.com/${src.repo}/${branch}/${src.dir ? `${src.dir}/` : ""}SKILL.md`;
       const res = await fetch(url);
       if (!res.ok) continue;
       const content = await res.text();
       if (!content.trim()) continue;
-      cache[skill.name] = { content, fetchedAt: Date.now() };
+      cache[name] = { content, fetchedAt: Date.now() };
       changed = true;
     } catch {
       // offline / rate-limited — retry next launch
@@ -445,29 +499,21 @@ export async function ensureCuratedSkillContent(): Promise<void> {
   }
 }
 
-// ─── Auto-install: every catalog skill on disk and agent-ready ─────────────
+// ─── Launch install: bundled skills only (catalog installs on demand) ──────
 
 /**
- * Install every bundled + curated skill that isn't on disk yet (global
- * scope). Called once in the background at launch so no agent ever has to
- * ask the user to download a skill: DeepAgentSession.create re-reads the
- * skills directory on every send, so anything written here is usable by the
- * very next message. Skills the user deleted are left alone (see
- * AUTO_INSTALL_SKIP_KEY); failures are silent and retried on the next
- * launch.
+ * Install the bundled skills (authored in the bundle — no network, no cost)
+ * that aren't on disk yet (global scope). Called once in the background at
+ * launch. Catalog/registry skills are NOT auto-installed: they are all
+ * embedded in the knowledge index (discoverable via RAG) and install on
+ * first use — search_skills installs a matching miss on the spot, so any
+ * skill is usable without the user ever downloading anything. Skills the
+ * user deleted are left alone (see AUTO_INSTALL_SKIP_KEY).
  */
-export async function ensureAllCuratedSkillsInstalled(): Promise<void> {
+export async function ensureBundledSkillsInstalled(): Promise<void> {
   try {
     const installed = new Set((await listInstalledSkills("global")).map((s) => s.name));
     const skipped = readAutoInstallSkip();
-    for (const skill of CURATED_SKILLS) {
-      if (installed.has(skill.name) || skipped.has(skill.name)) continue;
-      try {
-        await installCuratedSkill(skill, "global");
-      } catch {
-        // offline / rate-limited — retried on the next launch
-      }
-    }
     for (const bundled of BUNDLED_SKILLS) {
       if (installed.has(bundled.name) || skipped.has(bundled.name)) continue;
       try {

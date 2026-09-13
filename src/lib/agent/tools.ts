@@ -12,6 +12,8 @@ import {
   type CodingAgentInfo,
 } from "@/lib/coding-delegate";
 import { readLocalFile, writeLocalFile } from "@/lib/local-file";
+import { applySkillRuntimeNotes, virtualSkillPathToReal } from "@/lib/agent/skills";
+import { globalSkillsDirectory } from "@/lib/skills-library";
 import {
   saveAgentDefinition,
   loadAgentDefinitions,
@@ -22,6 +24,7 @@ import {
   isSessionReadable,
   sandboxDeniedMessage,
   ensureAgentWorkspace,
+  homeDir,
   normalizePath,
   type AgentSandbox,
 } from "@/lib/agent/sandbox";
@@ -42,13 +45,14 @@ import {
 } from "@/lib/workflows";
 import { webSearch } from "@/lib/agent/web-search";
 import {
-  CURATED_SKILLS,
-  listBundledSkills,
   listInstalledSkills,
   installBundledSkill,
-  installCuratedSkill,
+  installRegistrySkill,
+  touchSkillUsage,
 } from "@/lib/skills-library";
-import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { listAllCatalogSkills } from "@/lib/skill-registry";
+import { applySkillDiskHeader } from "@/lib/agent/skills";
+import { listAllConnectors } from "@/lib/mcp-catalog";
 import { hasToken, readMcpAuth } from "@/lib/mcp-auth";
 import { isConnected } from "@/lib/mcp-store";
 import { loadUserSettings } from "@/hooks/use-user-settings";
@@ -213,6 +217,8 @@ export function buildAgentTools(
   enableFiles = false,
   /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
   sandbox?: AgentSandbox,
+  /** Default cwd for run_python (this run's deliverables folder). */
+  deliverablesDir?: string,
 ): StructuredTool[] {
   const ctxFn = getContext ?? getRunContext;
   const allowedNote = sandbox?.allowedDirectories
@@ -289,10 +295,11 @@ export function buildAgentTools(
     tool(
       async ({ paths }: { paths: string[] }) => {
         const allowed = sandbox?.allowedDirectories;
+        const home = await homeDir();
         const shared: Array<{ path: string; name: string; size?: number }> = [];
         const skipped: string[] = [];
         for (const raw of paths.slice(0, 10)) {
-          const p = normalizePath(raw);
+          const p = normalizePath(raw, home);
           if (!p.startsWith("/")) {
             skipped.push(`${raw} (relative path — use an absolute path)`);
             continue;
@@ -310,7 +317,23 @@ export function buildAgentTools(
           if (!shared.some((f) => f.path === p)) shared.push({ path: p, name });
         }
         if (shared.length === 0) {
-          return `No files shared. Skipped: ${skipped.join("; ") || "none requested"}.`;
+          // Make the failure visible in the chat: emitting nothing here let a
+          // model narrate "ready to download" while the user saw no chip.
+          const ctxFail = ctxFn();
+          if (ctxFail) {
+            ctxFail.emit({
+              type: "activity",
+              activity: {
+                id: `share-failed-${Date.now()}`,
+                kind: "tool",
+                name: "share_files",
+                status: "error",
+                label: "Could not share files",
+                detail: `Skipped: ${skipped.join("; ") || "none requested"}`,
+              },
+            });
+          }
+          return `No files shared. Skipped: ${skipped.join("; ") || "none requested"}. Check the paths (they must be absolute and exist) and try again with corrected paths.`;
         }
         const ctx = ctxFn();
         if (!ctx) return "Error: no active run — download cards could not be shown.";
@@ -340,9 +363,14 @@ export function buildAgentTools(
       },
     ),
     tool(
-      async ({ code }: { code: string }) => {
-        const result = await runPython(code);
+      async ({ code, cwd }: { code: string; cwd?: string }) => {
+        // Default the working directory to this run's deliverables folder so
+        // relative saves (prs.save("deck.pptx")) land somewhere real and
+        // shareable — the inherited app cwd is `/` for a Finder-launched app.
+        const dir = cwd ?? deliverablesDir;
+        const result = await runPython(code, 30000, dir);
         const parts: string[] = [];
+        if (dir) parts.push(`(working directory: ${dir})`);
         if (result.stdout) parts.push(`stdout:\n${result.stdout.slice(0, 8000)}`);
         if (result.stderr) parts.push(`stderr:\n${result.stderr.slice(0, 4000)}`);
         if (result.timedOut) parts.push("(execution timed out)");
@@ -353,9 +381,15 @@ export function buildAgentTools(
         name: "run_python",
         description:
           "Run Python code on the user's system python3 and return stdout/stderr. " +
-          "Use to execute or verify code you wrote (calculations, data processing, quick checks).",
+          "Use to execute or verify code you wrote (calculations, data processing, quick checks). " +
+          "By default it runs in this chat's deliverables folder — save files the user should " +
+          "receive there and share them with share_files afterwards.",
         schema: z.object({
           code: z.string().describe("Complete Python script to execute."),
+          cwd: z
+            .string()
+            .optional()
+            .describe("Working directory (absolute path). Defaults to the chat's deliverables folder."),
         }),
       },
     ),
@@ -373,8 +407,9 @@ export function buildAgentTools(
         name: "run_node",
         description:
           "Run Node.js (JavaScript) code on the user's system node and return stdout/stderr. " +
-          "Use for skill scripts that need Node (e.g. pptxgenjs decks for the pptx skill). " +
-          "Common skill libraries like pptxgenjs are preinstalled — require() them directly.",
+          "Use only for skill scripts that genuinely require Node — NOT for creating Office " +
+          "documents (Word/PowerPoint/Excel): use the skills' Python workflow with run_python " +
+          "instead (python-docx, python-pptx, openpyxl — nothing to install).",
         schema: z.object({
           code: z.string().describe("Complete Node.js script to execute (CommonJS, use require())."),
           cwd: z
@@ -450,99 +485,121 @@ export function buildAgentTools(
     tool(
       async ({ query }: { query: string }) => {
         const q = query.toLowerCase().trim();
-        const installed = await listInstalledSkills("global").catch(() => [] as Array<{ name: string }>);
-        const installedNames = new Set(installed.map((s) => s.name));
+        const installed = await listInstalledSkills("global").catch(() => [] as Array<{ name: string; path: string }>);
+        const installedByname = new Map(installed.map((s) => [s.name, s.path]));
+        const catalog = await listAllCatalogSkills();
 
-        const bundled = listBundledSkills();
-        const all = [
-          ...bundled.map((b) => ({
-            name: b.name,
-            title: b.name,
-            description: b.description,
-            category: "Built-in",
-            source: "bundled",
-          })),
-          ...CURATED_SKILLS.map((c) => ({
-            name: c.name,
-            title: c.title,
-            description: c.description,
-            category: c.category,
-            source: c.sourceLabel,
-          })),
-        ];
+        // Semantic first: the knowledge index embeds every catalog skill
+        // (summaries always; full SKILL.md bodies for cached/installed ones),
+        // so tasks match by meaning — "polish my pitch deck" finds pptx.
+        let ranked: Array<{ skill: (typeof catalog)[number]; score: number }> = [];
+        try {
+          const hits = await searchKnowledgeIndex(query, {
+            sourceTypes: ["skill", "skill_doc"] as KnowledgeSourceType[],
+            limit: 6,
+          });
+          const byName = new Map(catalog.map((s) => [s.name, s]));
+          const seen = new Set<string>();
+          for (const hit of hits) {
+            const skill = byName.get(hit.sourceRef);
+            if (!skill || seen.has(skill.name)) continue;
+            seen.add(skill.name);
+            ranked.push({ skill, score: hits.length - ranked.length });
+          }
+        } catch {
+          // index unavailable — keyword fallback below
+        }
+        if (ranked.length === 0) {
+          ranked = catalog
+            .map((s) => {
+              const haystack =
+                `${s.name} ${s.title} ${s.description} ${s.category} ${s.keywords.join(" ")}`.toLowerCase();
+              let score = 0;
+              if (s.name === q || s.title.toLowerCase() === q) score = 100;
+              else if (s.name.startsWith(q) || s.title.toLowerCase().startsWith(q)) score = 80;
+              else if (haystack.includes(q)) score = 60;
+              else {
+                const terms = q.split(/\s+/).filter(Boolean);
+                const hits = terms.filter((t) => haystack.includes(t)).length;
+                if (hits > 0) score = hits * 15;
+              }
+              return { skill: s, score };
+            })
+            .filter((r) => r.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 6);
+        }
 
-        const scored = all
-          .map((s) => {
-            const haystack = `${s.name} ${s.title} ${s.description} ${s.category}`.toLowerCase();
-            let score = 0;
-            if (s.name === q || s.title.toLowerCase() === q) score = 100;
-            else if (s.name.startsWith(q) || s.title.toLowerCase().startsWith(q)) score = 80;
-            else if (haystack.includes(q)) score = 60;
-            else {
-              const terms = q.split(/\s+/).filter(Boolean);
-              const hits = terms.filter((t) => haystack.includes(t)).length;
-              if (hits > 0) score = hits * 15;
-            }
-            return { ...s, score, installed: installedNames.has(s.name) };
-          })
-          .filter((s) => s.score > 0)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 6);
-
-        if (scored.length === 0) {
+        if (ranked.length === 0) {
           return `No skills found for "${query}". The user can browse the full catalog in Settings → Skills.`;
         }
 
-        // Catalog skills are auto-installed at launch — a miss means the
-        // launch download hasn't reached this one yet (or failed). Install it
-        // right now so it lands on disk for future runs, and inline the
-        // SKILL.md content so this run can act on it immediately.
+        // Install-on-demand: a catalog skill doesn't live on disk until it is
+        // first used. Install the top miss right now so it lands on disk for
+        // future runs, and inline the SKILL.md content so this run can act on
+        // it immediately.
         let inlineContent = "";
-        const top = scored[0];
-        if (!top.installed) {
+        const top = ranked[0];
+        if (!installedByname.has(top.skill.name)) {
           try {
-            const curated = CURATED_SKILLS.find((c) => c.name === top.name);
-            if (curated) {
-              await installCuratedSkill(curated, "global");
+            if (top.skill.custom || (top.skill.repo && top.skill.dir !== undefined)) {
+              await installRegistrySkill(
+                {
+                  name: top.skill.name,
+                  repo: top.skill.repo!,
+                  dir: top.skill.dir ?? "",
+                  branch: top.skill.branch,
+                },
+                "global",
+              );
             } else {
-              await installBundledSkill(top.name, "global");
+              await installBundledSkill(top.skill.name, "global");
             }
             let skillMd = "";
-            for (const installed of await listInstalledSkills("global")) {
-              if (installed.name !== top.name) continue;
+            for (const installedSkill of await listInstalledSkills("global")) {
+              if (installedSkill.name !== top.skill.name) continue;
               skillMd = await invoke<string>("read_text_file", {
-                path: `${installed.path}/SKILL.md`,
+                path: `${installedSkill.path}/SKILL.md`,
               }).catch(() => "");
               break;
             }
-            top.installed = true;
-            inlineContent = skillMd.slice(0, 6000).trim();
+            installedByname.set(top.skill.name, `${(await globalSkillsDirectory())}/${top.skill.name}`);
+            inlineContent = applySkillDiskHeader(
+              top.skill.name,
+              installedByname.get(top.skill.name)!,
+              applySkillRuntimeNotes(top.skill.name, skillMd),
+            )
+              .slice(0, 6000)
+              .trim();
           } catch {
             // Offline / rate-limited — fall through to the suggest-card path.
           }
         }
 
-        const lines = scored.map(
-          (s, i) =>
-            `[${i + 1}] ${s.title} (${s.name})${s.installed ? " [INSTALLED]" : ""}\n    ${s.description}\n    Category: ${s.category} · Source: ${s.source}`,
-        );
-        const header = `Found ${scored.length} skill(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        const lines = ranked.map(({ skill: s }, i) => {
+          const path = installedByname.get(s.name);
+          const status = path ? `[INSTALLED — files in ${path}]` : "[not installed yet]";
+          return (
+            `[${i + 1}] ${s.title} (${s.name}) ${status}\n    ${s.description}\n` +
+            `    Category: ${s.category} · Source: ${s.sourceLabel}`
+          );
+        });
+        const header = `Found ${ranked.length} skill(s) for "${query}":\n\n${lines.join("\n\n")}`;
         if (!inlineContent) return header;
         return (
-          `${header}\n\n[${top.name}] was just installed to disk and is now available to every ` +
+          `${header}\n\n[${top.skill.name}] was just installed to disk and is now available to every ` +
           `future run. Its SKILL.md (may be truncated):\n\n${inlineContent}`
         );
       },
       {
         name: "search_skills",
         description:
-          "Search the skill catalog (bundled + curated) for skills matching a query. " +
-          "Returns the skill name, description, category, and whether it is already installed. " +
+          "Search the full skill catalog (bundled + registry) for skills matching a query. " +
+          "Returns the skill name, description, category, install state, and on-disk folder of installed skills. " +
           "Use this when the user's task might benefit from a skill (e.g. creating Word/Excel/PPT/PDF " +
-          "documents, frontend design, testing). Catalog skills are auto-installed at launch, so a " +
-          "match is normally already installed and immediately usable. If one shows as NOT installed, " +
-          "this tool installs it on the spot and returns its SKILL.md inline — follow it in this run; " +
-          "only if the install fails, call suggest with kind=skill.",
+          "documents, frontend design, testing). If the best match is NOT installed, this tool installs " +
+          "it on the spot and returns its SKILL.md inline — follow it in this run; only if the install " +
+          "fails, call suggest with kind=skill.",
         schema: z.object({
           query: z.string().describe("What the user wants to do, e.g. 'create word document' or 'react best practices'."),
         }),
@@ -554,53 +611,103 @@ export function buildAgentTools(
         // OAuth connectors only count as connected once the native sign-in
         // has stored a token — an added-but-unsigned entry has no usable tools.
         const authData = await readMcpAuth().catch(() => ({}));
-        const scored = MCP_CATALOG.map((c) => {
-          const haystack = `${c.name} ${c.tagline} ${c.category} ${(c.keywords ?? []).join(" ")}`.toLowerCase();
-          let score = 0;
-          if (c.id === q || c.name.toLowerCase() === q) score = 100;
-          else if (c.id.startsWith(q) || c.name.toLowerCase().startsWith(q)) score = 80;
-          else if (haystack.includes(q)) score = 60;
-          else {
-            const terms = q.split(/\s+/).filter(Boolean);
-            const hits = terms.filter((t) => haystack.includes(t)).length;
-            if (hits > 0) score = hits * 15;
-          }
+        const catalog = await listAllConnectors();
+
+        const stateOf = (c: (typeof catalog)[number]) => {
           const added = isConnected(c.id);
           const connected =
             c.auth === "oauth" ? added && hasToken(authData, c.id) : added;
           return {
-            id: c.id,
-            name: c.name,
-            tagline: c.tagline,
-            category: c.category,
-            auth: c.auth,
+            added,
             connected,
             needsSignIn: added && !connected,
-            score,
           };
-        })
-          .filter((c) => c.score > 0)
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 6);
+        };
 
-        if (scored.length === 0) {
+        // Semantic first: the knowledge index embeds every catalog connector
+        // (summary + per-tool descriptions), so requests like "create a Jira
+        // ticket" match Atlassian even without an id/keyword hit.
+        type Ranked = { connector: (typeof catalog)[number]; score: number };
+        let ranked: Ranked[] = [];
+        try {
+          const hits = await searchKnowledgeIndex(query, {
+            sourceTypes: ["connector"] as KnowledgeSourceType[],
+            limit: 6,
+          });
+          const byId = new Map(catalog.map((c) => [c.id, c]));
+          const seen = new Set<string>();
+          for (const hit of hits) {
+            const id = hit.sourceRef.split("::")[0];
+            const connector = byId.get(id);
+            if (!connector || seen.has(connector.id)) continue;
+            seen.add(connector.id);
+            ranked.push({ connector, score: hits.length - ranked.length });
+          }
+        } catch {
+          // index unavailable — keyword fallback below
+        }
+        if (ranked.length === 0) {
+          ranked = catalog
+            .map((c) => {
+              const haystack = `${c.name} ${c.tagline} ${c.category} ${(c.keywords ?? []).join(" ")}`.toLowerCase();
+              let score = 0;
+              if (c.id === q || c.name.toLowerCase() === q) score = 100;
+              else if (c.id.startsWith(q) || c.name.toLowerCase().startsWith(q)) score = 80;
+              else if (haystack.includes(q)) score = 60;
+              else {
+                const terms = q.split(/\s+/).filter(Boolean);
+                const hits = terms.filter((t) => haystack.includes(t)).length;
+                if (hits > 0) score = hits * 15;
+              }
+              return { connector: c, score };
+            })
+            .filter((r) => r.score > 0)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 6);
+        }
+
+        if (ranked.length === 0) {
           return `No connectors found for "${query}". The user can browse the full catalog in Settings → Connectors. For Google (Gmail, Calendar, Docs) or Microsoft 365 (Outlook, Excel, Word), suggest the Zapier connector.`;
         }
 
-        const lines = scored.map(
-          (c, i) =>
-            `[${i + 1}] ${c.name}${c.connected ? " [CONNECTED]" : c.needsSignIn ? " [ADDED — needs sign-in]" : ""}\n    ${c.tagline}\n    Category: ${c.category} · Auth: ${c.auth}`,
-        );
-        return `Found ${scored.length} connector(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        const lines = ranked.map(({ connector: c }, i) => {
+          const { connected, needsSignIn } = stateOf(c);
+          // Connected (or auth-free) connectors are usable RIGHT NOW via the
+          // call_mcp_tool proxy — no restart, no next-message wait.
+          const status = connected
+            ? `[CONNECTED — list tools with list_mcp_tools("${c.id}"), call them with call_mcp_tool]`
+            : needsSignIn
+              ? "[ADDED — needs sign-in]"
+              : c.auth === "none"
+                ? `[no sign-in needed — list tools with list_mcp_tools("${c.id}"), call them with call_mcp_tool]`
+                : "";
+          return (
+            `[${i + 1}] ${c.name}${status ? ` ${status}` : ""}\n    ${c.tagline}\n` +
+            `    Category: ${c.category} · Auth: ${c.auth}`
+          );
+        });
+        const header = `Found ${ranked.length} connector(s) for "${query}":\n\n${lines.join("\n\n")}`;
+        const unconnected = ranked.filter(({ connector: c }) => {
+          const { connected, needsSignIn } = stateOf(c);
+          return !connected && !needsSignIn && c.auth !== "none";
+        });
+        if (unconnected.length > 0) {
+          return (
+            `${header}\n\n${unconnected.map(({ connector: c }) => c.name).join(", ")} ` +
+            `require${unconnected.length === 1 ? "s" : ""} sign-in: call suggest with kind=connector to show a one-click connect card.`
+          );
+        }
+        return header;
       },
       {
         name: "search_connectors",
         description:
-          "Search the connector catalog (MCP servers) for connectors matching a query. " +
-          "Returns the connector name, tagline, category, auth type, and whether it is already connected. " +
+          "Search the full connector catalog (MCP servers) for connectors matching a query. " +
+          "Returns the connector name, tagline, category, auth type, and whether it is connected/usable. " +
           "Use this when the user wants to interact with an external app (email, calendar, docs, " +
-          "project management, etc.) and no matching connector is connected yet. " +
-          "If a matching connector is found and not connected, call suggest with kind=connector. " +
+          "project management, etc.). Connected and auth-free connectors are usable IMMEDIATELY via " +
+          "list_mcp_tools + call_mcp_tool in this run. For connectors that need sign-in, call suggest " +
+          "with kind=connector — after the user connects, the same call_mcp_tool flow works. " +
           "For Google Workspace (Gmail, Calendar, Docs) and Microsoft 365 (Outlook, Excel, Word), " +
           "the Zapier connector covers all of them — search for 'gmail' or 'office' to find it.",
         schema: z.object({
@@ -1236,9 +1343,27 @@ export function buildAgentTools(
       tools.push(
         tool(
           async ({ path, reason }: { path: string; reason?: string }) => {
+            // Skill files live in the agent's virtual filesystem (/skills/…)
+            // — map them onto the real skills directory so disk-backed reads
+            // work when the model reaches for read_local_file (or the shell)
+            // instead of the virtual read_file tool.
+            const skillsDir = await globalSkillsDirectory().catch(() => null);
+            const mapped = skillsDir ? virtualSkillPathToReal(path, skillsDir) : null;
+            if (mapped) {
+              // Skill content read mid-run — refresh its MRU recency.
+              const m = path.match(/^\/skills\/([^/]+)\//);
+              if (m) touchSkillUsage(m[1]);
+            }
+            if (path.startsWith("/skills") && !mapped) {
+              return (
+                `No skill file at ${path}. Skill files are read with read_file on the exact ` +
+                "/skills/<name>/SKILL.md path shown in the skill list."
+              );
+            }
+            const effectivePath = mapped ?? path;
             if (
               sandboxed &&
-              !(await isPathAllowed(path, sandbox!.allowedDirectories!))
+              !(await isPathAllowed(effectivePath, sandbox!.allowedDirectories!))
             ) {
               return sandboxDeniedMessage(sandbox!.allowedDirectories!);
             }
@@ -1248,7 +1373,7 @@ export function buildAgentTools(
                 return "Error: file access approval is not available in this context. Tell the user which file you wanted to read.";
               }
               const { approved } = await ctx.requestApproval({
-                command: path,
+                command: effectivePath,
                 action: "read",
                 source: "local_file",
                 reason,
@@ -1259,9 +1384,18 @@ export function buildAgentTools(
             }
             let result;
             try {
-              result = await readLocalFile(path);
+              result = await readLocalFile(effectivePath);
             } catch (err) {
-              return `Could not read ${path}: ${err instanceof Error ? err.message : String(err)}`;
+              return `Could not read ${effectivePath}: ${err instanceof Error ? err.message : String(err)}`;
+            }
+            // A SKILL.md read from disk gets the same app runtime notes as
+            // the virtual copy (Python-first document creation), so guidance
+            // is consistent whichever way the model read it.
+            if (mapped && result.kind !== "binary" && result.kind !== "directory") {
+              const skillName = result.path.slice(skillsDir!.length + 1).split("/")[0];
+              if (result.path.endsWith("/SKILL.md") && skillName) {
+                result.content = applySkillRuntimeNotes(skillName, result.content);
+              }
             }
             if (result.kind === "binary") {
               return `${result.path} — binary file, ${result.size} bytes.\n${result.note ?? ""}`;
@@ -1296,7 +1430,12 @@ export function buildAgentTools(
           },
         ),
         tool(
-          async ({ path, content, reason }: { path: string; content: string; reason?: string }) => {
+          async ({
+            path,
+            content,
+            append,
+            reason,
+          }: { path: string; content: string; append?: boolean; reason?: string }) => {
             if (
               sandboxed &&
               !(await isPathAllowed(path, sandbox!.allowedDirectories!))
@@ -1319,7 +1458,24 @@ export function buildAgentTools(
               }
             }
             try {
-              const result = await writeLocalFile(path, content);
+              let full = content;
+              if (append) {
+                const existing = await readLocalFile(path).catch(() => null);
+                if (existing && existing.kind !== "text") {
+                  return `Could not append to ${path}: it is not a text file (${existing.kind}).`;
+                }
+                if (existing?.truncated) {
+                  return (
+                    `Could not append to ${path}: the existing file (${existing.size} bytes) is too large ` +
+                    "to read back safely. Overwrite it with the complete content instead, or append via run_command."
+                  );
+                }
+                full = (existing?.content ?? "") + content;
+              }
+              const result = await writeLocalFile(path, full);
+              if (append) {
+                return `Appended to ${result.path} (now ${result.bytes} bytes).`;
+              }
               return result.created
                 ? `Created ${result.path} (${result.bytes} bytes).`
                 : `Overwrote ${result.path} with the new content (${result.bytes} bytes).`;
@@ -1330,14 +1486,23 @@ export function buildAgentTools(
           {
             name: "write_local_file",
             description:
-              "Create or overwrite a file on the user's Mac with the given full content. The parent folder must " +
-              "already exist. When editing an existing file, read it first, then write the complete new content. " +
+              "Create or overwrite a file on the user's Mac with the given full content. With append=true, add " +
+              "the content to the END of the existing file instead — use it to write very large files in " +
+              "chunks (a single oversized write can be cut off by the output token limit). The parent folder " +
+              "must already exist. When editing an existing file, read it first, then write the complete new content. " +
               "You may only write inside the user's granted folders." + allowedNote,
             schema: z.object({
               path: z
                 .string()
                 .describe("Absolute path of the file to create or overwrite (~ works too)."),
-              content: z.string().describe("The complete new content of the file."),
+              content: z.string().describe("The complete new content of the file, or the chunk to append."),
+              append: z
+                .boolean()
+                .optional()
+                .describe(
+                  "true = add the content to the end of the existing file instead of overwriting. " +
+                    "Use it to write very large files in chunks.",
+                ),
               reason: z.string().optional().describe("One line: why you are writing this file."),
             }),
           },
@@ -1371,7 +1536,7 @@ export function buildAgentTools(
             },
             model: input.model ?? undefined,
           });
-          // The agent's private on-disk workspace (~/Documents/chatUI/agents/<id>).
+          // The agent's private on-disk workspace (<app data dir>/agents/<id>).
           void ensureAgentWorkspace(def.id).catch(() => {});
           // Surface "an agent was created" so the UI can offer to discard the
           // now-useless setup conversation.

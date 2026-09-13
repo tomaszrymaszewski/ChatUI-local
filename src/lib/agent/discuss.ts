@@ -35,7 +35,7 @@ import type { ContentPart } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
 import { resolveHistoryBudget, truncateMessagesToBudget } from "@/lib/agent/history";
 import type { AgentEvent, StructuredInputRequest } from "@/lib/agent/types";
-import type { AgentMessage } from "@/lib/agent/runtime";
+import { usageOfMessage, type AgentMessage } from "@/lib/agent/runtime";
 import { modelLabel } from "@/lib/model-display";
 import { defaultCouncilRoster } from "@/lib/council-roster";
 
@@ -216,6 +216,12 @@ async function streamAgentWithReasoning(
         }
       })(),
     ]);
+    try {
+      const usage = usageOfMessage(await msg.output);
+      if (usage) emit({ type: "usage", usage });
+    } catch {
+      // no final message (e.g. aborted mid-stream)
+    }
   }
   try {
     await stream.output;
@@ -994,6 +1000,12 @@ Rules:
           }
         })(),
       ]);
+      try {
+        const usage = usageOfMessage(await msg.output);
+        if (usage) emit({ type: "usage", usage });
+      } catch {
+        // no final message (e.g. aborted mid-stream)
+      }
     }
 
     try {

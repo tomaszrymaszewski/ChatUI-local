@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   ArrowUp,
   ArrowLeft,
@@ -58,7 +59,7 @@ import { type Artifact } from "@/lib/artifacts";
 import { downloadSharedFile } from "@/lib/local-file";
 import { checkForUpdate, loadUpdateSettings, isUpdaterAvailable } from "@/lib/updater";
 import { detectModeTrigger } from "@/lib/mode-triggers";
-import { modelLabel } from "@/lib/model-display";
+import { modelLabel, modelLabelWithCatalog } from "@/lib/model-display";
 import { ProviderLogo } from "@/components/provider-logos";
 import { getProviderMeta } from "@/lib/provider-meta";
 import { OpenCodeProvider } from "@/lib/opencode-context";
@@ -145,15 +146,16 @@ import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
 import {
+  ensureBundledSkillsInstalled,
   ensureCuratedSkillContent,
-  ensureAllCuratedSkillsInstalled,
   globalSkillsDirectory,
 } from "@/lib/skills-library";
+import { fetchRegistrySkills } from "@/lib/skill-registry";
 import { useAgents } from "@/hooks/use-agents";
 import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController, type AgentControllerApi } from "@/hooks/use-deep-agent";
 import { useScheduler } from "@/hooks/use-scheduler";
-import type { AgentMode, AgentRunResult, TodoItem } from "@/lib/agent/types";
-import { WidgetStack, TasksWidget } from "@/components/agent-widgets";
+import type { ActivityItem, AgentMode, AgentRunResult, SharedFile, TodoItem } from "@/lib/agent/types";
+import { WidgetStack, TasksWidget, FilesWidget, ContextWidget } from "@/components/agent-widgets";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { ensureAgentWorkspace, removeAgentWorkspace } from "@/lib/agent/sandbox";
 import { applyAgentConfigPatch } from "@/lib/agent/tools";
@@ -168,6 +170,15 @@ import { generateChatTitle, instantChatTitle, type ContentPart } from "@/lib/llm
 import type { AgentMessage } from "@/lib/agent/runtime";
 import { toHistoryMessage } from "@/lib/agent/history";
 import {
+  loadSessionCompaction,
+  saveSessionCompaction,
+  compactHistoryMessages,
+  compactionAnchorIndex,
+  transcriptFromMessages,
+  summarizeConversation,
+} from "@/lib/agent/session-compact";
+import { CompactionDivider } from "@/components/compaction-divider";
+import {
   buildMessageTree,
   getActivePath,
   getSiblings,
@@ -175,8 +186,7 @@ import {
 import { prepareAttachmentContext, rebuildAttachmentContent, buildProjectFilesContext } from "@/lib/attachment-context";
 import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
-import { ensureNodeLibs } from "@/lib/run-node";
-import { getModelCapabilities } from "@/lib/model-capabilities";
+import { getModelCapabilities, getModelDisplayNameSync } from "@/lib/model-capabilities";
 import { buildMemoryContext, extractAndSaveMemory, loadMemory } from "@/lib/memory";
 
 function generateId() {
@@ -255,6 +265,10 @@ const CHAT_MIN_WIDTH_PX = 600;
 const ARTIFACT_ROW_OVERHEAD_PX = 22;
 /** The session container's p-2 padding (2 × 8px). */
 const CONTAINER_PADDING_PX = 16;
+/** The sidebar's expanded width (SIDEBAR_WIDTH = 16rem in ui/sidebar.tsx). */
+const SIDEBAR_EXPANDED_PX = 256;
+/** Right-hand space the widget stack reserves (18rem widget + 2 × 0.75rem). */
+const WIDGETS_RESERVED_PX = 312;
 
 export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
@@ -359,7 +373,7 @@ export function ChatView() {
   const [artifactPanel, setArtifactPanel] = useState<{ artifacts: Artifact[]; activeIndex: number } | null>(null);
   const [artifactWindowMode, setArtifactWindowMode] = useState<"open" | "minimized" | "expanded">("open");
   const [artifactWidth, setArtifactWidth] = useState<number | null>(null);
-  // Master show/hide for the agent-view widget stack (hamburger in the header).
+  // Master show/hide for the session widget stack (hamburger in the header).
   const [widgetsHidden, setWidgetsHidden] = useState(
     () => localStorage.getItem("chatui:widgets-hidden") === "1",
   );
@@ -368,6 +382,24 @@ export function ChatView() {
       localStorage.setItem("chatui:widgets-hidden", prev ? "0" : "1");
       return !prev;
     });
+  // Sidebar open state is controlled so opening the widgets can auto-collapse
+  // it when the widgets, sidebar, and chat text cannot fit width-wise.
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [windowWidth, setWindowWidth] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setWindowWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  // How the sidebar last came to be collapsed while widgets show: "auto"
+  // (by the fit check — reverted when space returns or widgets close) or
+  // "user" (manual toggle — always wins, never auto-reverted).
+  const sidebarAutoRef = useRef<"auto" | "user" | null>(null);
+  // Session id currently being compacted (context widget's Compact button).
+  const [compactingSessionId, setCompactingSessionId] = useState<string | null>(null);
+  // Bumped whenever the active session's compaction record changes, so the
+  // divider re-reads it from storage (records live in localStorage, not state).
+  const [compactionTick, setCompactionTick] = useState(0);
   const sessionContainerRef = useRef<HTMLDivElement>(null);
   const autoOpenedArtifacts = useRef<Set<string>>(new Set());
   const autoModeRef = useRef<ChatMode>("none");
@@ -379,18 +411,19 @@ export function ChatView() {
   }, [settings.temporaryByDefault]);
 
   // Knowledge index: first sweep shortly after launch (debounced triggers in
-  // use-deep-agent re-index after each run). Curated skill content is
-  // prefetched once in the background so full skill instructions are
-  // searchable (and retrievable) before any install, and every catalog skill
-  // is auto-installed to the global skills dir so agents can use them
-  // without asking the user to download anything.
+  // use-deep-agent re-index after each run). Bundled skills install at launch
+  // (no network); catalog/registry skills install on demand — the agent finds
+  // them via RAG and search_skills installs a match on the spot. The registry
+  // fetch warms the catalog cache; catalog bodies prefetch in the background
+  // (30-day cache) so full instructions are searchable before any install.
   useEffect(() => {
     scheduleKnowledgeSweep(15_000);
-    void ensureNodeLibs();
-    void ensureCuratedSkillContent()
-      .then(() => ensureAllCuratedSkillsInstalled())
-      .then(() => scheduleKnowledgeSweep(2_000))
-      .catch(() => {});
+    void (async () => {
+      await ensureBundledSkillsInstalled();
+      const registrySkills = await fetchRegistrySkills();
+      await ensureCuratedSkillContent(registrySkills);
+      scheduleKnowledgeSweep(2_000);
+    })().catch(() => {});
   }, []);
 
   // Check for app updates once on launch (silently).
@@ -633,6 +666,24 @@ export function ChatView() {
     [roots, nodeMap, selectedChildMap],
   );
 
+  // The session's compaction record (if any) and the active-path index of
+  // its anchor — the divider renders directly after that message. -1 hides
+  // it: no compaction, or the anchor left the path (same condition under
+  // which replay ignores the compaction).
+  const compactionRecord = useMemo(() => {
+    // Tick bump re-reads the record after a fresh compaction is saved.
+    void compactionTick;
+    return activeSessionId ? loadSessionCompaction(activeSessionId) : null;
+  }, [activeSessionId, compactionTick]);
+  const compactionAnchor = useMemo(
+    () =>
+      compactionAnchorIndex(
+        activePath.map((n) => n.message.id),
+        compactionRecord,
+      ),
+    [activePath, compactionRecord],
+  );
+
   // Agent-task view = an agent-mode session (task) is open in the main area.
   const agentTaskView = isAgentTab && !!activeSession?.agentId;
 
@@ -659,10 +710,62 @@ export function ChatView() {
     return [];
   })();
 
+  // Files generated during this session for the files widget: shared files
+  // and write_local_file results — the live run first, then the persisted
+  // active path — deduped by path (a later entry with a known size wins).
+  const sessionFiles: SharedFile[] = (() => {
+    const byPath = new Map<string, SharedFile>();
+    const add = (f: SharedFile) => {
+      const prev = byPath.get(f.path);
+      byPath.set(f.path, prev ? { ...prev, ...f, size: f.size ?? prev.size } : f);
+    };
+    const fromActivities = (acts: ActivityItem[] | undefined) => {
+      for (const a of acts ?? []) {
+        if (!a.file || a.status === "error") continue;
+        const shared: SharedFile = { path: a.file.path, name: a.file.name };
+        if (a.file.bytes !== undefined) shared.size = a.file.bytes;
+        add(shared);
+      }
+    };
+    if (agent?.isRunning) {
+      for (const f of agent.files) add(f);
+      fromActivities(agent.activities);
+    }
+    for (const node of activePath) {
+      for (const f of node.message.files ?? []) add(f);
+      fromActivities(node.message.activities);
+    }
+    return Array.from(byPath.values());
+  })();
+
   // Widgets shown = stack slid in; the chat column reserves matching
   // right-hand space (widget 18rem + 0.75rem offset + 0.75rem gap) so no
-  // chat text is ever covered.
-  const widgetsVisible = agentTaskView && !artifactPanel && !widgetsHidden;
+  // chat text is ever covered. Every open session gets the stack — regular
+  // tasks included; cards that have nothing to show render nothing.
+  const sessionViewActive = !!activeSession && (!isAgentTab || agentConsoleFocus === "session");
+  const widgetsVisible = sessionViewActive && !artifactPanel && !widgetsHidden;
+
+  // Auto-collapse the sidebar while the widgets are open and the three
+  // columns (sidebar 16rem + widgets 19.5rem + chat minimum) cannot fit
+  // width-wise. A manually collapsed/expanded sidebar always wins: only a
+  // fit-driven collapse is reverted when space returns or widgets close.
+  useEffect(() => {
+    if (!widgetsVisible) {
+      // Widgets closed: revert a fit-driven collapse; a user collapse stays.
+      // Either way the ref resets so the next widgets-open re-checks the fit.
+      if (sidebarAutoRef.current === "auto") setSidebarOpen(true);
+      sidebarAutoRef.current = null;
+      return;
+    }
+    const fits = windowWidth >= SIDEBAR_EXPANDED_PX + WIDGETS_RESERVED_PX + CHAT_MIN_WIDTH_PX;
+    if (!fits && sidebarOpen && sidebarAutoRef.current === null) {
+      sidebarAutoRef.current = "auto";
+      setSidebarOpen(false);
+    } else if (fits && !sidebarOpen && sidebarAutoRef.current === "auto") {
+      sidebarAutoRef.current = null;
+      setSidebarOpen(true);
+    }
+  }, [widgetsVisible, windowWidth, sidebarOpen]);
 
   useEffect(() => {
     setSelectedChildMap(new Map());
@@ -769,6 +872,69 @@ export function ChatView() {
       toast.success(`Downloaded ${name}`);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Download failed");
+    }
+  };
+
+  const handleOpenSharedFile = async (path: string) => {
+    try {
+      await openPath(path);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not open file");
+    }
+  };
+
+  const handleRevealSharedFile = async (path: string) => {
+    try {
+      await revealItemInDir(path);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not reveal file");
+    }
+  };
+
+  /**
+   * Manual context compaction (context widget's Compact button): summarize
+   * the conversation up to its newest message and store the summary as the
+   * session's compaction record — subsequent runs replay the summary in
+   * place of the older turns (see compactHistoryMessages). The messages
+   * themselves are untouched.
+   */
+  const handleCompactContext = async () => {
+    if (!activeSessionId || !activeSession || agent?.isRunning || activePath.length === 0) return;
+    const arc = isAgentTab
+      ? await agentRunContext({
+          agentId: activeSession.agentId,
+          isSetup: activeSession.isSetup === true,
+        })
+      : null;
+    const runModelName = arc?.model ?? selectedModel;
+    const provider = runModelName ? findProviderForModel(runModelName) : null;
+    if (!provider || !runModelName) {
+      toast.error("No provider configured. Add one in Settings.");
+      openSettings();
+      return;
+    }
+    setCompactingSessionId(activeSessionId);
+    try {
+      const transcript = transcriptFromMessages(
+        activePath.map((n) => ({ role: n.message.role, content: n.message.content })),
+      );
+      if (!transcript) {
+        toast.error("Nothing to compact yet.");
+        return;
+      }
+      const summary = await summarizeConversation(provider, runModelName, transcript);
+      if (!summary) throw new Error("The model returned no summary.");
+      saveSessionCompaction(activeSessionId, {
+        summary,
+        upToId: activePath[activePath.length - 1].message.id,
+        at: Date.now(),
+      });
+      setCompactionTick((t) => t + 1);
+      toast.success("Context compacted — older turns will be sent as a summary.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Compaction failed");
+    } finally {
+      setCompactingSessionId(null);
     }
   };
 
@@ -1127,8 +1293,16 @@ export function ChatView() {
         ];
       }
 
+      // Manual compaction: the summarized prefix is swapped for one summary
+      // turn before the outgoing message (no-op without a compaction record).
+      const runHistory = compactHistoryMessages(
+        activePath.map((n) => n.message.id),
+        historyMessages,
+        loadSessionCompaction(sessionId),
+      );
+
       const completionMessages: AgentMessage[] = [
-        ...historyMessages,
+        ...runHistory,
         { role: "user" as const, content: outgoingContent },
       ];
 
@@ -1331,7 +1505,12 @@ export function ChatView() {
           completionMessages.push(toHistoryMessage(n.message));
         }
       }
-      completionMessages.push({ role: "user" as const, content: text });
+      const runHistory = compactHistoryMessages(
+        pathToParent.map((n) => n.message.id),
+        completionMessages,
+        loadSessionCompaction(activeSessionId),
+      );
+      runHistory.push({ role: "user" as const, content: text });
 
       const ctrl = getAgentController(activeSessionId!);
       const assistantMsg = await addMessage(
@@ -1364,7 +1543,7 @@ export function ChatView() {
           provider,
           modelName: runModelName,
           reasoningEffort,
-          messages: completionMessages,
+          messages: runHistory,
           instructions: arc ? arc.instructions : currentProjectInstructions || undefined,
           mode: arc?.mode,
           webFetchEnabled: arc ? arc.webFetch : webFetchEnabled,
@@ -1442,6 +1621,15 @@ export function ChatView() {
         completionMessages.push(toHistoryMessage(msg));
       }
 
+      // Manual compaction: the summarized prefix is swapped for one summary
+      // turn (no-op without a compaction record, or when its anchor is not
+      // within the replayed path).
+      const runHistory = compactHistoryMessages(
+        pathToParent.map((n) => n.message.id),
+        completionMessages,
+        loadSessionCompaction(activeSessionId),
+      );
+
       const ctrl = getAgentController(activeSessionId);
       const assistantMsg = await addMessage(
         activeSessionId,
@@ -1473,7 +1661,7 @@ export function ChatView() {
           provider,
           modelName: runModelName,
           reasoningEffort,
-          messages: completionMessages,
+          messages: runHistory,
           instructions: arc ? arc.instructions : currentProjectInstructions || undefined,
           mode: arc?.mode,
           webFetchEnabled: arc ? arc.webFetch : webFetchEnabled,
@@ -1841,6 +2029,15 @@ export function ChatView() {
   const logoKeyFor = (m: (typeof allModels)[number]) =>
     getProviderMeta(m.builtinKey ?? "custom")?.logoKey ?? "custom";
 
+  /** Composer label: manual name wins, else the models.dev display name. */
+  const modelNameFor = (m: (typeof allModels)[number]) => {
+    const provider = providers.find((p) => p.id === m.providerId);
+    return modelLabelWithCatalog(
+      m,
+      provider ? getModelDisplayNameSync(provider, m.name) : null,
+    );
+  };
+
   const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
     { value: "default", label: "Default" },
     { value: "low", label: "Low" },
@@ -1864,7 +2061,7 @@ export function ChatView() {
           )}
           <span className="max-w-48 truncate">
             {selectedModelLabel
-              ? modelLabel(selectedModelLabel)
+              ? modelNameFor(selectedModelLabel)
               : "Select model"}
           </span>
           {reasoningEffort === "high" && (
@@ -1890,7 +2087,7 @@ export function ChatView() {
                 logoKey={logoKeyFor(m)}
                 className="size-3.5 shrink-0 text-muted-foreground"
               />
-              <span className="truncate">{modelLabel(m)}</span>
+              <span className="truncate">{modelNameFor(m)}</span>
               {m.name === selectedModel && (
                 <Check className="ml-auto size-3.5" />
               )}
@@ -2164,16 +2361,38 @@ export function ChatView() {
                 return (
                   <div className="mb-1 flex flex-col gap-1.5">
                     {shared.map((f) => (
-                      <button
+                      <div
                         key={f.path}
-                        onClick={() => void handleDownloadSharedFile(f.path)}
-                        className="flex w-full items-center gap-2 rounded-lg border px-4 py-3 text-sm transition-opacity hover:bg-accent"
+                        className="flex w-full items-center gap-2 rounded-lg border px-4 py-3 text-sm"
                         title={f.path}
                       >
                         <FileText className="size-4 shrink-0 text-muted-foreground" />
-                        <span className="truncate font-medium">{f.name}</span>
-                        <Download className="ml-auto size-4 shrink-0 text-muted-foreground" />
-                      </button>
+                        <button
+                          onClick={() => void handleOpenSharedFile(f.path)}
+                          className="min-w-0 flex-1 truncate text-left font-medium hover:underline"
+                        >
+                          {f.name}
+                        </button>
+                        <button
+                          onClick={() => void handleOpenSharedFile(f.path)}
+                          className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+                        >
+                          Open
+                        </button>
+                        <button
+                          onClick={() => void handleRevealSharedFile(f.path)}
+                          className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+                        >
+                          Reveal
+                        </button>
+                        <button
+                          onClick={() => void handleDownloadSharedFile(f.path)}
+                          aria-label={`Download ${f.name}`}
+                          className="shrink-0 text-muted-foreground hover:text-foreground"
+                        >
+                          <Download className="size-4" />
+                        </button>
+                      </div>
                     ))}
                   </div>
                 );
@@ -2256,6 +2475,8 @@ export function ChatView() {
       document.body,
     )}
     <SidebarProvider
+      open={sidebarOpen}
+      onOpenChange={setSidebarOpen}
       className="relative h-dvh min-h-0 overflow-hidden"
       style={{ "--sidebar-width-icon": "3rem" } as React.CSSProperties}
     >
@@ -2306,6 +2527,8 @@ export function ChatView() {
           if (artifactPanel && artifactWindowMode !== "minimized") {
             setArtifactWindowMode("minimized");
           }
+          // A manual sidebar toggle wins over the widgets fit check.
+          if (widgetsVisible) sidebarAutoRef.current = "user";
         }}
       />
 
@@ -2753,7 +2976,7 @@ export function ChatView() {
             </div>
           )}
           <div className="ml-auto flex items-center gap-2">
-            {agentTaskView && (
+            {sessionViewActive && (
               <Button
                 variant="ghost"
                 size="icon-sm"
@@ -2786,7 +3009,7 @@ export function ChatView() {
               <MessageScroller className="flex-1">
                 <MessageScrollerViewport>
                   <MessageScrollerContent className="mx-auto w-full max-w-3xl px-4 py-6">
-                    {activePath.map((node) => {
+                    {activePath.map((node, index) => {
                       // The in-progress assistant message renders its live
                       // streaming bubble in place — the same MessageScrollerItem
                       // the finished message will occupy. Swapping a separate
@@ -2817,6 +3040,44 @@ export function ChatView() {
                                       todos={agentTaskView ? undefined : agent?.todos}
                                       live
                                     />
+                                    {(agent?.files ?? []).length > 0 && (
+                                      <div className="mb-1 flex flex-col gap-1.5">
+                                        {agent.files.map((f) => (
+                                          <div
+                                            key={f.path}
+                                            className="flex w-full items-center gap-2 rounded-lg border px-4 py-3 text-sm"
+                                            title={f.path}
+                                          >
+                                            <FileText className="size-4 shrink-0 text-muted-foreground" />
+                                            <button
+                                              onClick={() => void handleOpenSharedFile(f.path)}
+                                              className="min-w-0 flex-1 truncate text-left font-medium hover:underline"
+                                            >
+                                              {f.name}
+                                            </button>
+                                            <button
+                                              onClick={() => void handleOpenSharedFile(f.path)}
+                                              className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+                                            >
+                                              Open
+                                            </button>
+                                            <button
+                                              onClick={() => void handleRevealSharedFile(f.path)}
+                                              className="shrink-0 text-xs text-muted-foreground hover:text-foreground"
+                                            >
+                                              Reveal
+                                            </button>
+                                            <button
+                                              onClick={() => void handleDownloadSharedFile(f.path)}
+                                              aria-label={`Download ${f.name}`}
+                                              className="shrink-0 text-muted-foreground hover:text-foreground"
+                                            >
+                                              <Download className="size-4" />
+                                            </button>
+                                          </div>
+                                        ))}
+                                      </div>
+                                    )}
                                     <div
                                       className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground"
                                       role="status"
@@ -2840,7 +3101,20 @@ export function ChatView() {
                           </MessageScrollerItem>
                         );
                       }
-                      return renderMessage(node.message);
+                      const rendered = renderMessage(node.message);
+                      if (compactionRecord && index === compactionAnchor) {
+                        return (
+                          <Fragment key={node.message.id}>
+                            {rendered}
+                            <CompactionDivider
+                              key={`${activeSessionId}:${compactionRecord.upToId}`}
+                              summary={compactionRecord.summary}
+                              at={compactionRecord.at}
+                            />
+                          </Fragment>
+                        );
+                      }
+                      return rendered;
                     })}
                   </MessageScrollerContent>
                 </MessageScrollerViewport>
@@ -3059,12 +3333,23 @@ export function ChatView() {
               </div>
             </div>
             </div>
-            {/* Agent-view floating widgets (top-right). Stays mounted while
+            {/* Session floating widgets (top-right). Stays mounted while
                 hidden so it can slide out of the right edge; the chat column
                 reserves matching space while visible, so nothing is covered. */}
-            {agentTaskView && !artifactPanel && (
+            {!artifactPanel && (
               <WidgetStack visible={!widgetsHidden}>
+                <ContextWidget
+                  usage={agent?.usage ?? { inputTokens: 0, cachedTokens: 0, outputTokens: 0, contextTokens: 0, costDollars: 0 }}
+                  contextLimit={agent?.contextLimit ?? null}
+                  canCompact={activePath.length > 0 && !agent?.isRunning}
+                  compacting={compactingSessionId === activeSessionId}
+                  onCompact={() => void handleCompactContext()}
+                />
                 <TasksWidget todos={sessionTodos} />
+                <FilesWidget
+                  files={sessionFiles}
+                  onDownload={(path) => void handleDownloadSharedFile(path)}
+                />
               </WidgetStack>
             )}
             {artifactPanel && artifactWindowMode !== "minimized" && artifactWindowMode !== "expanded" && (

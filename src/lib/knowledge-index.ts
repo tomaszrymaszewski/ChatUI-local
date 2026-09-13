@@ -2,7 +2,7 @@
 // images, skills, connectors and memories into chunk docs, embeds them ONCE
 // (local transformers.js model or a configured OpenAI-compatible /v1/embeddings
 // endpoint) and stores them in the sqlite-vec index managed by the Rust shell
-// (~/Documents/chatUI/index.db). Retrieval helpers live in
+// (index.db in the app's data directory). Retrieval helpers live in
 // knowledge-retrieval.ts; the agent-facing search_knowledge tool consumes it.
 
 import { invoke } from "@tauri-apps/api/core";
@@ -18,11 +18,10 @@ import { getFileBlob, getFileText, setFileText } from "@/lib/attachment-store";
 import {
   getBundledSkillContent,
   getCuratedSkillContent,
-  listBundledSkills,
-  listCuratedSkills,
   listInstalledSkills,
 } from "@/lib/skills-library";
-import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { listAllCatalogSkills } from "@/lib/skill-registry";
+import { listAllConnectors } from "@/lib/mcp-catalog";
 import { hasToken, readMcpAuth } from "@/lib/mcp-auth";
 import { ensureMcpMigrated, isConnected } from "@/lib/mcp-store";
 import { getConnectorToolInfo, type RemoteToolSummary } from "@/lib/mcp-discovery";
@@ -502,8 +501,13 @@ async function imageDocs(
 
 async function skillDocs(): Promise<RawSourceDoc[]> {
   const docs: RawSourceDoc[] = [];
-  for (const s of listCuratedSkills()) {
-    const text = `${s.title}. ${s.description} Category: ${s.category}. Source: ${s.sourceLabel}.`;
+  // Unified catalog: bundled + remote registry + custom entries. Every entry
+  // gets a summary doc (cheap, always indexed) so RAG can surface skills
+  // before any install.
+  const catalog = await listAllCatalogSkills();
+  for (const s of catalog) {
+    const keywords = s.keywords.length ? ` Keywords: ${s.keywords.join(", ")}.` : "";
+    const text = `${s.title}. ${s.description} Category: ${s.category}. Source: ${s.sourceLabel}.${keywords}`;
     docs.push({
       sourceType: "skill",
       sourceRef: s.name,
@@ -512,20 +516,10 @@ async function skillDocs(): Promise<RawSourceDoc[]> {
       extra: { kind: "catalog" },
       hash: hashKnowledgeText(text),
     });
-  }
-  for (const s of listBundledSkills()) {
-    const text = `${s.description} Source: bundled skill.`;
-    docs.push({
-      sourceType: "skill",
-      sourceRef: s.name,
-      sourceTitle: s.name,
-      texts: [text],
-      extra: { kind: "catalog" },
-      hash: hashKnowledgeText(text),
-    });
-    const content = getBundledSkillContent(s.name);
-    if (content) {
-      const clipped = content.slice(0, MAX_TEXT_CHARS);
+    // Bundled skills ship their body in the bundle — index it right away.
+    const bundledBody = getBundledSkillContent(s.name);
+    if (bundledBody) {
+      const clipped = bundledBody.slice(0, MAX_TEXT_CHARS);
       docs.push({
         sourceType: "skill_doc",
         sourceRef: `bundled:${s.name}`,
@@ -562,11 +556,11 @@ async function skillDocs(): Promise<RawSourceDoc[]> {
   } catch {
     // not running under Tauri
   }
-  // Curated skills' full SKILL.md bodies (prefetched by
-  // ensureCuratedSkillContent) — full instructions are searchable before any
+  // Catalog skills' full SKILL.md bodies prefetched by
+  // ensureCuratedSkillContent — full instructions are searchable before any
   // install; an installed skill's on-disk doc is the source of truth.
-  for (const s of listCuratedSkills()) {
-    if (installedNames.has(s.name)) continue;
+  for (const s of catalog) {
+    if (installedNames.has(s.name) || getBundledSkillContent(s.name)) continue;
     const content = getCuratedSkillContent(s.name);
     if (!content?.trim()) continue;
     const clipped = content.slice(0, MAX_TEXT_CHARS);
@@ -593,7 +587,10 @@ async function connectorDocs(): Promise<RawSourceDoc[]> {
   const toolInfo = await getConnectorToolInfo().catch(() => ({} as Record<string, RemoteToolSummary[]>));
   const authData = await readMcpAuth().catch(() => ({}));
   const docs: RawSourceDoc[] = [];
-  for (const e of MCP_CATALOG) {
+  // Full catalog (bundled + registry) so every connector is discoverable via
+  // RAG before any connect.
+  const catalog = await listAllConnectors();
+  for (const e of catalog) {
     const keywords = e.keywords?.length ? ` Keywords: ${e.keywords.join(", ")}.` : "";
     // OAuth entries need a stored token from the native sign-in, not just a
     // catalog entry, before their tools are really available.

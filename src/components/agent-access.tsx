@@ -1,6 +1,8 @@
 import { useMemo, useRef, useState } from "react";
 import { open as openDirectoryPicker } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
+import { displayHomePath } from "@/lib/agent/sandbox";
+import { useChatUiBaseDir } from "@/hooks/use-chat-ui-base-dir";
 import {
   Bot,
   CalendarClock,
@@ -23,7 +25,7 @@ import type { AgentAttachment, AgentDefinition, ChatSession, Project } from "@/t
 import type { AgentUpdatePatch } from "@/lib/agents";
 import { deleteFileBlob, putFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
-import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { listCachedConnectors } from "@/lib/mcp-catalog";
 import { skillIcon } from "@/components/skills-panel";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { Button } from "@/components/ui/button";
@@ -165,14 +167,14 @@ export function AgentAccess({
       view: { kind: "session", sessionId: s.id },
     }));
     const connectorFiles: TreeFile[] = [
-      ...MCP_CATALOG.map((entry) => ({
+      ...listCachedConnectors().map((entry) => ({
         type: "file" as const,
         id: `file:connector:${entry.id}`,
         name: `${entry.id}.json`,
         view: { kind: "connector" as const, id: entry.id },
       })),
       ...agent.connectors
-        .filter((id) => !MCP_CATALOG.some((c) => c.id === id))
+        .filter((id) => !listCachedConnectors().some((c) => c.id === id))
         .map((id) => ({
           type: "file" as const,
           id: `file:connector:${id}`,
@@ -468,6 +470,7 @@ function FileDetail({
   onSelectSession: (id: string) => void;
 }) {
   const view = file.view;
+  const baseDir = useChatUiBaseDir();
 
   if (view.kind === "system-prompt") {
     return (
@@ -582,7 +585,7 @@ function FileDetail({
   }
 
   if (view.kind === "connector") {
-    const entry = MCP_CATALOG.find((c) => c.id === view.id);
+    const entry = listCachedConnectors().find((c) => c.id === view.id);
     const enabled = agent.connectors.includes(view.id);
     const toggle = () =>
       onUpdate({
@@ -700,7 +703,7 @@ function FileDetail({
       <div>
         <DetailHeader path="folders/workspace.md" title="Private workspace" />
         <p className="mb-3 font-mono text-[11px] text-muted-foreground">
-          ~/Documents/chatUI/agents/{agent.id}
+          {baseDir ? `${displayHomePath(baseDir)}/agents/${agent.id}` : "…"}
         </p>
         <p className="text-xs text-muted-foreground">
           Always available to the agent and created on its first run. Files the

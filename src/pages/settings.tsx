@@ -60,7 +60,7 @@ import {
   type ImportResult,
 } from "@/lib/data-transfer";
 import { getProviderMeta } from "@/lib/provider-meta";
-import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync } from "@/lib/model-capabilities";
+import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync, getContextOverride, setContextOverride, getModelContextWindowSync, getModelDisplayNameSync, getModelCostSync, formatModelPrices, getProviderCatalogName } from "@/lib/model-capabilities";
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
 import { EMBEDDING_MODELS, setEmbeddingModel } from "@/lib/embeddings";
 import {
@@ -70,7 +70,7 @@ import {
   type KnowledgeIndexStats,
 } from "@/lib/knowledge-index";
 import { resetOnboarding } from "@/lib/onboarding";
-import { modelLabel } from "@/lib/model-display";
+import { modelLabel, modelLabelWithCatalog } from "@/lib/model-display";
 import { headroomStart, headroomStatus, type HeadroomStatus } from "@/lib/headroom-client";
 import type { Provider, ProviderModel, UserSettings, KnowledgeSourceToggles } from "@/types";
 
@@ -92,6 +92,13 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
   const [editingModel, setEditingModel] = useState<{ providerId: string; model: ProviderModel } | null>(null);
   const [deleteModelTarget, setDeleteModelTarget] = useState<{ providerId: string; model: ProviderModel } | null>(null);
   const [visionTick, setVisionTick] = useState(0);
+  const [contextTick, setContextTick] = useState(0);
+
+  /** models.dev display name for a model, null when the catalog is silent. */
+  const catalogNameFor = (providerId: string, modelName: string): string | null => {
+    const p = providers.find((pp) => pp.id === providerId);
+    return p ? getModelDisplayNameSync(p, modelName) : null;
+  };
   const [memoryTick, setMemoryTick] = useState(0);
   const [memoryProjectId, setMemoryProjectId] = useState<string | null>(null);
   const [newMemoryText, setNewMemoryText] = useState("");
@@ -211,15 +218,17 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
     }
   };
 
-  const handleSaveModelDisplayName = async (displayName: string) => {
+  const handleSaveModelDisplayName = async (displayName: string, contextTokens: number | undefined) => {
     if (!editingModel) return;
     try {
       await updateModelDisplayName(editingModel.providerId, editingModel.model.id, displayName);
-      toast.success("Model name updated");
+      setContextOverride(editingModel.providerId, editingModel.model.name, contextTokens);
+      setContextTick((t) => t + 1);
+      toast.success("Model updated");
       setEditingModel(null);
     } catch (err) {
       toast.error(
-        err instanceof Error ? err.message : "Failed to update model name"
+        err instanceof Error ? err.message : "Failed to update model"
       );
     }
   };
@@ -923,6 +932,15 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                                     {provider.hasKey ? "API key set" : "No API key"}
                                     <span className="mx-1">·</span>
                                     {provider.models.length} model{provider.models.length !== 1 ? "s" : ""}
+                                    {(() => {
+                                      const catalogName = getProviderCatalogName(provider.baseUrl);
+                                      return catalogName && catalogName !== provider.name ? (
+                                        <>
+                                          <span className="mx-1">·</span>
+                                          <span title="Provider name in the models.dev catalog">{catalogName}</span>
+                                        </>
+                                      ) : null;
+                                    })()}
                                   </div>
                                 </CardTitle>
                               </div>
@@ -996,7 +1014,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                               logoKey={getProviderMeta(m.builtinKey ?? "custom")?.logoKey ?? "custom"}
                               className="size-3.5 shrink-0 text-muted-foreground"
                             />
-                            {modelLabel(m)}
+                            {modelLabelWithCatalog(m, catalogNameFor(m.providerId, m.name))}
                           </span>
                         </SelectItem>
                       ))
@@ -1009,10 +1027,14 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                 <div className="flex flex-col gap-2">
                   {allModels.map((m) => {
                     void visionTick;
+                    void contextTick;
                     const provider = providers.find((p) => p.id === m.providerId);
                     const override = getVisionOverride(m.providerId, m.name);
                     const caps = provider ? getModelCapabilitiesSync(provider, m.name) : null;
                     const visionOn = override ?? caps?.vision ?? false;
+                    const ctx = provider ? getModelContextWindowSync(provider, m.name) : null;
+                    const catalogName = provider ? getModelDisplayNameSync(provider, m.name) : null;
+                    const prices = provider ? getModelCostSync(provider, m.name) : null;
                     const cycleVision = () => {
                       if (override === undefined) setVisionOverride(m.providerId, m.name, true);
                       else if (override === true) setVisionOverride(m.providerId, m.name, false);
@@ -1026,10 +1048,17 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                     >
                       <div className="flex flex-col gap-0.5">
                         <span className="text-sm font-medium">
-                          {modelLabel(m)}
+                          {modelLabelWithCatalog(m, catalogName)}
                         </span>
                         <span className="text-xs text-muted-foreground">
                           {m.name} · {m.providerName}
+                          {ctx
+                            ? ` · ${ctx.tokens.toLocaleString("en-US")} context`
+                            : " · context unknown"}
+                          {caps?.source === "catalog" && caps.inputModalities.length > 0
+                            ? ` · in: ${caps.inputModalities.join(", ")}`
+                            : ""}
+                          {prices ? ` · ${formatModelPrices(prices)}` : ""}
                           {settings.defaultModel === m.name && (
                             <span className="ml-2 rounded-full bg-primary/10 text-primary px-2 py-0.5 text-[10px]">
                               default
@@ -1251,23 +1280,29 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
         </DialogContent>
       </Dialog>
 
-      {/* Edit Model Display Name Dialog */}
+      {/* Edit Model Dialog */}
       <Dialog
         open={!!editingModel}
         onOpenChange={(o) => !o && setEditingModel(null)}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit Model Name</DialogTitle>
+            <DialogTitle>Edit Model</DialogTitle>
             <DialogDescription>
               Change the display name for "{editingModel ? modelLabel(editingModel.model) : ""}" (id: {editingModel?.model.name})
             </DialogDescription>
           </DialogHeader>
-          <EditModelNameForm
-            initialName={editingModel?.model.displayName ?? ""}
-            onSave={handleSaveModelDisplayName}
-            onCancel={() => setEditingModel(null)}
-          />
+          {editingModel && (
+            <EditModelNameForm
+              key={`${editingModel.providerId}:${editingModel.model.id}`}
+              provider={providers.find((p) => p.id === editingModel.providerId) ?? null}
+              providerId={editingModel.providerId}
+              modelName={editingModel.model.name}
+              initialName={editingModel.model.displayName ?? ""}
+              onSave={handleSaveModelDisplayName}
+              onCancel={() => setEditingModel(null)}
+            />
+          )}
         </DialogContent>
       </Dialog>
     </>
@@ -1275,32 +1310,89 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
 }
 
 function EditModelNameForm({
+  provider,
+  providerId,
+  modelName,
   initialName,
   onSave,
   onCancel,
 }: {
+  provider: Provider | null;
+  providerId: string;
+  modelName: string;
   initialName: string;
-  onSave: (name: string) => void;
+  onSave: (name: string, contextTokens: number | undefined) => void;
   onCancel: () => void;
 }) {
   const [name, setName] = useState(initialName);
+  const detected = provider ? getModelContextWindowSync(provider, modelName) : null;
+  const existing = getContextOverride(providerId, modelName);
+  const [contextText, setContextText] = useState(existing?.toString() ?? "");
+  const [contextError, setContextError] = useState<string | null>(null);
+  const save = () => {
+    const trimmed = contextText.trim();
+    if (trimmed === "") {
+      onSave(name, undefined);
+      return;
+    }
+    const value = Number(trimmed.replace(/,/g, ""));
+    if (!Number.isInteger(value) || value <= 0) {
+      setContextError("Enter a positive whole number of tokens, or leave empty for auto.");
+      return;
+    }
+    onSave(name, value);
+  };
   return (
     <div className="flex flex-col gap-4 pt-2">
-      <Input
-        autoFocus
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        placeholder="Display name"
-        onKeyDown={(e) => {
-          if (e.key === "Enter") onSave(name);
-          if (e.key === "Escape") onCancel();
-        }}
-      />
+      <div className="flex flex-col gap-2">
+        <Label>Display name</Label>
+        <Input
+          autoFocus
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder="Display name"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") save();
+            if (e.key === "Escape") onCancel();
+          }}
+        />
+      </div>
+      <div className="flex flex-col gap-2">
+        <Label>Context window override (tokens)</Label>
+        <p className="text-xs text-muted-foreground">
+          {detected
+            ? `Detected: ${detected.tokens.toLocaleString("en-US")} tokens (${
+                detected.source === "override"
+                  ? "your override"
+                  : detected.source === "catalog"
+                    ? "models.dev, this provider"
+                    : "models.dev, another provider"
+              }).`
+            : "Not detected — history and the context widget assume a 32,768-token window."}{" "}
+          Leave empty for auto, or enter the provider's documented window.
+        </p>
+        <Input
+          value={contextText}
+          onChange={(e) => {
+            setContextText(e.target.value);
+            setContextError(null);
+          }}
+          placeholder="e.g. 1048576"
+          inputMode="numeric"
+          onKeyDown={(e) => {
+            if (e.key === "Enter") save();
+            if (e.key === "Escape") onCancel();
+          }}
+        />
+        {contextError && (
+          <p className="text-xs text-destructive">{contextError}</p>
+        )}
+      </div>
       <div className="flex justify-end gap-2">
         <Button variant="outline" size="sm" onClick={onCancel}>
           Cancel
         </Button>
-        <Button size="sm" onClick={() => onSave(name)}>
+        <Button size="sm" onClick={save}>
           Save
         </Button>
       </div>

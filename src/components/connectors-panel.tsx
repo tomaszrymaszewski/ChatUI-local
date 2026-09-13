@@ -68,7 +68,7 @@ import {
 } from "@/lib/mcp-store";
 import { searchMcpRegistry, type RegistryServer } from "@/lib/mcp-registry";
 import {
-  MCP_CATALOG,
+  listCachedConnectors,
   MCP_CATEGORIES,
   type McpCatalogEntry,
   type McpCategory,
@@ -372,16 +372,17 @@ export function ConnectorsPanel({
 
   const filteredCatalog = useMemo(() => {
     const q = query.trim().toLowerCase();
-    return MCP_CATALOG.filter((e) => {
+    return listCachedConnectors().filter((e) => {
       if (category !== "All" && e.category !== category) return false;
       if (!q) return true;
       return (
         e.name.toLowerCase().includes(q) ||
         e.tagline.toLowerCase().includes(q) ||
-        e.category.toLowerCase().includes(q)
+        e.category.toLowerCase().includes(q) ||
+        (e.keywords ?? []).some((k) => k.toLowerCase().includes(q))
       );
     });
-  }, [query, category]);
+  }, [query, category, tick]);
 
   return (
     <div className="flex flex-col gap-4">

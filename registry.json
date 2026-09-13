@@ -1,0 +1,469 @@
+{
+  "version": 1,
+  "skills": [
+    {
+      "name": "pdf",
+      "title": "PDF Documents",
+      "description": "Create and edit polished PDF files — reports, forms, and handouts.",
+      "category": "Documents",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/pdf",
+      "keywords": ["pdf", "document", "report", "forms", "export", "print"]
+    },
+    {
+      "name": "docx",
+      "title": "Word Documents",
+      "description": "Create and edit Microsoft Word (.docx) files with proper formatting.",
+      "category": "Documents",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/docx",
+      "keywords": ["word", "docx", "document", "letter", "report", "office", "writing"]
+    },
+    {
+      "name": "xlsx",
+      "title": "Spreadsheets",
+      "description": "Create and edit Excel (.xlsx) spreadsheets with formulas and charts.",
+      "category": "Documents",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/xlsx",
+      "keywords": ["excel", "xlsx", "spreadsheet", "budget", "formulas", "data", "table", "finance"]
+    },
+    {
+      "name": "pptx",
+      "title": "Presentations",
+      "description": "Create and edit PowerPoint (.pptx) slide decks that look great.",
+      "category": "Documents",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/pptx",
+      "keywords": ["powerpoint", "pptx", "slides", "deck", "presentation", "pitch", "keynote"]
+    },
+    {
+      "name": "frontend-design",
+      "title": "Frontend Design",
+      "description": "Design beautiful, polished web interfaces with great taste.",
+      "category": "Design & Creative",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/frontend-design",
+      "keywords": ["ui", "ux", "web design", "landing page", "interface", "css", "tailwind", "beautiful"]
+    },
+    {
+      "name": "canvas-design",
+      "title": "Canvas Design",
+      "description": "Create visual designs and artwork on an HTML canvas.",
+      "category": "Design & Creative",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/canvas-design",
+      "keywords": ["canvas", "poster", "artwork", "graphic", "visual", "drawing"]
+    },
+    {
+      "name": "brand-guidelines",
+      "title": "Brand Guidelines",
+      "description": "Keep everything on-brand — colors, fonts, tone, and logo rules.",
+      "category": "Design & Creative",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/brand-guidelines",
+      "keywords": ["brand", "identity", "logo", "style guide", "colors", "typography", "tone of voice"]
+    },
+    {
+      "name": "theme-factory",
+      "title": "Theme Factory",
+      "description": "Build cohesive color themes and design systems for apps.",
+      "category": "Design & Creative",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/theme-factory",
+      "keywords": ["theme", "color palette", "design system", "dark mode", "tokens", "styling"]
+    },
+    {
+      "name": "algorithmic-art",
+      "title": "Algorithmic Art",
+      "description": "Generate generative art and creative visuals with code.",
+      "category": "Design & Creative",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/algorithmic-art",
+      "keywords": ["generative art", "creative coding", "patterns", "visualization", "p5", "shaders"]
+    },
+    {
+      "name": "internal-comms",
+      "title": "Internal Communications",
+      "description": "Write clear company updates, announcements, and team messages.",
+      "category": "Writing",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/internal-comms",
+      "keywords": ["announcement", "newsletter", "memo", "update", "all-hands", "team message", "email draft"]
+    },
+    {
+      "name": "doc-coauthoring",
+      "title": "Document Co-authoring",
+      "description": "Collaboratively draft and refine long-form documents.",
+      "category": "Writing",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/doc-coauthoring",
+      "keywords": ["draft", "edit document", "long-form", "whitepaper", "proposal", "writing feedback"]
+    },
+    {
+      "name": "webapp-testing",
+      "title": "Web App Testing",
+      "description": "Reliably test web apps with Playwright — clicks, forms, and flows.",
+      "category": "Coding",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/webapp-testing",
+      "keywords": ["playwright", "e2e", "testing", "browser automation", "qa", "test web app", "selenium"]
+    },
+    {
+      "name": "mcp-builder",
+      "title": "MCP Builder",
+      "description": "Build your own MCP servers to connect new apps to the AI.",
+      "category": "Coding",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/mcp-builder",
+      "keywords": ["mcp server", "model context protocol", "tools", "integration", "api server"]
+    },
+    {
+      "name": "web-artifacts-builder",
+      "title": "Web Artifacts",
+      "description": "Build interactive, self-contained web widgets and tools.",
+      "category": "Coding",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/web-artifacts-builder",
+      "keywords": ["widget", "interactive", "html app", "mini app", "single file", "demo"]
+    },
+    {
+      "name": "skill-creator",
+      "title": "Skill Creator",
+      "description": "Create your own custom skills to teach the AI new tasks.",
+      "category": "Coding",
+      "sourceLabel": "Official — Anthropic",
+      "repo": "anthropics/skills",
+      "dir": "skills/skill-creator",
+      "keywords": ["create skill", "custom skill", "author skill", "teach ai", "skill.md"]
+    },
+    {
+      "name": "react-best-practices",
+      "title": "React Best Practices",
+      "description": "Write modern React the way the Vercel team recommends.",
+      "category": "Coding",
+      "sourceLabel": "Official — Vercel",
+      "repo": "vercel-labs/agent-skills",
+      "dir": "skills/react-best-practices",
+      "keywords": ["react", "hooks", "next.js", "components", "state", "performance"]
+    },
+    {
+      "name": "web-design-guidelines",
+      "title": "Web Design Guidelines",
+      "description": "Follow proven rules for clean, usable web design.",
+      "category": "Coding",
+      "sourceLabel": "Official — Vercel",
+      "repo": "vercel-labs/agent-skills",
+      "dir": "skills/web-design-guidelines",
+      "keywords": ["web design", "usability", "accessibility", "layout", "typography", "wcag"]
+    },
+    {
+      "name": "supabase-postgres-best-practices",
+      "title": "Supabase & Postgres",
+      "description": "Use Supabase and Postgres the right way — schema, RLS, performance.",
+      "category": "Coding",
+      "sourceLabel": "Official — Supabase",
+      "repo": "supabase/agent-skills",
+      "dir": "skills/supabase-postgres-best-practices",
+      "keywords": ["supabase", "postgres", "sql", "row level security", "rls", "database schema", "migrations"]
+    },
+    {
+      "name": "brainstorming",
+      "title": "Brainstorming",
+      "description": "Explore ideas from fresh angles and solve problems creatively.",
+      "category": "Workflow",
+      "sourceLabel": "Community — obra/superpowers",
+      "repo": "obra/superpowers",
+      "dir": "skills/brainstorming",
+      "keywords": ["ideate", "ideas", "creative", "diverge", "options", "naming", "concepts"]
+    },
+    {
+      "name": "systematic-debugging",
+      "title": "Systematic Debugging",
+      "description": "Track down bugs methodically instead of guessing.",
+      "category": "Workflow",
+      "sourceLabel": "Community — obra/superpowers",
+      "repo": "obra/superpowers",
+      "dir": "skills/systematic-debugging",
+      "keywords": ["bug", "error", "broken", "fix", "root cause", "not working", "crash", "trace"]
+    },
+    {
+      "name": "test-driven-development",
+      "title": "Test-Driven Development",
+      "description": "Write tests first, then code — for reliable results.",
+      "category": "Workflow",
+      "sourceLabel": "Community — obra/superpowers",
+      "repo": "obra/superpowers",
+      "dir": "skills/test-driven-development",
+      "keywords": ["tdd", "unit tests", "red green", "pytest", "vitest", "jest", "coverage"]
+    },
+    {
+      "name": "code-review",
+      "title": "Code Review",
+      "description": "Review code for quality, bugs, and improvements.",
+      "category": "Workflow",
+      "sourceLabel": "Community — Matt Pocock",
+      "repo": "mattpocock/skills",
+      "dir": "skills/engineering/code-review",
+      "keywords": ["review", "pull request", "pr", "refactor feedback", "code quality", "audit"]
+    },
+    {
+      "name": "research",
+      "title": "Research",
+      "description": "Research topics online, cross-check facts, and cite sources.",
+      "category": "Workflow",
+      "sourceLabel": "Community — Matt Pocock",
+      "repo": "mattpocock/skills",
+      "dir": "skills/engineering/research",
+      "keywords": ["deep research", "sources", "citations", "fact check", "compare", "investigate", "literature"]
+    }
+  ],
+  "connectors": [
+    {
+      "id": "notion",
+      "name": "Notion",
+      "tagline": "Let the AI read, search, and update your Notion pages and databases.",
+      "category": "Productivity",
+      "vendor": "Notion",
+      "auth": "oauth",
+      "keywords": ["notion", "wiki", "notes", "docs", "pages", "databases"],
+      "install": { "type": "remote", "url": "https://mcp.notion.com/mcp" },
+      "registryName": "com.notion/mcp"
+    },
+    {
+      "id": "todoist",
+      "name": "Todoist",
+      "tagline": "Manage your to-do lists, tasks, and projects from your chats.",
+      "category": "Productivity",
+      "vendor": "Todoist",
+      "auth": "oauth",
+      "keywords": ["todoist", "todo", "tasks", "reminders", "shopping list"],
+      "install": { "type": "remote", "url": "https://ai.todoist.net/mcp" },
+      "registryName": "net.todoist/mcp"
+    },
+    {
+      "id": "linear",
+      "name": "Linear",
+      "tagline": "Create, search, and update issues in your Linear project tracker.",
+      "category": "Productivity",
+      "vendor": "Linear",
+      "auth": "oauth",
+      "keywords": ["linear", "issues", "bugs", "sprints", "project tracker", "tickets"],
+      "install": { "type": "remote", "url": "https://mcp.linear.app/mcp" },
+      "registryName": "app.linear/linear"
+    },
+    {
+      "id": "atlassian",
+      "name": "Jira & Confluence",
+      "tagline": "Work with Jira tickets and Confluence pages from your Atlassian cloud.",
+      "category": "Productivity",
+      "vendor": "Atlassian",
+      "auth": "oauth",
+      "keywords": ["jira", "confluence", "atlassian", "tickets", "issues", "wiki", "sprints"],
+      "install": { "type": "remote", "url": "https://mcp.atlassian.com/v1/mcp" },
+      "registryName": "com.atlassian/atlassian-mcp-server"
+    },
+    {
+      "id": "zapier",
+      "name": "Zapier",
+      "tagline": "Connect the AI to 9,000+ apps — including Gmail, Google Calendar, Google Docs, Drive, Outlook, Microsoft 365, and Slack — through your Zapier automations.",
+      "category": "Productivity",
+      "vendor": "Zapier",
+      "auth": "oauth",
+      "keywords": ["gmail", "google", "google calendar", "google docs", "drive", "sheets", "outlook", "office", "microsoft 365", "microsoft", "excel", "word", "teams", "slack", "email", "calendar"],
+      "install": { "type": "remote", "url": "https://mcp.zapier.com/api/v1/connect" },
+      "registryName": "com.zapier/mcp"
+    },
+    {
+      "id": "airtable",
+      "name": "Airtable",
+      "tagline": "Read and update records in your Airtable bases.",
+      "category": "Productivity",
+      "vendor": "Airtable",
+      "auth": "oauth",
+      "keywords": ["airtable", "bases", "records", "tables", "no-code database"],
+      "install": { "type": "remote", "url": "https://mcp.airtable.com/mcp" },
+      "registryName": "com.airtable/mcp"
+    },
+    {
+      "id": "figma",
+      "name": "Figma",
+      "tagline": "Pull design files and frames from Figma so the AI can build from them.",
+      "category": "Design",
+      "vendor": "Figma",
+      "auth": "oauth",
+      "keywords": ["figma", "design files", "frames", "mockups", "figma url"],
+      "install": { "type": "remote", "url": "https://mcp.figma.com/mcp" },
+      "registryName": "com.figma.mcp/mcp"
+    },
+    {
+      "id": "webflow",
+      "name": "Webflow",
+      "tagline": "Design and manage Webflow sites with AI assistance.",
+      "category": "Design",
+      "vendor": "Webflow",
+      "auth": "oauth",
+      "keywords": ["webflow", "website builder", "cms", "publish site"],
+      "install": { "type": "remote", "url": "https://mcp.webflow.com/mcp" },
+      "registryName": "com.webflow/mcp"
+    },
+    {
+      "id": "github",
+      "name": "GitHub",
+      "tagline": "Manage repos, issues, and pull requests on GitHub.",
+      "category": "Developer",
+      "vendor": "GitHub",
+      "auth": "oauth",
+      "keywords": ["github", "repos", "issues", "pull requests", "prs", "code review", "commits", "git"],
+      "install": { "type": "remote", "url": "https://api.githubcopilot.com/mcp/" }
+    },
+    {
+      "id": "vercel",
+      "name": "Vercel",
+      "tagline": "Inspect and manage your Vercel deployments and projects.",
+      "category": "Developer",
+      "vendor": "Vercel",
+      "auth": "oauth",
+      "keywords": ["vercel", "deployments", "hosting", "next.js deploy", "domains"],
+      "install": { "type": "remote", "url": "https://mcp.vercel.com" },
+      "registryName": "com.vercel/vercel-mcp"
+    },
+    {
+      "id": "cloudflare",
+      "name": "Cloudflare",
+      "tagline": "Manage Cloudflare services — DNS, Workers, KV, R2, and more.",
+      "category": "Developer",
+      "vendor": "Cloudflare",
+      "auth": "oauth",
+      "keywords": ["cloudflare", "dns", "workers", "kv", "r2", "pages", "zones", "cdn"],
+      "install": { "type": "remote", "url": "https://bindings.mcp.cloudflare.com/mcp" },
+      "registryName": "com.cloudflare.mcp/mcp"
+    },
+    {
+      "id": "cloudflare-docs",
+      "name": "Cloudflare Docs",
+      "tagline": "Search Cloudflare's official documentation — free, no sign-in needed.",
+      "category": "Search & Research",
+      "vendor": "Cloudflare",
+      "auth": "none",
+      "keywords": ["cloudflare docs", "workers documentation", "how to cloudflare"],
+      "install": { "type": "remote", "url": "https://docs.mcp.cloudflare.com/mcp" }
+    },
+    {
+      "id": "postman",
+      "name": "Postman",
+      "tagline": "Run and explore your Postman API collections from chat.",
+      "category": "Developer",
+      "vendor": "Postman",
+      "auth": "oauth",
+      "keywords": ["postman", "api collections", "http requests", "api testing"],
+      "install": { "type": "remote", "url": "https://mcp.postman.com/mcp" },
+      "registryName": "com.postman/postman-mcp-server"
+    },
+    {
+      "id": "supabase",
+      "name": "Supabase",
+      "tagline": "Run SQL, manage migrations, and work with your Supabase project.",
+      "category": "Data & AI",
+      "vendor": "Supabase",
+      "auth": "oauth",
+      "keywords": ["supabase", "postgres", "sql", "migrations", "auth users", "storage buckets", "edge functions"],
+      "install": { "type": "remote", "url": "https://mcp.supabase.com/mcp" },
+      "registryName": "com.supabase/mcp"
+    },
+    {
+      "id": "prisma",
+      "name": "Prisma Postgres",
+      "tagline": "Manage Prisma Postgres databases and run migrations.",
+      "category": "Data & AI",
+      "vendor": "Prisma",
+      "auth": "oauth",
+      "keywords": ["prisma", "postgres", "orm", "schema", "migrations"],
+      "install": { "type": "remote", "url": "https://mcp.prisma.io/sse" },
+      "registryName": "io.prisma/mcp"
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "tagline": "Browse models, datasets, and AI apps on the Hugging Face Hub.",
+      "category": "Data & AI",
+      "vendor": "Hugging Face",
+      "auth": "oauth",
+      "keywords": ["hugging face", "models", "datasets", "spaces", "ml", "ai hub"],
+      "install": { "type": "remote", "url": "https://huggingface.co/mcp" },
+      "registryName": "co.huggingface/hf-mcp-server"
+    },
+    {
+      "id": "stripe",
+      "name": "Stripe",
+      "tagline": "Look up customers, charges, and subscriptions in your Stripe account.",
+      "category": "Business",
+      "vendor": "Stripe",
+      "auth": "oauth",
+      "keywords": ["stripe", "payments", "customers", "subscriptions", "invoices", "billing"],
+      "install": { "type": "remote", "url": "https://mcp.stripe.com" },
+      "registryName": "com.stripe/mcp"
+    },
+    {
+      "id": "paypal",
+      "name": "PayPal",
+      "tagline": "Access PayPal orders, payments, and account info.",
+      "category": "Business",
+      "vendor": "PayPal",
+      "auth": "oauth",
+      "keywords": ["paypal", "payments", "orders", "transactions"],
+      "install": { "type": "remote", "url": "https://mcp.paypal.com/mcp" },
+      "registryName": "com.paypal.mcp/mcp"
+    },
+    {
+      "id": "exa",
+      "name": "Exa",
+      "tagline": "Smart web search and crawling to find and read the best sources.",
+      "category": "Search & Research",
+      "vendor": "Exa",
+      "auth": "apikey",
+      "envKeys": ["EXA_API_KEY"],
+      "apiKeyHeader": "x-api-key",
+      "keywords": ["web search", "crawl", "similar pages", "find links", "semantic search"],
+      "install": { "type": "remote", "url": "https://mcp.exa.ai/mcp" },
+      "registryName": "ai.exa/exa"
+    },
+    {
+      "id": "microsoft-learn",
+      "name": "Microsoft Learn",
+      "tagline": "Search official Microsoft documentation — free, no sign-in needed.",
+      "category": "Search & Research",
+      "vendor": "Microsoft",
+      "auth": "none",
+      "keywords": ["microsoft docs", "azure docs", "dotnet", "c#", "typescript docs", "microsoft learn"],
+      "install": { "type": "remote", "url": "https://learn.microsoft.com/api/mcp" },
+      "registryName": "com.microsoft/microsoft-learn-mcp"
+    },
+    {
+      "id": "playwright-browser",
+      "name": "Browser (Playwright)",
+      "tagline": "Let the AI browse in a real browser — read JavaScript-heavy pages, follow links, click, and fill forms. Runs locally on your machine.",
+      "category": "Search & Research",
+      "vendor": "Microsoft",
+      "auth": "none",
+      "corsFree": true,
+      "keywords": ["browser", "web browsing", "headless", "playwright", "chrome", "navigate", "click", "scrape", "webpage", "javascript-rendered", "registry"],
+      "install": { "type": "remote", "url": "http://localhost:8931/mcp" },
+      "registryName": "io.github.microsoft/playwright-mcp"
+    }
+  ]
+}

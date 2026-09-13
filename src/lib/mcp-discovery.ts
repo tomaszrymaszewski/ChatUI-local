@@ -3,7 +3,7 @@
 // embeds these so the vector DB matches user requests against what each
 // connector can actually do (e.g. "create a jira ticket" → Atlassian).
 
-import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { listAllConnectors } from "@/lib/mcp-catalog";
 import { getAccessToken } from "@/lib/mcp-auth";
 import { loadMcpServers } from "@/lib/mcp-store";
 import {
@@ -76,7 +76,8 @@ async function mapWithConcurrency<T, R>(
  */
 export async function getConnectorToolInfo(): Promise<Record<string, RemoteToolSummary[]>> {
   const cache = readCache();
-  const remote = MCP_CATALOG.filter(
+  const catalog = await listAllConnectors();
+  const remote = catalog.filter(
     (entry): entry is typeof entry & { install: { type: "remote"; url: string } } =>
       entry.install.type === "remote",
   );

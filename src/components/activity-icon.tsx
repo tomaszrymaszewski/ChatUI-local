@@ -1,5 +1,6 @@
 import {
   Bot,
+  Archive,
   BookOpen,
   Calendar,
   CalendarClock,
@@ -85,6 +86,7 @@ function toolIcon(name: string) {
     case "search_knowledge": return BookOpen;
     case "read_local_file": return FileInput;
     case "write_local_file": return FilePen;
+    case "compact_context": return Archive;
     case "create_agent": return Bot;
     case "update_agent": return UserCog;
     case "write_todos":

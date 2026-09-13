@@ -42,21 +42,59 @@ export function hitLabel(hit: KnowledgeHit): string {
   }
 }
 
-/** Format auto-injected retrieval — one compact line per hit. */
+/** Hint appended to catalog-only skill hits (not installed on disk yet). */
+function skillHitHint(hit: KnowledgeHit): string {
+  if (hit.sourceType !== "skill" && hit.sourceType !== "skill_doc") return "";
+  const kind = hit.extra?.kind;
+  if (kind === "installed" || kind === "bundled") {
+    return ` Full instructions: read_file /skills/${hit.sourceRef}/SKILL.md.`;
+  }
+  return ` Not installed yet — call search_skills("${hit.sourceRef}") to install it on the spot and load its full instructions.`;
+}
+
+/** Format auto-injected retrieval — skills/connectors first, then user data. */
 export function buildKnowledgeBlock(hits: KnowledgeHit[], maxChars = 3000): string {
   if (hits.length === 0) return "";
-  const lines: string[] = [];
+  const sections: string[] = [];
   let used = 0;
-  for (const hit of hits) {
-    const snippet = hit.text.replace(/\s+/g, " ").trim();
-    const clipped = snippet.length > 600 ? `${snippet.slice(0, 600)}…` : snippet;
-    const line = `- ${hitLabel(hit)}: ${clipped}`;
-    if (used + line.length > maxChars) break;
-    lines.push(line);
-    used += line.length;
+
+  // Skills and connectors get their own section with actionable guidance —
+  // they are always-on discovery surfaces, distinct from the user's data.
+  const capabilityHits = hits.filter(
+    (h) => h.sourceType === "skill" || h.sourceType === "skill_doc" || h.sourceType === "connector",
+  );
+  if (capabilityHits.length > 0) {
+    const lines: string[] = [];
+    for (const hit of capabilityHits) {
+      const snippet = hit.text.replace(/\s+/g, " ").trim();
+      const clipped = snippet.length > 400 ? `${snippet.slice(0, 400)}…` : snippet;
+      const line = `- ${hitLabel(hit)}: ${clipped}${skillHitHint(hit)}`;
+      if (used + line.length > maxChars) break;
+      lines.push(line);
+      used += line.length;
+    }
+    if (lines.length > 0) {
+      sections.push(`Relevant skills & connectors (most similar first):\n${lines.join("\n")}`);
+    }
   }
-  if (lines.length === 0) return "";
-  return `Relevant knowledge from the user's library (most similar first):\n${lines.join("\n")}`;
+
+  const dataHits = hits.filter((h) => !capabilityHits.includes(h));
+  if (dataHits.length > 0) {
+    const lines: string[] = [];
+    for (const hit of dataHits) {
+      const snippet = hit.text.replace(/\s+/g, " ").trim();
+      const clipped = snippet.length > 600 ? `${snippet.slice(0, 600)}…` : snippet;
+      const line = `- ${hitLabel(hit)}: ${clipped}`;
+      if (used + line.length > maxChars) break;
+      lines.push(line);
+      used += line.length;
+    }
+    if (lines.length > 0) {
+      sections.push(`Relevant knowledge from the user's library (most similar first):\n${lines.join("\n")}`);
+    }
+  }
+
+  return sections.join("\n\n");
 }
 
 /** Numbered results for the agent tool — keeps hit ids so the agent can

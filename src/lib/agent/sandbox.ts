@@ -29,7 +29,7 @@ function isTauri(): boolean {
 let homeDirPromise: Promise<string | null> | null = null;
 
 /** Home dir via the Rust shell (cached); null outside Tauri/tests. */
-function homeDir(): Promise<string | null> {
+export function homeDir(): Promise<string | null> {
   if (!isTauri()) return Promise.resolve(null);
   homeDirPromise ??= invoke<string>("get_home_dir").catch(() => null);
   return homeDirPromise;
@@ -125,8 +125,8 @@ export function isSessionReadable(
 }
 
 /**
- * The agent's private, persistent workspace folder under
- * ~/Documents/chatUI/agents/<agentId>. Ensured on demand (created when the
+ * The agent's private, persistent workspace folder under the app's data
+ * directory (<base>/agents/<agentId>). Ensured on demand (created when the
  * agent is first saved or starts its first session). Returns undefined when
  * the filesystem is unavailable (browser dev / tests).
  */
@@ -153,6 +153,26 @@ export async function ensureAgentWorkspace(
   }
 }
 
+/**
+ * The app's data base directory (read-only — creates nothing), or null
+ * outside Tauri/tests. Unlike ensureAgentWorkspace this is safe to call for
+ * display purposes.
+ */
+export async function chatUiBaseDir(): Promise<string | null> {
+  if (!isTauri()) return null;
+  try {
+    return await invoke<string>("get_chat_ui_base_dir");
+  } catch {
+    return null;
+  }
+}
+
+/** Display form of an absolute path: the user's home replaced with `~`. */
+export function displayHomePath(path: string): string {
+  const m = path.match(/^\/Users\/[^/]+/);
+  return m ? `~${path.slice(m[0].length)}` : path;
+}
+
 /** Best-effort workspace cleanup when an agent is deleted. */
 export async function removeAgentWorkspace(agentId: string): Promise<void> {
   if (!isTauri()) return;
@@ -165,4 +185,41 @@ export async function removeAgentWorkspace(agentId: string): Promise<void> {
   } catch {
     // best-effort only
   }
+}
+
+/**
+ * True when `path` is inside the legacy ~/Documents/chatUI base. Used by the
+ * one-time remap of stored absolute paths (sandbox allowlists) after the
+ * data move.
+ */
+export function isLegacyChatUiPath(path: string, home?: string | null): boolean {
+  return remapLegacyChatUiPath(path, home, "") !== path;
+}
+
+const LEGACY_BASE_PREFIX = "~/documents/chatui";
+
+/**
+ * Rewrite paths pointing into the legacy ~/Documents/chatUI base to the new
+ * app-data base. Used for one-time migration of stored settings (agent
+ * sandbox allowlists) across the data move; untouched otherwise. Accepts
+ * both `~/…`-prefixed and absolute legacy forms.
+ */
+export function remapLegacyChatUiPath(
+  path: string,
+  home: string | null | undefined,
+  newBase: string,
+): string {
+  const normalized = normalizePath(path, home);
+  const lower = normalized.toLowerCase();
+  const prefixes = [LEGACY_BASE_PREFIX];
+  if (home) {
+    prefixes.push(`${normalizePath(home, null).toLowerCase()}/documents/chatui`);
+  }
+  for (const prefix of prefixes) {
+    if (lower === prefix) return newBase;
+    if (lower.startsWith(`${prefix}/`)) {
+      return `${newBase}${normalized.slice(prefix.length)}`;
+    }
+  }
+  return path;
 }

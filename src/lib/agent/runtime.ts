@@ -1,5 +1,9 @@
 import { createDeepAgent, registerHarnessProfile, type DeepAgent } from "deepagents";
-import { todoListMiddleware } from "langchain";
+import {
+  countTokensApproximately,
+  summarizationMiddleware,
+  todoListMiddleware,
+} from "langchain";
 import { MemorySaver } from "@langchain/langgraph";
 import type { Provider, ReasoningEffort } from "@/types";
 import type { ContentPart } from "@/lib/llm";
@@ -8,13 +12,15 @@ import { buildSystemPrompt } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
 import { buildAgentTools, type ToolProfile } from "@/lib/agent/tools";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
-import { loadMcpTools, type McpToolsResult } from "@/lib/agent/mcp";
+import { loadMcpTools, createMcpProxy, type McpProxy, type McpToolsResult } from "@/lib/agent/mcp";
 import { loadSkillFiles, type SkillFile } from "@/lib/agent/skills";
 import type { RunContext } from "@/lib/agent/run-context";
 import {
+  resolveCompactionThreshold,
   resolveHistoryBudget,
   truncateMessagesToBudget,
 } from "@/lib/agent/history";
+import { compactionNoticeMiddleware } from "@/lib/agent/compaction";
 import type {
   ActivityItem,
   AgentEvent,
@@ -22,6 +28,7 @@ import type {
   ReasoningStream,
   StructuredInputRequest,
   TodoItem,
+  TokenUsage,
 } from "@/lib/agent/types";
 import {
   compressHistoryMessages,
@@ -38,6 +45,12 @@ import { subagentErrorCaptureMiddleware } from "@/lib/agent/subagent-error-captu
  * be bypassed. Registration merges (set union) with the library's own
  * profiles; our models are all ChatOpenAI instances (hint "openai"), the
  * other hints are covered for safety.
+ *
+ * read_file is the exception: deepagents force-re-adds it (it is required by
+ * the skills middleware's read-on-demand flow) and StateBackend reads are
+ * virtual-only — skills and run state, never the user's disk. The model is
+ * told to use it for /skills/<name>/SKILL.md; read_local_file additionally
+ * maps /skills/ paths onto the real skills folder as a fallback.
  */
 const HIDDEN_BUILTIN_FILESYSTEM_TOOLS = [
   "ls",
@@ -98,6 +111,8 @@ export interface AgentSessionOptions {
   mcpNames?: string[];
   /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
   sandbox?: AgentSandbox;
+  /** This run's deliverables folder — run_python's default cwd; files here are shareable. */
+  deliverablesDir?: string;
 }
 
 const CORE_BEHAVIOR_PROMPT = `
@@ -120,17 +135,29 @@ You can generate rich content inline in your markdown replies:
 Side panel artifacts:
 - For substantial code (python, html, jsx/react, javascript) or long markdown documents
   (research briefs, reports, plans), call create_artifact with the full content so the user
-  gets an editable, runnable copy in the side panel. Do NOT repeat the content in your reply —
+  gets an editable, runnable copy in the side panel. Do NOT repeat the artifact content in your reply —
   instead write a brief 1-2 sentence summary of what you created and mention the user can
   view, edit, and download it.
+- Artifact content counts against your output token limit — a single oversized create_artifact call can
+  be cut off mid-call. Keep each artifact within what one response can reliably produce; if a call was
+  cut off, continue with the remaining content as a follow-up artifact titled "… (continued)" instead of
+  re-issuing the same oversized call.
 
 Other tools:
+- Skills live in your virtual filesystem at /skills/<name>/SKILL.md. Read them with read_file on the
+  exact path from the skill list (limit=1000). They are NOT real disk paths — shell commands (cat)
+  will not find them; read_local_file understands /skills/ paths too. Each skill's real folder on
+  disk is stated in a "Disk location" note at the top of its SKILL.md — run its scripts and read
+  its supporting files from there (run_python / run_command). Only recently used skills are listed;
+  if a skill you expect is missing from the list, call search_skills — it sees the full library.
 - When you need specific structured parameters from the user (research topic and depth, a code
   task spec, document requirements), call request_structured_input with a short form instead of
   asking in prose.
 - You can run Python on the user's machine with run_python to execute or verify code.
-- You can run Node.js on the user's machine with run_node (CommonJS; skill libraries like
-  pptxgenjs are preinstalled) — use it for skill scripts that need Node.
+- You can run Node.js on the user's machine with run_node (CommonJS) — only for the rare skill script
+  that genuinely needs Node. For creating Office documents (Word, PowerPoint, Excel), use the skills'
+  Python workflow with run_python (python-docx, python-pptx, openpyxl): it is much faster and needs no
+  package downloads. Never use the skills' npm/Node creation paths (docx-js, pptxgenjs).
 - Files you create on disk (a .pptx built with python-pptx, a report, a dataset, an image) are
   invisible to the user until you share them: call share_files with the absolute paths and a
   download card is attached to your message. Never say a file is "ready to download" without
@@ -151,19 +178,19 @@ Chat modes — the user can activate special modes by starting their message wit
 You can also suggest a mode to the user via the suggest tool when their request would clearly benefit from one.
 
 Skills and connectors — proactive discovery:
-- Installed skills are listed in the Skills System section above. Every catalog skill is
-  auto-installed at launch, so when the user's task might benefit from a capability
-  (creating Word/Excel/PPT/PDF files, frontend design, testing, etc.), call search_skills
-  to find the matching skill and use it directly — do not ask the user to download
-  anything. Only if a matching skill somehow shows as NOT installed (launch download
-  still running or failed), call suggest with kind=skill to show an install card.
+- Every catalog skill is discoverable and installs on demand — the user never downloads anything.
+  When the user's task might benefit from a capability (creating Word/Excel/PPT/PDF files, frontend
+  design, testing, etc.), call search_skills to find the matching skill and use it directly. If the
+  best match is NOT installed yet, search_skills installs it on the spot and returns its SKILL.md —
+  follow it in this run. Only if that install fails, call suggest with kind=skill to show an install card.
 - Similarly, when the user wants to interact with an external app (email, calendar, docs, project
-  tracker, etc.) and no matching connector is connected, call search_connectors to find one. If a
-  match is found and not connected, call suggest with kind=connector — the card lets the user
-  connect and sign in with one click. Connectors that surface in the "Relevant knowledge" context
-  but aren't connected yet work the same way. For Google Workspace (Gmail,
-  Google Calendar, Google Docs, Drive) and Microsoft 365 (Outlook, Excel, Word), the Zapier
-  connector covers all of them — search for "gmail", "office", or "google" to find it.
+  tracker, etc.), call search_connectors to find one. Connectors that are connected or need no
+  sign-in are usable IMMEDIATELY: list their tools with list_mcp_tools, call them with call_mcp_tool —
+  in this run, no restart needed. For a connector that needs sign-in, call suggest with kind=connector
+  — the card lets the user connect and sign in with one click, and afterwards call_mcp_tool works in
+  the same run. Connectors that surface in the "Relevant knowledge" context work the same way. For
+  Google Workspace (Gmail, Google Calendar, Google Docs, Drive) and Microsoft 365 (Outlook, Excel,
+  Word), the Zapier connector covers all of them — search for "gmail", "office", or "google" to find it.
 - Never suggest something that is already installed or connected (the search results show status).
 - After calling suggest, continue your reply naturally — the card is shown to the user automatically.
 
@@ -184,14 +211,13 @@ Working style:
 - Spawn subagents with the task tool for independent research or verification work — in parallel
   when the steps don't depend on each other — and synthesize their reports.
 - Use web_search / web_fetch for anything current or external. Read installed skills under
-  /skills/ when a task matches one — catalog skills are auto-installed at launch, so use them
-  directly instead of asking the user to download anything.
-- When a task would benefit from a connector the user doesn't have yet, find it with
-  search_connectors and propose it with the suggest tool. Connectors surfaced in
-  the "Relevant knowledge" context that aren't connected yet can be proposed the same way — the
-  suggestion card lets the user connect and sign in with one click. (Only a skill that failed to
-  auto-install is worth a kind=skill suggestion.)
-- Connected external apps are available as mcp__… tools.
+  /skills/ when a task matches one; search_skills finds the whole catalog and installs a
+  matching skill on the spot — use it instead of asking the user to download anything.
+- Connectors (external apps) work the same way: search_connectors finds them, connected or
+  auth-free ones are usable immediately via list_mcp_tools + call_mcp_tool in this run, and a
+  connector needing sign-in gets a suggest kind=connector card — after the user connects,
+  call_mcp_tool works in the same run. The most recently used connectors also expose native
+  mcp__… tools.
 - Be transparent: say what you are about to do, and report what you did.
 `.trim();
 
@@ -219,8 +245,11 @@ Local files:
 - read_local_file reads a file from the user's Mac — text files directly, PDFs as extracted text, and a
   folder path as a listing. Use it whenever the user points you at a local document or folder
   (e.g. a report, paper, or project directory).
-- write_local_file creates or overwrites a file with the full content. When editing an existing file,
-  read it first, then write the complete new content.
+- write_local_file creates or overwrites a file with the full content. With append=true it adds the
+  content to the END of the existing file instead. A single oversized write can be cut off mid-call by
+  the output token limit — for files longer than roughly 400 lines, write in chunks: first call with the
+  initial portion, then subsequent calls with append=true. When editing an existing file, read it first,
+  then write the complete new content.
 - share_files gives the user download buttons for files you created — any file deliverable
   (deck, document, dataset, image, zip) must be shared this way before you wrap up, or the user
   cannot get it out of your workspace.
@@ -326,6 +355,14 @@ function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
     if (base) parts.push(base);
   }
   parts.push(RICH_FORMAT_PROMPT);
+  if (opts.deliverablesDir) {
+    parts.push(
+      `Deliverables folder: ${opts.deliverablesDir}\n` +
+        `run_python and run_node run in this folder by default. Save every file the user should ` +
+        `receive there (use absolute paths when saving), then call share_files with the absolute ` +
+        `path so a download card appears in the chat.`,
+    );
+  }
   if (opts.toolProfile !== "task") parts.push(SUGGESTIONS_PROMPT);
   return parts.join("\n\n");
 }
@@ -363,6 +400,12 @@ function toLangChainMessages(
 export interface StreamOutcome {
   interrupted: boolean;
   inputRequest?: StructuredInputRequest;
+  /**
+   * finish_reason of the last assembled model message in this stream.
+   * "length" means the model hit its output token limit — the turn (possibly
+   * mid tool call) was cut off and the caller should continue the thread.
+   */
+  finishReason?: string;
 }
 
 const BUILTIN_SKILL_CONTENT = `---
@@ -403,10 +446,40 @@ function withBuiltinSkill(
   };
 }
 
+/** Final path segment of a POSIX-ish path (works for ~/… and absolute paths). */
+function basename(path: string): string {
+  return path.split("/").filter(Boolean).pop() ?? path;
+}
+
+/**
+ * Provider-reported token counts of an assembled model message
+ * (AIMessage.usage_metadata). Null when the message carries none — providers
+ * that omit usage in streaming simply report nothing. Exported for tests and
+ * the research/council pipelines, which consume the same v3 message stream.
+ */
+export function usageOfMessage(finalMessage: unknown): TokenUsage | null {
+  const meta = (
+    finalMessage as { usage_metadata?: { input_tokens?: unknown; output_tokens?: unknown; input_token_details?: { cache_read?: unknown } } } | undefined
+  )?.usage_metadata;
+  if (!meta) return null;
+  const input = Number(meta.input_tokens);
+  const output = Number(meta.output_tokens);
+  if (!Number.isFinite(input) || !Number.isFinite(output) || (input <= 0 && output <= 0)) {
+    return null;
+  }
+  const cached = Number(meta.input_token_details?.cache_read);
+  return {
+    inputTokens: input,
+    cachedTokens: Number.isFinite(cached) && cached > 0 ? cached : 0,
+    outputTokens: output,
+  };
+}
+
 /**
  * Derive a short label for an inline activity chip from the tool name + args.
+ * Exported for tests.
  */
-function toolCallLabel(name: string, input: unknown): string | undefined {
+export function toolCallLabel(name: string, input: unknown): string | undefined {
   if (!input || typeof input !== "object") return undefined;
   const args = input as Record<string, unknown>;
   if (name === "web_search" && typeof args.query === "string") {
@@ -425,7 +498,67 @@ function toolCallLabel(name: string, input: unknown): string | undefined {
   if (name === "create_artifact" && typeof args.title === "string") {
     return `Creating "${args.title.slice(0, 40)}"`;
   }
+  if (name === "write_local_file" && typeof args.path === "string") {
+    return `Writing ${basename(args.path)}`;
+  }
+  if (name === "read_local_file" && typeof args.path === "string") {
+    return `Reading ${basename(args.path)}`;
+  }
   return undefined;
+}
+
+/**
+ * Argument caps for the per-chip preview: enough of a file write / artifact /
+ * script to see what the agent is doing, small enough that persisting one per
+ * tool call never bloats message storage (localStorage) meaningfully.
+ */
+const ARGS_PREVIEW_CHARS = 4000;
+const ARGS_PREVIEW_COMMAND_CHARS = 2000;
+const ARGS_PREVIEW_JSON_CHARS = 500;
+
+function clipPreview(text: string, limit = ARGS_PREVIEW_CHARS): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n… truncated (${text.length} chars total)`;
+}
+
+/**
+ * Bounded, human-readable preview of a tool call's arguments for the
+ * expandable activity chip — e.g. the file path plus the head of the content
+ * being written. Exported for tests. Returns undefined when there is nothing
+ * worth showing (no input, or stringify failed).
+ */
+export function toolCallArgsPreview(name: string, input: unknown): string | undefined {
+  if (!input || typeof input !== "object") return undefined;
+  const args = input as Record<string, unknown>;
+  if (name === "write_local_file") {
+    if (typeof args.path !== "string") return undefined;
+    const content = typeof args.content === "string" ? args.content : "";
+    const header = `${args.path}${args.append === true ? " (append)" : ""}`;
+    return `${header}\n\n${clipPreview(content)}`;
+  }
+  if (name === "create_artifact") {
+    const title = typeof args.title === "string" ? args.title : "artifact";
+    const language = typeof args.language === "string" ? args.language : "";
+    const content = typeof args.content === "string" ? args.content : "";
+    return `${title} (${language})\n\n${clipPreview(content)}`;
+  }
+  if (name === "run_python" || name === "run_node") {
+    return typeof args.code === "string" ? clipPreview(args.code) : undefined;
+  }
+  if (name === "run_command") {
+    return typeof args.command === "string" ? clipPreview(args.command, ARGS_PREVIEW_COMMAND_CHARS) : undefined;
+  }
+  if (name === "read_local_file") {
+    return typeof args.path === "string" ? args.path : undefined;
+  }
+  // Fallback (MCP tools, suggest, schedules, …): compact JSON, tightly capped.
+  try {
+    const json = JSON.stringify(input);
+    if (json.length <= ARGS_PREVIEW_JSON_CHARS) return json;
+    return `${json.slice(0, ARGS_PREVIEW_JSON_CHARS)}…`;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -441,12 +574,16 @@ export class DeepAgentSession {
     private historyBudget: number,
     private modelName: string,
     private mcp: McpToolsResult,
+    private mcpProxy: McpProxy | null,
     private runCtx: { current: RunContext | null } = { current: null },
   ) {}
 
   static async create(opts: AgentSessionOptions): Promise<DeepAgentSession> {
     const model = await createChatModel(opts.provider, opts.modelName, opts.reasoningEffort);
     const mcp = await loadMcpTools(opts.projectDir, opts.mcpNames);
+    // On-demand proxy for the non-hot connectors — including ones connected
+    // mid-run from a suggestion card (usable in the SAME run).
+    const mcpProxy = createMcpProxy(opts.projectDir, opts.mcpNames);
     let skillFiles = await loadSkillFiles(opts.projectDir);
     if (opts.skillNames) {
       // Sandboxed agents only see the skills chosen at setup time.
@@ -460,6 +597,7 @@ export class DeepAgentSession {
     }
     skillFiles = withBuiltinSkill(skillFiles);
     const historyBudget = await resolveHistoryBudget(opts.provider, opts.modelName);
+    const compactionTokens = await resolveCompactionThreshold(opts.provider, opts.modelName);
 
     const runCtx: { current: RunContext | null } = { current: null };
     const profile = opts.toolProfile ?? "chat";
@@ -469,6 +607,7 @@ export class DeepAgentSession {
       profile,
       opts.enableFileTools ?? false,
       opts.sandbox,
+      opts.deliverablesDir,
     );
     if (profile === "task" && opts.enableCommandTools === false) {
       tools = tools.filter((t) => t.name !== "run_command" && t.name !== "run_coding_task");
@@ -476,10 +615,26 @@ export class DeepAgentSession {
 
     const agent = await createDeepAgent({
       model,
-      tools: [...tools, ...mcp.tools],
+      tools: [...tools, ...mcp.tools, ...(mcpProxy?.tools ?? [])],
       systemPrompt: buildAgentSystemPrompt(opts),
       middleware: [
         todoListMiddleware(),
+        // Runs before the summarizer (beforeModel hooks chain in middleware
+        // order) so it sees the pre-compaction state and can announce the
+        // compaction as an activity chip.
+        compactionNoticeMiddleware(compactionTokens, () => runCtx.current),
+        summarizationMiddleware({
+          model,
+          // Absolute token counts only — fractional triggers require a model
+          // profile that our custom-baseURL ChatOpenAI instances don't have
+          // (the middleware throws without one).
+          trigger: { tokens: compactionTokens },
+          keep: { tokens: Math.max(2048, Math.floor(compactionTokens / 2)) },
+          // Wrapped: the middleware's TokenCounter takes rest args, and
+          // countTokensApproximately's optional second (tools) parameter
+          // doesn't widen to that signature directly.
+          tokenCounter: (messages) => countTokensApproximately(messages),
+        }),
         toolCompressionMiddleware(opts.modelName),
         emptyResponseGuardMiddleware(),
         // Subagent (task tool) failures become tool results instead of
@@ -492,12 +647,13 @@ export class DeepAgentSession {
       name: profile === "chat" ? "chatui-assistant" : `chatui-${profile}`,
     });
 
-    return new DeepAgentSession(agent, crypto.randomUUID(), skillFiles, historyBudget, opts.modelName, mcp, runCtx);
+    return new DeepAgentSession(agent, crypto.randomUUID(), skillFiles, historyBudget, opts.modelName, mcp, mcpProxy, runCtx);
   }
 
   /** Close MCP clients opened for this session. */
   async dispose(): Promise<void> {
     await this.mcp.dispose();
+    await this.mcpProxy?.dispose();
   }
 
   async firstInput(messages: AgentMessage[]): Promise<Record<string, unknown>> {
@@ -526,6 +682,11 @@ export class DeepAgentSession {
         signal,
       });
 
+      // finish_reason of the most recent assembled model message — "length"
+      // means the turn was cut off by the output token limit (possibly mid
+      // tool call), which the caller can continue from.
+      let lastFinishReason: string | undefined;
+
       const consumeMessages = (async () => {
         for await (const msg of run.messages) {
           await Promise.all([
@@ -540,6 +701,20 @@ export class DeepAgentSession {
               }
             })(),
           ]);
+          try {
+            // Same pattern as deep-research.ts: the assembled message's
+            // response_metadata carries the provider's finish_reason.
+            const final = await (msg as { output?: unknown }).output;
+            const reason = (final as { response_metadata?: { finish_reason?: unknown } })
+              ?.response_metadata?.finish_reason;
+            if (typeof reason === "string") lastFinishReason = reason;
+            // Usage rides on the same assembled message — one event per model
+            // call feeds the session's context-usage widget.
+            const usage = usageOfMessage(final);
+            if (usage) emit({ type: "usage", usage });
+          } catch {
+            // no assembled message (e.g. aborted mid-stream)
+          }
         }
       })();
 
@@ -547,6 +722,7 @@ export class DeepAgentSession {
         for await (const call of run.toolCalls) {
           const id = `tool-${call.callId || call.name}-${Date.now()}`;
           const label = toolCallLabel(call.name, call.input);
+          const argsPreview = toolCallArgsPreview(call.name, call.input);
           // Visited websites carry their url so the UI can show a favicon.
           const input = call.input as Record<string, unknown> | undefined;
           const url =
@@ -562,6 +738,7 @@ export class DeepAgentSession {
               status: "running",
               label,
               url,
+              argsPreview,
             },
           });
           void call.status.then(async (status: "running" | "finished" | "error") => {
@@ -576,6 +753,21 @@ export class DeepAgentSession {
             } else {
               detail = await call.error.catch(() => undefined);
             }
+            // A completed write_local_file names the file it produced —
+            // remember it so the session files widget can offer a download.
+            let file: ActivityItem["file"];
+            if (
+              status === "finished" &&
+              call.name === "write_local_file" &&
+              typeof input?.path === "string"
+            ) {
+              const bytesMatch = detail ? /\((\d+) bytes\)/.exec(detail) : null;
+              file = {
+                path: input.path,
+                name: basename(input.path),
+                ...(bytesMatch ? { bytes: Number(bytesMatch[1]) } : {}),
+              };
+            }
             emit({
               type: "activity",
               activity: {
@@ -586,6 +778,8 @@ export class DeepAgentSession {
                 detail,
                 label,
                 url,
+                argsPreview,
+                ...(file ? { file } : {}),
               },
             });
           });
@@ -651,7 +845,7 @@ export class DeepAgentSession {
         throw streamError;
       }
 
-      return { interrupted: false };
+      return { interrupted: false, finishReason: lastFinishReason };
     } finally {
       this.runCtx.current = null;
     }

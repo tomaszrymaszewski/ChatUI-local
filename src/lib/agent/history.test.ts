@@ -4,6 +4,7 @@ import {
   buildRunThoughts,
   estimateMessageTokens,
   MAX_HISTORY_TOKENS,
+  resolveCompactionThreshold,
   resolveHistoryBudget,
   toHistoryMessage,
   truncateMessagesToBudget,
@@ -310,6 +311,43 @@ describe("resolveHistoryBudget", () => {
     mockedContextWindow.mockRejectedValueOnce(new Error("offline"));
     await expect(resolveHistoryBudget(provider("https://api.example.com"), "x")).resolves.toBe(
       32768 - 16384,
+    );
+  });
+});
+
+describe("resolveCompactionThreshold", () => {
+  it("uses a window fraction, not the history budget's hard reserve subtraction", async () => {
+    mockedContextWindow.mockResolvedValueOnce(128_000);
+    await expect(resolveCompactionThreshold(provider("https://api.example.com"), "mid")).resolves.toBe(
+      96_000,
+    );
+  });
+
+  it("caps huge model windows at 250k", async () => {
+    mockedContextWindow.mockResolvedValueOnce(1_000_000);
+    await expect(resolveCompactionThreshold(provider("https://api.example.com"), "big")).resolves.toBe(
+      MAX_HISTORY_TOKENS,
+    );
+  });
+
+  it("floors tiny windows so small models still compact meaningfully", async () => {
+    mockedContextWindow.mockResolvedValueOnce(2_048);
+    await expect(resolveCompactionThreshold(provider("https://api.example.com"), "tiny")).resolves.toBe(
+      4096,
+    );
+  });
+
+  it("falls back to the local window for local runtimes", async () => {
+    mockedContextWindow.mockResolvedValueOnce(null);
+    await expect(resolveCompactionThreshold(provider("http://localhost:11434"), "local")).resolves.toBe(
+      6144, // 8192 * 0.75
+    );
+  });
+
+  it("falls back to the default window when the catalog lookup fails", async () => {
+    mockedContextWindow.mockRejectedValueOnce(new Error("offline"));
+    await expect(resolveCompactionThreshold(provider("https://api.example.com"), "x")).resolves.toBe(
+      24_576, // 32768 * 0.75
     );
   });
 });

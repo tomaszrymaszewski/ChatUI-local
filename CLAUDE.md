@@ -6,7 +6,12 @@ Persistent instructions for AI coding agents on this repo. Keep changes tightly 
 
 A local-first desktop chat app: **Tauri 2 (Rust shell) + React 19 + TypeScript + Vite 7
 + Tailwind + shadcn/ui**. No Supabase, no router, no auth — all persistence is
-localStorage plus JSON files under `~/Documents/chatUI` (managed by the Rust side).
+localStorage (chats, sessions, agents, projects, schedules, provider keys) plus files
+under the OS app-data dir `~/Library/Application Support/com.tomaszrymaszewski.chatui/`
+(managed by the Rust side). **Never use `~/Documents`** — that base was removed; a
+one-time startup migration (`migrate_legacy_chat_ui_dir` in `src-tauri/src/lib.rs`,
+runs in `setup()`) moved skills/agents/mcp-tokens/logs/index.db over and deleted the
+old folder.
 
 - **Chat** — `src/components/ChatView.tsx` (the whole UI: sessions, projects, settings
   views). Every send runs through a **LangChain Deep Agents** runtime:
@@ -14,14 +19,15 @@ localStorage plus JSON files under `~/Documents/chatUI` (managed by the Rust sid
   - `src/lib/agent/runtime.ts` — `DeepAgentSession` (createDeepAgent, v3 streamEvents,
     system prompts incl. council/research mode prompts).
   - `src/lib/agent/tools.ts` — built-in tools (time/date/weather/web_fetch,
-    create_artifact, run_python, request_structured_input, search_skills,
+    create_artifact, share_files, run_python, request_structured_input, search_skills,
     search_connectors, suggest).
   - `src/lib/agent/{models,skills,mcp,run-context,types}.ts` — ChatOpenAI factory
     (OpenAI-compatible endpoints only; maxTokens comes from models.dev `limit.output`,
     8192 fallback — omitting it means small provider defaults like DeepSeek's 4096),
-    skill files, remote MCP tools, per-run context.
+    skill files, remote MCP tools + on-demand proxy, per-run context.
   - `src/lib/run-python.ts` → Tauri command `run_python` in `src-tauri/src/lib.rs`
-    (system python3, temp file, try_wait poll + kill on timeout).
+    (system python3, temp file, optional cwd — defaults to the run's deliverables
+    folder, try_wait poll + kill on timeout).
 - **Rich content** — `src/components/markdown-renderer.tsx` renders LaTeX (KaTeX),
   ```mermaid, ```chart (Vega-Lite), ```svg fences, prism syntax highlighting.
   `src/components/artifact-panel.tsx` is the editable side panel (CodeMirror editing
@@ -45,9 +51,9 @@ localStorage plus JSON files under `~/Documents/chatUI` (managed by the Rust sid
    asked. Match the existing code style in each file exactly.
 4. **Ask, don't assume.** If an API/library surface is uncertain, verify it in
    `node_modules` or docs first — do not guess.
-5. **LSP lies.** The editor LSP sometimes reports stale "cannot find module" errors for
-   `src/components/skills-dialog.tsx`, `src/components/mcp-dialog.tsx`, and
-   `src/components/suggestion-card.tsx`. Trust `tsc` (the build), not those diagnostics.
+5. **LSP lies.** The editor LSP sometimes reports stale "cannot find module" errors or
+   phantom files (e.g. `src/components/skills-dialog.tsx`, a `__probe.test.ts`). Trust
+   `tsc` (the build), not those diagnostics.
 6. **Never commit secrets.** Provider API keys live in localStorage only.
 
 ## Architecture notes that bite
@@ -77,6 +83,11 @@ localStorage plus JSON files under `~/Documents/chatUI` (managed by the Rust sid
   4k reserve for system prompt + tool schemas + output.
 - **OpenCode server** (port 2138) is spawned/adopted by the Rust shell for the legacy
   agent half; env vars are sanitized there — keep that behavior.
+- **Deliverables + share_files**: `run_python`/`run_node` default their cwd to the run's
+  deliverables folder (`<base>/files/<sessionId>`, threaded via `DeepAgentSession` opts).
+  Files are invisible to the user until `share_files` is called — it emits the `files`
+  AgentEvent; `ChatView` renders download/Open/Reveal chips (persisted + live mid-run).
+  `share_files` expands `~` and emits a visible error activity when every path is skipped.
 - **App updates** (`src/lib/updater.ts` + `src/components/updates-panel.tsx`): the app
   pings a static `latest.json` on GitHub Releases on launch (if auto-check is on in
   Settings → Updates). `tauri-plugin-updater` verifies the signed bundle against the
@@ -87,12 +98,28 @@ localStorage plus JSON files under `~/Documents/chatUI` (managed by the Rust sid
   "i want to learn…", or "research…" as the first word of the composer auto-activates
   the corresponding chat mode (button lights up blue + expands). Detection is live:
   deleting the word reverts the mode. Manual toggles always win over auto-detection.
-- **Skill/connector discovery** (`search_skills` / `search_connectors` / `suggest` tools):
-  the agent can search the skill and connector catalogs at runtime and present actionable
-  suggestion cards (`src/components/suggestion-card.tsx`) in place of the composer textbox.
-  Suggestions are non-blocking (the run continues). The `suggest` tool emits a `suggestion`
-  AgentEvent via `RunContext.emit` (same pattern as `create_artifact`). Google Workspace
-  and Microsoft 365 are covered by the Zapier connector (keywords field in `McpCatalogEntry`).
+- **Skill/connector discovery — one system for both, registry-driven + RAG.** The
+  catalog lives in `registry.json` **at the repo root** (skills + connectors sections,
+  both with `keywords`) and is fetched from raw.githubusercontent at launch, cached in
+  localStorage (24 h TTL) with in-bundle fallbacks (`CURATED_SKILLS`, `MCP_CATALOG`).
+  - **Skills**: `src/lib/skill-registry.ts` (registry fetch/cache/custom entries) +
+    `src/lib/skills-library.ts` (disk install/list). Install-on-demand: bundled skills
+    auto-install at launch (`ensureBundledSkillsInstalled`); everything else installs on
+    first use — `search_skills` (semantic over the knowledge index, keyword fallback)
+    installs a matching miss and inlines its SKILL.md. `loadSkillFiles` virtualizes at
+    most `MAX_ADVERTISED_SKILLS` (30, MRU) into `/skills/<name>/SKILL.md` and stamps a
+    **"Disk location" header** into each SKILL.md (`applySkillDiskHeader`) — the real
+    path is how the agent stops guessing and wandering into other apps' folders.
+  - **Connectors**: `listAllConnectors()` (mcp-catalog.ts) = bundled + registry; UI
+    renders use the sync `listCachedConnectors()`. Access is hybrid: only the 3 most
+    recently used servers connect eagerly (`hotSetMcpServers` → native `mcp__` tools);
+    everything else goes through the lazy **`list_mcp_tools` / `call_mcp_tool` proxy**
+    (`createMcpProxy` in `src/lib/agent/mcp.ts`, one instance per run) — which is also
+    what makes a connector connected mid-run (suggestion card) usable in the same run.
+  - Suggestion cards (`src/components/suggestion-card.tsx`) remain the connect/install
+    UX (non-blocking, `RunContext.emit`). Adding skills: Settings → Skills → Add skill
+    (GitHub URL / local folder / paste SKILL.md) or Import (one-click from
+    `~/.claude/skills`, `~/.config/opencode/skills`, `~/.eigent/skills`).
 
 ## Commands
 

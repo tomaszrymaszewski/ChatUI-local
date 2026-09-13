@@ -48,6 +48,48 @@ export async function resolveHistoryBudget(
   return Math.min(MAX_HISTORY_TOKENS, Math.max(1024, contextWindow - OVERHEAD_RESERVE_TOKENS));
 }
 
+/**
+ * Fraction of the model's context window at which mid-run compaction kicks in.
+ * Unlike resolveHistoryBudget this has no 16k overhead subtraction (the 1024
+ * floor that results on local models would compact every turn); the window
+ * fraction already leaves room for the system prompt, tool schemas, and output.
+ */
+const COMPACTION_TRIGGER_FRACTION = 0.75;
+const COMPACTION_MIN_TOKENS = 4096;
+
+/**
+ * The model's context window (tokens): the models.dev limit when known,
+ * the local-runtime fallback for Ollama/LM Studio, 32k otherwise. Used for
+ * history budgets, compaction thresholds, and the usage widget's denominator.
+ */
+export async function resolveContextWindow(
+  provider: Provider,
+  modelName: string,
+): Promise<number> {
+  const known = await getModelContextWindow(provider, modelName).catch(() => null);
+  return known ?? (isLocalBaseUrl(provider.baseUrl) ? LOCAL_FALLBACK_CONTEXT : DEFAULT_FALLBACK_CONTEXT);
+}
+
+/**
+ * Absolute token count at which a running agent's thread should be compacted
+ * (older turns summarized). Uses the models.dev context limit when known,
+ * the local-runtime fallback otherwise — always capped at MAX_HISTORY_TOKENS.
+ * Absolute counts only: fractional triggers require a model profile that our
+ * custom-baseURL ChatOpenAI instances don't carry.
+ */
+export async function resolveCompactionThreshold(
+  provider: Provider,
+  modelName: string,
+): Promise<number> {
+  const known = await getModelContextWindow(provider, modelName).catch(() => null);
+  const contextWindow =
+    known ?? (isLocalBaseUrl(provider.baseUrl) ? LOCAL_FALLBACK_CONTEXT : DEFAULT_FALLBACK_CONTEXT);
+  return Math.min(
+    MAX_HISTORY_TOKENS,
+    Math.max(COMPACTION_MIN_TOKENS, Math.floor(contextWindow * COMPACTION_TRIGGER_FRACTION)),
+  );
+}
+
 export function estimateMessageTokens(
   message: { content: string | ContentPart[] },
 ): number {

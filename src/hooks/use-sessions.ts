@@ -39,25 +39,35 @@ function loadSessions(): ChatSession[] {
   }
 }
 
+/**
+ * Persist the session list without ever throwing: this runs inside React
+ * state updaters (and therefore during render), so a QuotaExceededError from
+ * a full store would escape to the crash boundary and take down the app on
+ * every send. The list stays in memory for this run when it cannot persist.
+ */
 function saveSessions(sessions: ChatSession[]) {
-  localStorage.setItem(
-    STORAGE_KEY,
-    JSON.stringify(
-      sessions.map((s) => ({
-        id: s.id,
-        title: s.title,
-        updatedAt: s.updatedAt.toISOString(),
-        projectId: s.projectId,
-        type: s.type,
-        isTemporary: s.isTemporary,
-        chatMode: s.chatMode,
-        reasoningEffort: s.reasoningEffort,
-        agentId: s.agentId,
-        isSetup: s.isSetup,
-        movedToAgent: s.movedToAgent,
-      })),
-    ),
-  );
+  try {
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(
+        sessions.map((s) => ({
+          id: s.id,
+          title: s.title,
+          updatedAt: s.updatedAt.toISOString(),
+          projectId: s.projectId,
+          type: s.type,
+          isTemporary: s.isTemporary,
+          chatMode: s.chatMode,
+          reasoningEffort: s.reasoningEffort,
+          agentId: s.agentId,
+          isSetup: s.isSetup,
+          movedToAgent: s.movedToAgent,
+        })),
+      ),
+    );
+  } catch {
+    console.warn("[chatui] storage full — session list will not persist after reload");
+  }
   window.dispatchEvent(new Event(SESSIONS_EVENT));
 }
 

@@ -2,7 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 /**
  * Access to the app's MCP OAuth token store
- * (~/Documents/chatUI/mcp/auth.json, migrated once from opencode's old
+ * (app data dir: mcp/auth.json, migrated once from opencode's old
  * shared store). The native browser flow — started with beginMcpOauth —
  * writes tokens here; the langchain agent's own MCP connections (see
  * src/lib/agent/mcp.ts) read them back so connectors work without any

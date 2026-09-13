@@ -176,11 +176,6 @@ export function UpdatesPanel() {
               </CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-4">
-              {updateInfo.body && (
-                <div className="rounded-lg border bg-muted/50 p-3 text-sm whitespace-pre-wrap">
-                  {updateInfo.body}
-                </div>
-              )}
               {downloadProgress !== null && (
                 <div className="flex flex-col gap-1">
                   <div className="flex justify-between text-xs text-muted-foreground">

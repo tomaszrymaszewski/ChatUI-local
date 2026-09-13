@@ -31,8 +31,14 @@ import {
   ListChecks,
   GitPullRequest,
   Telescope,
+  Link2,
+  FolderOpen,
+  ClipboardPaste,
+  Download,
 } from "lucide-react";
 import { toast } from "sonner";
+import { invoke } from "@tauri-apps/api/core";
+import { open as openDirectoryPicker } from "@tauri-apps/plugin-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -45,22 +51,22 @@ import {
 import { cn } from "@/lib/utils";
 import { FastapiLogo, NextjsLogo } from "@/components/brand-logos";
 import {
-  listBundledSkills,
-  listCuratedSkills,
   installBundledSkill,
-  installCuratedSkill,
+  installRegistrySkill,
   listInstalledSkills,
   deleteSkill,
+  globalSkillsDirectory,
   SKILL_CATEGORIES,
-  type SkillCatalogEntry,
   type InstalledSkill,
-  type CuratedSkill,
   type SkillCategory,
 } from "@/lib/skills-library";
-
-type LibraryItem =
-  | { kind: "bundled"; entry: SkillCatalogEntry }
-  | { kind: "curated"; entry: CuratedSkill };
+import {
+  listAllCatalogSkills,
+  parseGithubSkillUrl,
+  saveCustomSkill,
+  type CatalogSkill,
+} from "@/lib/skill-registry";
+import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
 
 type IconComponent = ComponentType<SVGProps<SVGSVGElement>>;
 
@@ -102,6 +108,15 @@ export function skillIcon(name: string): { Icon: IconComponent; tile: string } {
   return SKILL_ICONS[name] ?? FALLBACK_ICON;
 }
 
+/** Well-known skill folders of other agent apps (imported on click only). */
+const EXTERNAL_SKILL_DIRS = [
+  { label: "Claude Code", path: "~/.claude/skills" },
+  { label: "opencode", path: "~/.config/opencode/skills" },
+  { label: "Eigent", path: "~/.eigent/skills" },
+];
+
+type AddMode = "url" | "folder" | "paste";
+
 export function SkillsPanel({
   activeDirectory,
 }: {
@@ -109,29 +124,31 @@ export function SkillsPanel({
 }) {
   const [scope, setScope] = useState<"global" | "project">("global");
   const [installedSkills, setInstalledSkills] = useState<InstalledSkill[]>([]);
+  const [library, setLibrary] = useState<CatalogSkill[]>([]);
   const [installing, setInstalling] = useState<string | null>(null);
   const [uninstalling, setUninstalling] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState<SkillCategory | "All">("All");
+  // Add-skill dialog state
+  const [addOpen, setAddOpen] = useState(false);
+  const [addMode, setAddMode] = useState<AddMode>("url");
+  const [githubUrl, setGithubUrl] = useState("");
+  const [pastedMd, setPastedMd] = useState("");
+  const [adding, setAdding] = useState(false);
+  // Import-from-other-apps state
+  const [importOpen, setImportOpen] = useState(false);
+  const [importScan, setImportScan] = useState<Array<{ label: string; path: string; skills: string[] }> | null>(null);
+  const [importScanning, setImportScanning] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importPicked, setImportPicked] = useState<Set<string>>(new Set());
 
   const refresh = useCallback(async () => {
     const globalSkills = await listInstalledSkills("global");
     const projectSkills = activeDirectory ? await listInstalledSkills("project", activeDirectory) : [];
     setInstalledSkills([...globalSkills, ...projectSkills]);
+    setLibrary(await listAllCatalogSkills());
   }, [activeDirectory]);
-
-  const library = useMemo<LibraryItem[]>(() => {
-    const bundled: LibraryItem[] = listBundledSkills().map((e) => ({
-      kind: "bundled" as const,
-      entry: e,
-    }));
-    const curated: LibraryItem[] = listCuratedSkills().map((e) => ({
-      kind: "curated" as const,
-      entry: e,
-    }));
-    return [...bundled, ...curated];
-  }, []);
 
   useEffect(() => {
     void refresh();
@@ -142,14 +159,18 @@ export function SkillsPanel({
     [installedSkills],
   );
 
-  const handleInstall = async (item: LibraryItem) => {
-    const name = item.entry.name;
+  const handleInstall = async (skill: CatalogSkill) => {
+    const name = skill.name;
     setInstalling(name);
     try {
-      if (item.kind === "bundled") {
-        await installBundledSkill(name, scope, activeDirectory ?? undefined);
+      if (skill.repo) {
+        await installRegistrySkill(
+          { name, repo: skill.repo, dir: skill.dir, branch: skill.branch },
+          scope,
+          activeDirectory ?? undefined,
+        );
       } else {
-        await installCuratedSkill(item.entry, scope, activeDirectory ?? undefined);
+        await installBundledSkill(name, scope, activeDirectory ?? undefined);
       }
       toast.success(`Installed skill: ${name}`);
       setTick((t) => t + 1);
@@ -176,18 +197,138 @@ export function SkillsPanel({
     }
   };
 
+  const handleAddGithubUrl = async () => {
+    const parsed = parseGithubSkillUrl(githubUrl);
+    if (!parsed) {
+      toast.error("Enter a GitHub URL: github.com/owner/repo or …/tree/branch/skill-dir");
+      return;
+    }
+    setAdding(true);
+    try {
+      await installRegistrySkill(parsed, scope, activeDirectory ?? undefined);
+      saveCustomSkill({
+        ...parsed,
+        title: parsed.name,
+        description: `Custom skill imported from github.com/${parsed.repo}`,
+        category: "Coding",
+        sourceLabel: "Custom — GitHub",
+        keywords: [],
+      });
+      toast.success(`Installed skill: ${parsed.name}`);
+      setGithubUrl("");
+      setAddOpen(false);
+      setTick((t) => t + 1);
+      scheduleKnowledgeSweep(2_000);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to install from GitHub");
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handleAddFolder = async () => {
+    try {
+      const picked = await openDirectoryPicker({ directory: true, multiple: false });
+      if (typeof picked !== "string" || !picked) return;
+      const name = picked.split("/").filter(Boolean).pop() ?? "skill";
+      const dest = await globalSkillsDirectory();
+      const target = `${dest}/${name}`;
+      if (await invoke<boolean>("path_exists", { path: target })) {
+        toast.error(`A skill named "${name}" already exists`);
+        return;
+      }
+      await invoke("copy_path", { src: picked, dest: target });
+      toast.success(`Imported skill: ${name}`);
+      setAddOpen(false);
+      setTick((t) => t + 1);
+      scheduleKnowledgeSweep(2_000);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to import folder");
+    }
+  };
+
+  const handleAddPaste = async () => {
+    const content = pastedMd.trim();
+    if (!content) return;
+    const nameMatch = content.match(/^---\n[\s\S]*?^name:\s*(\S+)/m);
+    const name = nameMatch?.[1] ?? `pasted-skill-${Date.now()}`;
+    setAdding(true);
+    try {
+      const home = await globalSkillsDirectory();
+      await invoke("write_text_file", { path: `${home}/${name}/SKILL.md`, content });
+      toast.success(`Installed skill: ${name}`);
+      setPastedMd("");
+      setAddOpen(false);
+      setTick((t) => t + 1);
+      scheduleKnowledgeSweep(2_000);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to save skill");
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const scanExternalDirs = useCallback(async () => {
+    setImportScanning(true);
+    try {
+      const found: Array<{ label: string; path: string; skills: string[] }> = [];
+      for (const dir of EXTERNAL_SKILL_DIRS) {
+        const entries = await invoke<Array<{ name: string }>>("list_dir_entries", { path: dir.path }).catch(() => []);
+        if (entries.length > 0) {
+          found.push({ label: dir.label, path: dir.path, skills: entries.map((e) => e.name) });
+        }
+      }
+      setImportScan(found);
+      setImportPicked(new Set());
+    } finally {
+      setImportScanning(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (importOpen && !importScan && !importScanning) void scanExternalDirs();
+  }, [importOpen, importScan, importScanning, scanExternalDirs]);
+
+  const handleImportExternal = async () => {
+    if (importPicked.size === 0) return;
+    setImporting(true);
+    try {
+      const home = await invoke<string>("get_home_dir");
+      const dest = await globalSkillsDirectory();
+      let count = 0;
+      for (const source of importScan ?? []) {
+        for (const skill of source.skills) {
+          const key = `${source.path}/${skill}`;
+          if (!importPicked.has(key)) continue;
+          const target = `${dest}/${skill}`;
+          if (await invoke<boolean>("path_exists", { path: target })) continue;
+          await invoke("copy_path", {
+            src: key.replace(/^~/, home),
+            dest: target,
+          }).catch(() => {});
+          count += 1;
+        }
+      }
+      toast.success(count > 0 ? `Imported ${count} skill(s)` : "Nothing new to import");
+      setImportOpen(false);
+      setImportScan(null);
+      setTick((t) => t + 1);
+      scheduleKnowledgeSweep(2_000);
+    } finally {
+      setImporting(false);
+    }
+  };
+
   const filteredLibrary = useMemo(() => {
     const q = query.trim().toLowerCase();
     return library.filter((item) => {
-      const title = item.kind === "bundled" ? item.entry.name : item.entry.title;
-      const desc = item.entry.description;
-      const cat: SkillCategory = item.kind === "bundled" ? "Built-in" : item.entry.category;
-      if (category !== "All" && cat !== category) return false;
+      if (category !== "All" && item.category !== category) return false;
       if (!q) return true;
       return (
-        title.toLowerCase().includes(q) ||
-        desc.toLowerCase().includes(q) ||
-        item.entry.name.toLowerCase().includes(q)
+        item.title.toLowerCase().includes(q) ||
+        item.description.toLowerCase().includes(q) ||
+        item.name.toLowerCase().includes(q) ||
+        item.keywords.some((k) => k.toLowerCase().includes(q))
       );
     });
   }, [library, query, category]);
@@ -200,8 +341,9 @@ export function SkillsPanel({
         </h2>
         <p className="text-sm text-muted-foreground">
           Skills are instruction packs that make the AI great at a specific task — like
-          creating polished PDFs, designing on-brand slides, or reviewing code. Install one
-          once and it works everywhere.
+          creating polished PDFs, designing on-brand slides, or reviewing code. Everything in
+          the catalog is discoverable by the agent automatically; installing just keeps it
+          always ready.
         </p>
       </div>
 
@@ -223,7 +365,7 @@ export function SkillsPanel({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="global">All projects (~/.config)</SelectItem>
+                  <SelectItem value="global">All projects (app library)</SelectItem>
                   <SelectItem value="project" disabled={!activeDirectory}>
                     {activeDirectory
                       ? `This project (${activeDirectory.replace(/.*\//, "")})`
@@ -234,6 +376,12 @@ export function SkillsPanel({
             </div>
             <Button variant="ghost" size="sm" onClick={() => setTick((t) => t + 1)}>
               <RefreshCw className="size-3.5" /> Refresh
+            </Button>
+            <Button variant="outline" size="sm" onClick={() => setImportOpen(true)}>
+              <Download className="size-3.5" /> Import
+            </Button>
+            <Button size="sm" onClick={() => setAddOpen(true)}>
+              <Plus className="size-3.5" /> Add skill
             </Button>
           </div>
 
@@ -255,6 +403,136 @@ export function SkillsPanel({
           </div>
         </div>
 
+        {addOpen && (
+          <div className="flex flex-col gap-3 rounded-xl border p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">Add a skill</span>
+              <button onClick={() => setAddOpen(false)} className="text-muted-foreground hover:text-foreground">
+                <Trash2 className="hidden" />
+                <span className="text-xs">Close</span>
+              </button>
+            </div>
+            <div className="flex gap-1.5">
+              {(
+                [
+                  { id: "url", label: "GitHub URL", Icon: Link2 },
+                  { id: "folder", label: "Local folder", Icon: FolderOpen },
+                  { id: "paste", label: "Paste SKILL.md", Icon: ClipboardPaste },
+                ] as Array<{ id: AddMode; label: string; Icon: IconComponent }>
+              ).map(({ id, label, Icon }) => (
+                <button
+                  key={id}
+                  onClick={() => setAddMode(id)}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                    addMode === id
+                      ? "border-foreground bg-foreground text-background"
+                      : "border-border text-muted-foreground hover:text-foreground",
+                  )}
+                >
+                  <Icon className="size-3" /> {label}
+                </button>
+              ))}
+            </div>
+            {addMode === "url" && (
+              <div className="flex gap-2">
+                <Input
+                  placeholder="https://github.com/owner/repo/tree/main/skills/my-skill"
+                  value={githubUrl}
+                  onChange={(e) => setGithubUrl(e.target.value)}
+                />
+                <Button size="sm" disabled={adding || !githubUrl.trim()} onClick={() => void handleAddGithubUrl()}>
+                  {adding ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
+                  Add
+                </Button>
+              </div>
+            )}
+            {addMode === "folder" && (
+              <Button size="sm" variant="outline" onClick={() => void handleAddFolder()} className="self-start">
+                <FolderOpen className="size-3.5" /> Choose folder…
+              </Button>
+            )}
+            {addMode === "paste" && (
+              <div className="flex flex-col gap-2">
+                <textarea
+                  className="min-h-32 rounded-lg border bg-transparent p-3 font-mono text-xs"
+                  placeholder={"---\nname: my-skill\ndescription: What it does for the AI\n---\n# Instructions…"}
+                  value={pastedMd}
+                  onChange={(e) => setPastedMd(e.target.value)}
+                />
+                <Button size="sm" disabled={adding || !pastedMd.trim()} onClick={() => void handleAddPaste()} className="self-start">
+                  {adding ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />}
+                  Save skill
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {importOpen && (
+          <div className="flex flex-col gap-3 rounded-xl border p-4">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">Import skills from other apps</span>
+              <button onClick={() => { setImportOpen(false); setImportScan(null); }} className="text-xs text-muted-foreground hover:text-foreground">
+                Close
+              </button>
+            </div>
+            {importScanning && <Loader2 className="size-4 animate-spin text-muted-foreground" />}
+            {importScan && importScan.length === 0 && (
+              <p className="text-xs text-muted-foreground">
+                No skill folders found in Claude Code, opencode, or Eigent.
+              </p>
+            )}
+            {importScan?.map((source) => (
+              <div key={source.path} className="flex flex-col gap-1.5">
+                <span className="text-xs font-medium text-muted-foreground">{source.label}</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {source.skills.map((skill) => {
+                    const key = `${source.path}/${skill}`;
+                    const picked = importPicked.has(key);
+                    const already = installedNames.has(skill);
+                    return (
+                      <button
+                        key={key}
+                        disabled={already}
+                        onClick={() => {
+                          const next = new Set(importPicked);
+                          if (picked) next.delete(key);
+                          else next.add(key);
+                          setImportPicked(next);
+                        }}
+                        className={cn(
+                          "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+                          already
+                            ? "border-emerald-500/30 text-emerald-600 dark:text-emerald-400"
+                            : picked
+                              ? "border-foreground bg-foreground text-background"
+                              : "border-border text-muted-foreground hover:text-foreground",
+                        )}
+                        title={already ? "Already installed" : key}
+                      >
+                        {already ? <Check className="mr-1 inline size-3" /> : picked ? <Check className="mr-1 inline size-3" /> : <Plus className="mr-1 inline size-3" />}
+                        {skill}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
+            {importScan && importScan.length > 0 && (
+              <Button
+                size="sm"
+                className="self-start"
+                disabled={importing || importPicked.size === 0}
+                onClick={() => void handleImportExternal()}
+              >
+                {importing ? <Loader2 className="size-3.5 animate-spin" /> : <Download className="size-3.5" />}
+                Import {importPicked.size > 0 ? `${importPicked.size} ` : ""}selected
+              </Button>
+            )}
+          </div>
+        )}
+
         <div className="min-h-0 flex-1 overflow-y-auto pr-1">
           {/* ─── Library ─── */}
           <div className="flex flex-col gap-3">
@@ -262,19 +540,12 @@ export function SkillsPanel({
 
             <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
               {filteredLibrary.map((item) => {
-                const name = item.entry.name;
-                const title = item.kind === "bundled" ? name : item.entry.title;
-                const desc = item.entry.description;
-                const cat: SkillCategory = item.kind === "bundled" ? "Built-in" : item.entry.category;
-                const source =
-                  item.kind === "bundled"
-                    ? "Built-in"
-                    : item.entry.sourceLabel;
+                const name = item.name;
                 const installed = installedNames.has(name);
                 const { Icon, tile } = skillIcon(name);
                 return (
                   <div
-                    key={`${item.kind}-${name}`}
+                    key={`${item.sourceLabel}-${name}`}
                     className={cn(
                       "flex flex-col gap-3 rounded-xl border p-4 transition-colors",
                       installed
@@ -330,14 +601,14 @@ export function SkillsPanel({
                       )}
                     </div>
                     <div className="flex flex-col gap-1">
-                      <span className="text-sm font-semibold leading-tight">{title}</span>
+                      <span className="text-sm font-semibold leading-tight">{item.title}</span>
                       <span className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
-                        {desc}
+                        {item.description}
                       </span>
                     </div>
                     <div className="mt-auto flex items-center justify-between gap-2 pt-1 text-[10px] text-muted-foreground/70">
-                      <span className="truncate">{source}</span>
-                      <span className="shrink-0 rounded-full border px-2 py-0.5">{cat}</span>
+                      <span className="truncate">{item.sourceLabel}</span>
+                      <span className="shrink-0 rounded-full border px-2 py-0.5">{item.category}</span>
                     </div>
                   </div>
                 );
@@ -352,8 +623,8 @@ export function SkillsPanel({
         <div className="flex items-center gap-2 rounded-lg bg-muted/50 p-2.5 text-xs text-muted-foreground">
           <BookOpen className="size-3.5 shrink-0" />
           <span>
-            Tip: skills are reusable instructions. The AI reads them when your request matches
-            what a skill covers — you don't need to do anything special after installing.
+            Tip: skills are reusable instructions. The agent finds what it needs via the
+            knowledge index and installs on demand — you don't need to do anything special.
           </span>
         </div>
     </div>

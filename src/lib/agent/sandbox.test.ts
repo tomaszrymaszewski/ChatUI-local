@@ -3,6 +3,7 @@ import {
   isSessionReadable,
   isPathWithin,
   normalizePath,
+  remapLegacyChatUiPath,
   type AgentSandbox,
 } from "@/lib/agent/sandbox";
 
@@ -120,5 +121,34 @@ describe("isSessionReadable (search_chats scope)", () => {
     expect(isSessionReadable(own, sandbox)).toBe(true);
     expect(isSessionReadable(chat, sandbox)).toBe(true);
     expect(isSessionReadable(temp, sandbox)).toBe(false);
+  });
+});
+
+describe("remapLegacyChatUiPath (Documents → app data dir move)", () => {
+  const NEW_BASE = "/Users/tester/Library/Application Support/com.tomaszrymaszewski.chatui";
+
+  it("remaps ~-prefixed legacy paths", () => {
+    expect(
+      remapLegacyChatUiPath("~/Documents/chatUI/agents/a1/notes.md", HOME, NEW_BASE),
+    ).toBe(`${NEW_BASE}/agents/a1/notes.md`);
+  });
+
+  it("remaps absolute legacy paths", () => {
+    expect(
+      remapLegacyChatUiPath(`${HOME}/Documents/chatUI/skills/pptx`, HOME, NEW_BASE),
+    ).toBe(`${NEW_BASE}/skills/pptx`);
+  });
+
+  it("remaps the legacy base itself", () => {
+    expect(remapLegacyChatUiPath("~/Documents/chatUI", HOME, NEW_BASE)).toBe(NEW_BASE);
+  });
+
+  it("leaves unrelated paths untouched", () => {
+    expect(
+      remapLegacyChatUiPath("/Users/tester/projects/app", HOME, NEW_BASE),
+    ).toBe("/Users/tester/projects/app");
+    expect(
+      remapLegacyChatUiPath(`${HOME}/Documents/chatUI-backup/x`, HOME, NEW_BASE),
+    ).toBe(`${HOME}/Documents/chatUI-backup/x`);
   });
 });

@@ -289,5 +289,61 @@ export const MCP_CATEGORIES: McpCategory[] = [
 ];
 
 export function getCatalogEntry(id: string): McpCatalogEntry | undefined {
-  return MCP_CATALOG.find((e) => e.id === id);
+  return listCachedConnectors().find((e) => e.id === id);
+}
+
+// ─── Registry-driven catalog (same system as skills) ────────────────────────
+//
+// The registry.json in the app's repo can carry a "connectors" section with
+// the same entry shape; new connectors ship without an app release. The
+// in-bundle list above is the offline fallback. The registry cache (written
+// by fetchRegistryFile during knowledge sweeps) is read synchronously for
+// UI renders.
+
+function cachedRegistryConnectors(): McpCatalogEntry[] {
+  try {
+    const raw = localStorage.getItem("chatui:skills:registry");
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as { file?: { connectors?: unknown[] } };
+    return ((parsed?.file?.connectors ?? []) as McpCatalogEntry[]).filter(
+      (e) => e && typeof e.id === "string" && typeof e.install?.url === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Synchronous unified view: bundled list + last cached registry entries
+ * (bundled wins on id conflicts). For UI rendering; the async
+ * listAllConnectors() is the authoritative version for sweeps/tools.
+ */
+export function listCachedConnectors(): McpCatalogEntry[] {
+  const byId = new Map<string, McpCatalogEntry>();
+  for (const entry of cachedRegistryConnectors()) byId.set(entry.id, entry);
+  for (const entry of MCP_CATALOG) byId.set(entry.id, entry);
+  return [...byId.values()];
+}
+
+/**
+ * The unified connector catalog: in-bundle curated list + registry
+ * entries (bundled wins on id conflicts). Consumers: knowledge index and
+ * the search_connectors tool.
+ */
+export async function listAllConnectors(): Promise<McpCatalogEntry[]> {
+  const { fetchRegistryFile } = await import("@/lib/skill-registry");
+  const file = await fetchRegistryFile().catch(() => null);
+  const byId = new Map<string, McpCatalogEntry>();
+  for (const entry of (file?.connectors ?? []) as McpCatalogEntry[]) {
+    if (
+      entry &&
+      typeof entry.id === "string" &&
+      typeof entry.name === "string" &&
+      typeof entry.install?.url === "string"
+    ) {
+      byId.set(entry.id, entry);
+    }
+  }
+  for (const entry of MCP_CATALOG) byId.set(entry.id, entry);
+  return [...byId.values()];
 }

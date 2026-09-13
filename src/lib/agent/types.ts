@@ -25,6 +25,10 @@ export interface ActivityItem {
   /** Monotonic creation order shared with reasoning streams — used to interleave
    *  thoughts and sub-agent boxes chronologically. Absent on legacy messages. */
   seq?: number;
+  /** Bounded preview of the tool call's arguments (file path + content head, code, command…). */
+  argsPreview?: string;
+  /** File created/appended by this tool call — feeds the session files widget. */
+  file?: { path: string; name: string; bytes?: number };
 }
 
 export interface TodoItem {
@@ -80,6 +84,16 @@ export interface ApprovalRequest {
 
 export type AgentMode = "chat" | "council" | "research" | "task";
 
+/** Provider-reported token counts of one model call (usage_metadata). */
+export interface TokenUsage {
+  /** Prompt tokens processed by this call (system + history + tools). */
+  inputTokens: number;
+  /** Prompt tokens served from the provider's cache. */
+  cachedTokens: number;
+  /** Completion tokens produced by this call. */
+  outputTokens: number;
+}
+
 /** A file the agent shared so the user can download it from the chat. */
 export interface SharedFile {
   /** Absolute path on disk (workspace or an allowed folder). */
@@ -98,6 +112,7 @@ export type AgentEvent =
   | { type: "artifact"; artifact: Artifact }
   | { type: "files"; files: SharedFile[] }
   | { type: "suggestion"; suggestion: SuggestionRequest }
+  | { type: "usage"; usage: TokenUsage }
   | { type: "agent_created"; agentId: string; agentName: string };
 
 export interface ReasoningStream {

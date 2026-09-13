@@ -17,6 +17,9 @@ use tauri::{Emitter, Manager};
 /// receives the browser redirect and validates `state`.
 const MCP_OAUTH_CALLBACK_PORT: u16 = 19876;
 
+/// Bundle identifier (tauri.conf.json) — names our app-data directory.
+const APP_DATA_DIR_ID: &str = "com.tomaszrymaszewski.chatui";
+
 // Legacy OpenCode server (kept for the legacy agent half; coding delegation
 // now shells out to installed coding-agent CLIs instead).
 const OPENCODE_PORT: &str = "2138";
@@ -114,9 +117,13 @@ fn make_display_path(path: &PathBuf) -> String {
 }
 
 fn chat_ui_base_dir() -> Result<PathBuf, String> {
-    let doc_dir = dirs::document_dir()
-        .ok_or_else(|| "Could not find Documents directory".to_string())?;
-    Ok(doc_dir.join("chatUI"))
+    // App-owned data lives in the OS app-data dir (NOT ~/Documents):
+    // macOS: ~/Library/Application Support/com.tomaszrymaszewski.chatui.
+    // Matches tauri's app_data_dir (data_dir + bundle identifier) without
+    // needing an AppHandle, so every path helper stays a free function.
+    let data_dir = dirs::data_dir()
+        .ok_or_else(|| "Could not find app data directory".to_string())?;
+    Ok(data_dir.join(APP_DATA_DIR_ID))
 }
 
 fn sessions_dir() -> Result<PathBuf, String> {
@@ -127,6 +134,89 @@ fn projects_dir() -> Result<PathBuf, String> {
     Ok(chat_ui_base_dir()?.join("projects"))
 }
 
+// ─── One-time migration: legacy ~/Documents/chatUI → app data dir ─────────
+
+/// Subtrees/files carried over from the legacy ~/Documents/chatUI base.
+/// Dead artifacts (projects/, settings.json, node-libs/) are not copied.
+const MIGRATION_ITEMS: &[&str] = &[
+    "sessions",
+    "agents",
+    "skills",
+    "mcp",
+    "logs",
+    "index.db",
+    "index.db-wal",
+    "index.db-shm",
+];
+
+/// Moves all data from the legacy ~/Documents/chatUI base into the new
+/// app-data dir, then deletes the legacy folder entirely. Runs at startup
+/// (setup), before any command can open index.db — the vec connection is
+/// cached for the process lifetime, so the move must happen first — or read
+/// OAuth tokens. Idempotent: a `.migrated-from-documents` marker in the new
+/// base short-circuits it. On any copy failure the legacy folder is kept and
+/// migration retries on the next launch (already-copied items are skipped,
+/// never overwritten, so partial progress self-heals).
+fn migrate_legacy_chat_ui_dir() {
+    let Some(doc_dir) = dirs::document_dir() else {
+        return;
+    };
+    let legacy = doc_dir.join("chatUI");
+    if !legacy.exists() {
+        return;
+    }
+    if let Ok(base) = chat_ui_base_dir() {
+        migrate_chat_ui_dir_impl(&legacy, &base);
+    }
+}
+
+fn migrate_chat_ui_dir_impl(legacy: &std::path::Path, base: &std::path::Path) -> bool {
+    let marker = base.join(".migrated-from-documents");
+    if marker.exists() {
+        // Already migrated — only the leftover legacy folder still needs to go.
+        let _ = fs::remove_dir_all(legacy);
+        return true;
+    }
+    for item in MIGRATION_ITEMS {
+        let src = legacy.join(item);
+        if !src.exists() {
+            continue;
+        }
+        let dst = base.join(item);
+        if dst.exists() {
+            continue; // never overwrite newer data at the destination
+        }
+        let result = if src.is_dir() {
+            copy_path_recursive(&src, &dst)
+        } else {
+            fs::create_dir_all(dst.parent().unwrap_or(base))
+                .map_err(|e| e.to_string())
+                .and_then(|_| {
+                    fs::copy(&src, &dst)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                })
+        };
+        if result.is_err() {
+            return false; // keep the legacy folder; retry next launch
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let auth = base.join("mcp").join("auth.json");
+        if auth.exists() {
+            let _ = fs::set_permissions(&auth, fs::Permissions::from_mode(0o600));
+        }
+    }
+    if fs::create_dir_all(base).is_err() || fs::write(&marker, "{}").is_err() {
+        return false;
+    }
+    // Copy verified — the legacy folder goes away entirely.
+    let _ = fs::remove_dir_all(legacy);
+    true
+}
+
 // ─── Directory management ─────────────────────────────────────────────────
 
 #[tauri::command]
@@ -135,17 +225,31 @@ fn ensure_chat_ui_directory() -> Result<String, String> {
     if !base.exists() {
         fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     }
-    for sub in &["sessions", "agents", "projects", "skills", "mcp", "logs"] {
+    for sub in &["sessions", "agents", "skills", "mcp", "logs", "files"] {
         let dir = base.join(sub);
         if !dir.exists() {
             fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         }
     }
-    let settings = base.join("settings.json");
-    if !settings.exists() {
-        fs::write(&settings, "{}").map_err(|e| e.to_string())?;
-    }
     Ok(base.to_string_lossy().to_string())
+}
+
+/// Create a directory (with parents) if missing; returns the absolute path.
+/// Used for per-run deliverables folders and skill imports.
+#[tauri::command]
+fn ensure_dir(path: String) -> Result<String, String> {
+    let p = expand_tilde(&path);
+    if p.is_file() {
+        return Err(format!("Path is a file, not a directory: {}", p.display()));
+    }
+    fs::create_dir_all(&p).map_err(|e| format!("{}: {}", p.display(), e))?;
+    Ok(p.to_string_lossy().to_string())
+}
+
+/// The app's data base directory (read-only — creates nothing). Display use.
+#[tauri::command]
+fn get_chat_ui_base_dir() -> Result<String, String> {
+    Ok(chat_ui_base_dir()?.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1028,7 +1132,7 @@ async fn mcp_http_post(
 
 // ─── MCP OAuth (native — no external auth process) ─────────────────────────
 
-/// App-owned OAuth token store (~/Documents/chatUI/mcp/auth.json).
+/// App-owned OAuth token store (<app data dir>/mcp/auth.json).
 fn mcp_auth_path() -> Result<PathBuf, String> {
     Ok(chat_ui_base_dir()?.join("mcp").join("auth.json"))
 }
@@ -1996,12 +2100,28 @@ pub struct PythonRunResult {
 /// to a temp file and the child is polled with try_wait; on timeout it is
 /// killed so a runaway script cannot hang the IPC call. stdout/stderr are
 /// drained on separate threads so a full pipe buffer can't deadlock the child.
+/// Accepts an optional working directory (like run_command) — without one the
+/// child inherits the app's cwd, which is `/` for a Finder-launched .app and
+/// therefore useless for scripts that save relative output files.
 #[tauri::command]
-async fn run_python(code: String, timeout_ms: Option<u64>) -> Result<PythonRunResult, String> {
+async fn run_python(
+    code: String,
+    cwd: Option<String>,
+    timeout_ms: Option<u64>,
+) -> Result<PythonRunResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::Read;
 
         let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000));
+
+        if let Some(dir) = cwd.as_deref() {
+            let dir = expand_tilde(dir);
+            let meta = fs::metadata(&dir)
+                .map_err(|e| format!("Working directory {}: {}", dir.display(), e))?;
+            if !meta.is_dir() {
+                return Err(format!("Working directory is not a folder: {}", dir.display()));
+            }
+        }
 
         let script_path = std::env::temp_dir().join(format!(
             "chatui-python-{}-{}.py",
@@ -2011,8 +2131,12 @@ async fn run_python(code: String, timeout_ms: Option<u64>) -> Result<PythonRunRe
         fs::write(&script_path, &code)
             .map_err(|e| format!("Failed to write temp script: {}", e))?;
 
-        let mut child = Command::new("python3")
-            .arg(&script_path)
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script_path);
+        if let Some(dir) = cwd.as_deref() {
+            cmd.current_dir(expand_tilde(dir));
+        }
+        let mut child = cmd
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -3947,6 +4071,82 @@ mod tests {
         let wrong = vec_doc("w", "s1", &[1.0, 0.0, 0.0, 0.0]);
         assert!(super::vec_upsert_impl(&conn, &[wrong]).is_err());
     }
+
+    // Migration carries skills/agents/mcp/sessions/logs + index.db (with WAL
+    // sidecars) into the new base and then deletes the legacy folder entirely.
+    #[test]
+    fn migration_moves_data_and_removes_legacy_dir() {
+        let tmp = std::env::temp_dir().join(format!("chatui-mig-{}-{}", std::process::id(), now_unix()));
+        let legacy = tmp.join("legacy").join("chatUI");
+        let base = tmp.join("base");
+        for sub in ["skills/pptx", "agents/a1", "mcp", "sessions", "logs"] {
+            fs::create_dir_all(legacy.join(sub)).unwrap();
+        }
+        fs::write(legacy.join("skills/pptx/SKILL.md"), "skill body").unwrap();
+        fs::write(legacy.join("mcp/auth.json"), "{}").unwrap();
+        fs::write(legacy.join("index.db"), "db").unwrap();
+        fs::write(legacy.join("index.db-wal"), "wal").unwrap();
+        // Dead artifacts are skipped, not migrated.
+        fs::write(legacy.join("settings.json"), "{}").unwrap();
+
+        assert!(super::migrate_chat_ui_dir_impl(&legacy, &base));
+
+        assert_eq!(fs::read_to_string(base.join("skills/pptx/SKILL.md")).unwrap(), "skill body");
+        assert_eq!(fs::read_to_string(base.join("mcp/auth.json")).unwrap(), "{}");
+        assert_eq!(fs::read_to_string(base.join("index.db-wal")).unwrap(), "wal");
+        assert!(base.join(".migrated-from-documents").exists());
+        assert!(!legacy.exists(), "legacy folder must be deleted entirely");
+        assert!(!base.join("settings.json").exists(), "dead artifacts are not migrated");
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // A second migration run is a no-op (marker short-circuits; a leftover
+    // legacy folder is still cleaned up).
+    #[test]
+    fn migration_is_idempotent() {
+        let tmp = std::env::temp_dir().join(format!("chatui-mig2-{}-{}", std::process::id(), now_unix()));
+        let legacy = tmp.join("legacy").join("chatUI");
+        let base = tmp.join("base");
+        fs::create_dir_all(legacy.join("skills")).unwrap();
+        fs::write(legacy.join("skills/SKILL.md"), "old").unwrap();
+        fs::create_dir_all(base.join("skills")).unwrap();
+        fs::write(base.join("skills/SKILL.md"), "newer").unwrap();
+
+        assert!(super::migrate_chat_ui_dir_impl(&legacy, &base));
+        // Destination data was never overwritten.
+        assert_eq!(fs::read_to_string(base.join("skills/SKILL.md")).unwrap(), "newer");
+        assert!(base.join(".migrated-from-documents").exists());
+        assert!(!legacy.exists());
+
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    // A failed copy keeps the legacy folder so migration retries next launch.
+    #[test]
+    fn migration_failure_keeps_legacy_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = std::env::temp_dir().join(format!("chatui-mig3-{}-{}", std::process::id(), now_unix()));
+        let legacy = tmp.join("legacy").join("chatUI");
+        let base = tmp.join("base");
+        // An unreadable subfolder makes copy_path_recursive bail out.
+        let no_read = legacy.join("skills").join("no-read");
+        fs::create_dir_all(&no_read).unwrap();
+        fs::write(no_read.join("x.txt"), "x").unwrap();
+        let mut perms = fs::metadata(&no_read).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&no_read, perms).unwrap();
+
+        assert!(!super::migrate_chat_ui_dir_impl(&legacy, &base));
+        assert!(legacy.exists(), "legacy folder kept on failure");
+        assert!(!base.join(".migrated-from-documents").exists());
+
+        // Restore so the temp tree can be removed.
+        let mut perms = fs::metadata(&no_read).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&no_read, perms).unwrap();
+        fs::remove_dir_all(&tmp).ok();
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -3956,8 +4156,16 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .setup(|_app| {
+            // Must run before any command can open the vector index or read
+            // OAuth tokens — both live in the (moved) base directory.
+            migrate_legacy_chat_ui_dir();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             ensure_chat_ui_directory,
+            ensure_dir,
+            get_chat_ui_base_dir,
             create_project_directory,
             list_project_directories,
             delete_project_directory,

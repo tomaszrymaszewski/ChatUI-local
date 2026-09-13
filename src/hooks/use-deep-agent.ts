@@ -6,7 +6,9 @@ import { DeepAgentSession, type AgentMessage } from "@/lib/agent/runtime";
 import { runDeepResearch } from "@/lib/agent/deep-research";
 import { runDiscuss } from "@/lib/agent/discuss";
 import { setRetrievedDocIds } from "@/lib/agent/run-context";
-import { buildRunThoughts, toHistoryMessage } from "@/lib/agent/history";
+import { buildRunThoughts, toHistoryMessage, resolveContextWindow } from "@/lib/agent/history";
+import { getModelCost, priceUsage, type ModelPrices } from "@/lib/model-capabilities";
+import { ensureDeliverablesDir } from "@/lib/deliverables";
 import { loadMessages } from "@/hooks/use-messages";
 import { loadUserSettings } from "@/hooks/use-user-settings";
 import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
@@ -68,6 +70,65 @@ export interface DeepAgentRunOptions {
  */
 const MAX_AUTO_CONTINUES = 5;
 
+/** Cumulative token usage of a session (all runs, all model calls). */
+export interface SessionUsage {
+  /** Sum of prompt tokens processed across every model call. */
+  inputTokens: number;
+  /** Sum of prompt tokens served from the provider's cache. */
+  cachedTokens: number;
+  /** Sum of completion tokens produced. */
+  outputTokens: number;
+  /** Tokens in context at the most recent model call (its input + output) — the "how full is the window" figure. */
+  contextTokens: number;
+  /** Estimated session spend in USD at models.dev list prices (0 when unpriced). */
+  costDollars: number;
+}
+
+const ZERO_USAGE: SessionUsage = {
+  inputTokens: 0,
+  cachedTokens: 0,
+  outputTokens: 0,
+  contextTokens: 0,
+  costDollars: 0,
+};
+
+const USAGE_KEY_PREFIX = "chatui:session-usage:";
+
+/** Load a session's persisted usage (zeros when absent/corrupt). */
+function loadSessionUsage(sessionId: string): SessionUsage {
+  try {
+    const raw = localStorage.getItem(USAGE_KEY_PREFIX + sessionId);
+    if (!raw) return { ...ZERO_USAGE };
+    const data = JSON.parse(raw) as Partial<SessionUsage>;
+    if (
+      typeof data.inputTokens !== "number" ||
+      typeof data.cachedTokens !== "number" ||
+      typeof data.outputTokens !== "number" ||
+      typeof data.contextTokens !== "number"
+    ) {
+      return { ...ZERO_USAGE };
+    }
+    return {
+      inputTokens: data.inputTokens,
+      cachedTokens: data.cachedTokens,
+      outputTokens: data.outputTokens,
+      contextTokens: data.contextTokens,
+      // Sessions persisted before spend tracking have no cost field.
+      costDollars: typeof data.costDollars === "number" ? data.costDollars : 0,
+    };
+  } catch {
+    return { ...ZERO_USAGE };
+  }
+}
+
+function persistSessionUsage(sessionId: string, usage: SessionUsage) {
+  try {
+    localStorage.setItem(USAGE_KEY_PREFIX + sessionId, JSON.stringify(usage));
+  } catch {
+    // storage full/unavailable — usage is best-effort
+  }
+}
+
 /**
  * Synthetic user turn injected when a run ends on its own with unfinished
  * todos (or dies mid-task): it continues the SAME thread, so the model keeps
@@ -79,6 +140,14 @@ const AUTO_CONTINUE_PROMPT =
   "off: do not restart or repeat completed work, keep the todo statuses updated, and keep " +
   "going until every item is done. If the work is actually already complete, mark the " +
   "remaining todos completed and give the final summary instead.]";
+
+/** Synthetic user turn after a stream ended on the output token limit. */
+const TRUNCATION_CONTINUE_PROMPT =
+  "[Automatic continuation — your previous turn hit the model's output token limit and was cut off, " +
+  "possibly mid tool call; this was not the user. Do not restart or repeat completed work. If a file " +
+  "write or artifact was cut off, do NOT re-issue the same oversized call: split the remaining content " +
+  "into smaller pieces (write_local_file with append=true for the next chunk, or a shorter artifact) " +
+  "and continue until the task and every todo item is finished.]";
 
 /** Best-effort char count of the run input (text parts only; images excluded). */
 function inputChars(messages: AgentMessage[]): number {
@@ -98,6 +167,29 @@ function inputChars(messages: AgentMessage[]): number {
     }
   }
   return n;
+}
+
+/**
+ * Whether a finished stream should be followed by an automatic continuation
+ * on the same thread: the run ended with unfinished todos, or it was cut off
+ * by the model's output token limit (finish_reason "length"), possibly mid
+ * tool call. Exported for tests.
+ */
+export function shouldAutoContinue(
+  attempt: number,
+  todosUnfinished: boolean,
+  truncated: boolean,
+): boolean {
+  return attempt < MAX_AUTO_CONTINUES && (todosUnfinished || truncated);
+}
+
+/**
+ * The synthetic user turn to inject for an automatic continuation. A
+ * truncation cut gets the more specific resume-with-chunking instruction;
+ * a clean early stop gets the todo-focused one. Exported for tests.
+ */
+export function continuationPrompt(truncated: boolean): string {
+  return truncated ? TRUNCATION_CONTINUE_PROMPT : AUTO_CONTINUE_PROMPT;
 }
 
 type InputResolution =
@@ -146,6 +238,10 @@ export interface AgentControllerApi {
   reasoningStreams: ReasoningStream[];
   /** Agent created during the most recent run (agent-builder setup), if any. */
   createdAgent: { agentId: string; agentName: string } | null;
+  /** Cumulative token usage for this session — feeds the context widget. */
+  usage: SessionUsage;
+  /** The session model's context window (tokens), null until a run resolves it. */
+  contextLimit: number | null;
   run: (opts: DeepAgentRunOptions) => Promise<AgentRunResult>;
   submitInput: (values: Record<string, unknown>) => void;
   skipInput: () => void;
@@ -170,6 +266,12 @@ class AgentController implements AgentControllerApi {
   pendingApprovals: PendingApproval[] = [];
   reasoningStreams: ReasoningStream[] = [];
   createdAgent: { agentId: string; agentName: string } | null = null;
+  /** Cumulative token usage for this session — feeds the context widget. */
+  usage: SessionUsage;
+  /** The session model's context window (tokens), null until a run resolves it. */
+  contextLimit: number | null = null;
+  /** This run's models.dev list prices (per M tokens), null when unpriced. */
+  private pricingRef: ModelPrices | null = null;
 
   private version = 0;
   private listeners = new Set<() => void>();
@@ -206,6 +308,7 @@ class AgentController implements AgentControllerApi {
   private seqCounter = 0;
   constructor(sessionId: string) {
     this.sessionId = sessionId;
+    this.usage = loadSessionUsage(sessionId);
   }
 
   // ── React subscription ────────────────────────────────────────────────
@@ -350,6 +453,22 @@ class AgentController implements AgentControllerApi {
         break;
       case "agent_created":
         this.createdAgent = { agentId: event.agentId, agentName: event.agentName };
+        break;
+      case "usage":
+        // Accumulate across runs and model calls; contextTokens tracks the
+        // most recent call (its input is what actually filled the window).
+        // Spend is priced with the run's models.dev list prices (resolved at
+        // run start); unpriced models simply add 0.
+        this.usage = {
+          inputTokens: this.usage.inputTokens + event.usage.inputTokens,
+          cachedTokens: this.usage.cachedTokens + event.usage.cachedTokens,
+          outputTokens: this.usage.outputTokens + event.usage.outputTokens,
+          contextTokens: event.usage.inputTokens + event.usage.outputTokens,
+          costDollars:
+            this.usage.costDollars + priceUsage(event.usage, this.pricingRef),
+        };
+        persistSessionUsage(this.sessionId, this.usage);
+        this.notify();
         break;
     }
   };
@@ -525,6 +644,15 @@ class AgentController implements AgentControllerApi {
     this.isRunning = true;
     this.unattended = opts.unattended ?? false;
     registryNotify();
+    // Resolve the model's context window for the usage widget (async, best-effort).
+    void resolveContextWindow(opts.provider, opts.modelName)
+      .then((limit) => {
+        this.contextLimit = limit;
+        this.notify();
+      })
+      .catch(() => {});
+    // List prices for session-spend math (cached catalog: no extra fetch).
+    this.pricingRef = await getModelCost(opts.provider, opts.modelName).catch(() => null);
     const controller = new AbortController();
     this.abortRef = controller;
 
@@ -602,6 +730,7 @@ class AgentController implements AgentControllerApi {
           skillNames: opts.taskProfile?.skillNames,
           mcpNames: opts.taskProfile?.mcpNames,
           sandbox: opts.taskProfile?.sandbox,
+          deliverablesDir: await ensureDeliverablesDir(this.sessionId),
         });
 
         // A run must not stop on its own while the todo list still has work:
@@ -611,9 +740,10 @@ class AgentController implements AgentControllerApi {
         // continuation cap) ends the run unfinished.
         let input: unknown = await session.firstInput(opts.messages);
         let lastError: unknown = null;
+        let lastFinishReason: string | undefined;
         for (let attempt = 0; ; attempt++) {
           try {
-            await session.stream(
+            const outcome = await session.stream(
               input,
               this.emit,
               controller.signal,
@@ -622,21 +752,22 @@ class AgentController implements AgentControllerApi {
               this.loadThoughts,
             );
             lastError = null;
+            lastFinishReason = outcome.finishReason;
           } catch (err) {
             if (controller.signal.aborted) {
               cancelled = true;
               break;
             }
             lastError = err;
+            lastFinishReason = undefined;
           }
           if (controller.signal.aborted) {
             cancelled = true;
             break;
           }
-          if (
-            attempt >= MAX_AUTO_CONTINUES ||
-            !this.todosRef.some((t) => t.status !== "completed")
-          ) {
+          const todosUnfinished = this.todosRef.some((t) => t.status !== "completed");
+          const truncated = lastFinishReason === "length";
+          if (!shouldAutoContinue(attempt, todosUnfinished, truncated)) {
             break;
           }
           this.emit({
@@ -648,7 +779,9 @@ class AgentController implements AgentControllerApi {
               status: "done",
               label: lastError
                 ? "Run failed mid-task — continuing"
-                : "Run stopped with unfinished todos — continuing",
+                : truncated
+                  ? "Output limit hit — continuing"
+                  : "Run stopped with unfinished todos — continuing",
             },
           });
           if (lastError) {
@@ -661,9 +794,12 @@ class AgentController implements AgentControllerApi {
             }
           }
           // On an error the failed input is resent — it may never have reached
-          // the thread; on a clean stop the synthetic turn continues it.
+          // the thread; otherwise a synthetic turn continues it (truncation
+          // cuts get the chunking-specific instruction).
           if (!lastError) {
-            input = { messages: [{ role: "user" as const, content: AUTO_CONTINUE_PROMPT }] };
+            input = {
+              messages: [{ role: "user" as const, content: continuationPrompt(truncated) }],
+            };
           }
         }
         if (lastError) throw lastError;

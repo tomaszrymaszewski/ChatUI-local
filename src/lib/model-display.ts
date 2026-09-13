@@ -136,3 +136,19 @@ export function modelLabel(model: Pick<ProviderModel, "name" | "displayName">): 
   }
   return formatModelName(model.name);
 }
+
+/**
+ * Catalog-aware label: a manual display name still wins, but a models.dev
+ * display name ("GLM 5.3 Flash") beats the ID formatter ("Glm 5.3 Flash").
+ * Pass null when the catalog knows nothing — plain modelLabel applies.
+ */
+export function modelLabelWithCatalog(
+  model: Pick<ProviderModel, "name" | "displayName">,
+  catalogName: string | null,
+): string {
+  if (model.displayName && model.displayName !== model.name) {
+    return model.displayName;
+  }
+  if (catalogName) return catalogName;
+  return formatModelName(model.name);
+}

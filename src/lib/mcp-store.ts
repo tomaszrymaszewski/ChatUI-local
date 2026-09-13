@@ -72,6 +72,52 @@ export function isConnected(name: string): boolean {
   return !!entry && entry.enabled !== false;
 }
 
+// ─── Connector usage tracking (MRU hot set) ────────────────────────────────
+//
+// Only the most recently used connected servers are connected eagerly at
+// session start (native mcp__ tools with full schemas); everything else is
+// reachable on demand through the list_mcp_tools / call_mcp_tool proxy
+// tools. Usage is bumped whenever a connector's tools actually run.
+
+const USAGE_KEY = "chatui:mcp:usage";
+
+/** Note that a connector's tools just ran — feeds the eager hot set. */
+export function touchMcpUsage(name: string): void {
+  try {
+    const raw = localStorage.getItem(USAGE_KEY);
+    const usage = raw ? (JSON.parse(raw) as Record<string, number>) : {};
+    usage[name] = Date.now();
+    localStorage.setItem(USAGE_KEY, JSON.stringify(usage));
+  } catch {
+    // ignore quota errors
+  }
+}
+
+export function readMcpUsage(): Record<string, number> {
+  try {
+    const raw = localStorage.getItem(USAGE_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, number>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The "hot set": up to `limit` visible servers ordered by most recent use
+ * (unused ones keep their store order). These get native mcp__ tools.
+ */
+export function hotSetMcpServers(
+  projectDir?: string | null,
+  limit = 3,
+): string[] {
+  const usage = readMcpUsage();
+  return Object.entries(visibleMcpServers(projectDir))
+    .map(([name], i) => ({ name, last: usage[name] ?? 0, order: i }))
+    .sort((a, b) => b.last - a.last || a.order - b.order)
+    .slice(0, Math.max(0, limit))
+    .map((s) => s.name);
+}
+
 async function readLegacyConfig(directory: string | null): Promise<Record<string, unknown>> {
   try {
     const path = await invoke<string>("get_opencode_config_path", { directory });

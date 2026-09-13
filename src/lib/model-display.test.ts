@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatModelName, modelLabel } from "@/lib/model-display";
+import { formatModelName, modelLabel, modelLabelWithCatalog } from "@/lib/model-display";
 
 describe("formatModelName", () => {
   it("formats the user's examples", () => {
@@ -68,5 +68,28 @@ describe("modelLabel", () => {
   it("formats when no display name exists", () => {
     expect(modelLabel({ name: "accounts/fireworks/models/glm-5p3" })).toBe("Glm 5.3");
     expect(modelLabel({ name: "gpt-5-mini", displayName: undefined })).toBe("Gpt 5 Mini");
+  });
+});
+
+describe("modelLabelWithCatalog", () => {
+  it("prefers a manually set display name over the catalog", () => {
+    expect(
+      modelLabelWithCatalog({ name: "glm-5p3-flash", displayName: "My GLM" }, "GLM 5.3 Flash"),
+    ).toBe("My GLM");
+  });
+
+  it("prefers the catalog name over the id formatter", () => {
+    expect(
+      modelLabelWithCatalog(
+        { name: "accounts/fireworks/models/glm-5p3-flash" },
+        "GLM 5.3 Flash",
+      ),
+    ).toBe("GLM 5.3 Flash");
+  });
+
+  it("falls back to formatting when the catalog knows nothing", () => {
+    expect(
+      modelLabelWithCatalog({ name: "accounts/fireworks/models/glm-5p3-flash" }, null),
+    ).toBe("Glm 5.3 Flash");
   });
 });

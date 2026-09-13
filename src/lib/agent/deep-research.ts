@@ -25,7 +25,7 @@ import type { ContentPart } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
 import { resolveHistoryBudget, truncateMessagesToBudget } from "@/lib/agent/history";
 import type { AgentEvent, TodoItem, StructuredInputRequest } from "@/lib/agent/types";
-import type { AgentMessage } from "@/lib/agent/runtime";
+import { usageOfMessage, type AgentMessage } from "@/lib/agent/runtime";
 
 const MAX_SUBQUESTIONS = 8;
 const MAX_CONCURRENT = 3;
@@ -244,11 +244,14 @@ async function streamAgentWithReasoning(
         })(),
       ]);
       try {
-        const reason = finishReasonOf(await msg.output);
+        const finalMessage = await msg.output;
+        const reason = finishReasonOf(finalMessage);
         if (reason) {
           finishReason = reason;
           lastMessageText = messageText;
         }
+        const usage = usageOfMessage(finalMessage);
+        if (usage) emit({ type: "usage", usage });
       } catch {
         // no final message (e.g. aborted mid-stream)
       }
@@ -843,8 +846,11 @@ Rules:
           })(),
         ]);
         try {
-          const reason = finishReasonOf(await msg.output);
+          const finalMessage = await msg.output;
+          const reason = finishReasonOf(finalMessage);
           if (reason) finishReason = reason;
+          const usage = usageOfMessage(finalMessage);
+          if (usage) emit({ type: "usage", usage });
         } catch {
           // no final message (e.g. aborted mid-stream)
         }

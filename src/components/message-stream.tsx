@@ -45,8 +45,15 @@ function ActivityChip({ item }: { item: ActivityItem }) {
   const label = item.label ?? formatToolName(item.name);
   const doneLabel =
     item.status === "done"
-      ? label.replace(/^Searching /, "Searched ").replace(/^Fetching /, "Fetched ").replace(/^Creating /, "Created ").replace(/^Running /, "Ran ")
+      ? label
+          .replace(/^Searching /, "Searched ")
+          .replace(/^Fetching /, "Fetched ")
+          .replace(/^Creating /, "Created ")
+          .replace(/^Running /, "Ran ")
+          .replace(/^Writing /, "Wrote ")
+          .replace(/^Reading /, "Read ")
       : label;
+  const hasExpandable = !!(item.detail || item.argsPreview);
 
   // Fetched websites render as plain links to the page — no expandable
   // detail; clicking opens the site.
@@ -75,7 +82,7 @@ function ActivityChip({ item }: { item: ActivityItem }) {
   return (
     <div className="my-1">
       <button
-        onClick={() => item.detail && setExpanded((p) => !p)}
+        onClick={() => hasExpandable && setExpanded((p) => !p)}
         className={cn(
           "group inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs transition-colors",
           item.status === "error"
@@ -83,7 +90,7 @@ function ActivityChip({ item }: { item: ActivityItem }) {
             : item.status === "done"
               ? "text-muted-foreground"
               : "text-muted-foreground",
-          item.detail && "hover:bg-accent",
+          hasExpandable && "hover:bg-accent",
         )}
       >
         <span className="shrink-0">
@@ -92,20 +99,30 @@ function ActivityChip({ item }: { item: ActivityItem }) {
         <span className={cn(item.status === "running" && "shimmer")}>
           {item.status === "running" ? label : doneLabel}
         </span>
-        {item.detail && (
+        {hasExpandable && (
           <span className="shrink-0">
             {expanded ? <ChevronDown className="size-2.5" /> : <ChevronRight className="size-2.5" />}
           </span>
         )}
       </button>
-      {expanded && item.detail && (
+      {expanded && hasExpandable && (
         <div
           className={cn(
-            "mt-0.5 ml-5 max-h-32 overflow-y-auto rounded-md border bg-muted/30 p-2 text-[11px]",
+            "mt-0.5 ml-5 rounded-md border bg-muted/30 p-2 text-[11px]",
             item.status === "error" ? "border-red-500/30 text-red-500/80" : "text-muted-foreground",
           )}
         >
-          <pre className="whitespace-pre-wrap break-all font-sans">{item.detail}</pre>
+          {item.argsPreview && (
+            <div className="max-h-40 overflow-y-auto">
+              <pre className="whitespace-pre-wrap break-all font-mono">{item.argsPreview}</pre>
+            </div>
+          )}
+          {item.argsPreview && item.detail && <div className="my-1.5 border-t" />}
+          {item.detail && (
+            <div className="max-h-32 overflow-y-auto">
+              <pre className="whitespace-pre-wrap break-all font-sans">{item.detail}</pre>
+            </div>
+          )}
         </div>
       )}
     </div>

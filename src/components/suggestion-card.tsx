@@ -18,10 +18,10 @@ import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   installBundledSkill,
-  installCuratedSkill,
-  CURATED_SKILLS,
+  installRegistrySkill,
   getBundledSkillContent,
 } from "@/lib/skills-library";
+import { listAllCatalogSkills } from "@/lib/skill-registry";
 import { summarizeAgentPatch } from "@/lib/agent/tools";
 import { MCP_CATALOG } from "@/lib/mcp-catalog";
 import { getMcpServer, saveMcpServer } from "@/lib/mcp-store";
@@ -258,16 +258,21 @@ export function SuggestionCard({
 
 /**
  * Helper that resolves a skill name to the correct install function.
- * Bundled skills use installBundledSkill; curated skills use installCuratedSkill.
+ * Bundled skills use installBundledSkill; registry/custom skills use
+ * installRegistrySkill.
  */
 export async function installSkillByName(name: string): Promise<void> {
   if (getBundledSkillContent(name)) {
     await installBundledSkill(name, "global");
     return;
   }
-  const curated = CURATED_SKILLS.find((s) => s.name === name);
-  if (curated) {
-    await installCuratedSkill(curated, "global");
+  const catalog = await listAllCatalogSkills();
+  const skill = catalog.find((s) => s.name === name);
+  if (skill?.repo) {
+    await installRegistrySkill(
+      { name: skill.name, repo: skill.repo, dir: skill.dir, branch: skill.branch },
+      "global",
+    );
     return;
   }
   throw new Error(`Unknown skill: ${name}`);

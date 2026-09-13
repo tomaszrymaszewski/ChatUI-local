@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
-import { visibleMcpServers, type McpServerEntry } from "@/lib/mcp-store";
+import { visibleMcpServers, hotSetMcpServers, touchMcpUsage, type McpServerEntry } from "@/lib/mcp-store";
 import { getCatalogEntry } from "@/lib/mcp-catalog";
 import { getAccessToken } from "@/lib/mcp-auth";
 
@@ -100,6 +100,47 @@ async function connectClient(
 }
 
 /**
+ * Auth headers for one server: API-key entries put the collected key on the
+ * wire (explicit entry headers win over the derived ones); OAuth servers
+ * attach the token from the app's token store (written by the native browser
+ * sign-in flow) unless the entry already carries auth.
+ */
+async function headersForEntry(
+  serverName: string,
+  entry: McpServerEntry,
+): Promise<Record<string, string>> {
+  const headers: Record<string, string> = {
+    ...apiKeyHeadersForEntry(serverName, entry),
+    ...(entry.headers ?? {}),
+  };
+  const hasAuthHeader = Object.keys(headers).some(
+    (k) => k.toLowerCase() === "authorization" || k.toLowerCase() === "x-api-key",
+  );
+  if (!hasAuthHeader) {
+    const token = await getAccessToken(serverName);
+    if (token) headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+}
+
+/** Connect one server (with the 10 s timeout race + sidecar warm-up). */
+async function connectServer(serverName: string, entry: McpServerEntry): Promise<Client> {
+  const corsFree = getCatalogEntry(serverName)?.corsFree === true;
+  if (corsFree) {
+    // Warm the local sidecar before connecting: an instant port probe
+    // when it's already up, a real spawn (up to ~15s) on first use.
+    await invoke("browser_mcp_start").catch(() => {});
+  }
+  const headers = await headersForEntry(serverName, entry);
+  return Promise.race([
+    connectClient(entry, headers, corsFree),
+    new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("MCP connect timeout")), 10000),
+    ),
+  ]);
+}
+
+/**
  * Load remote (HTTP/SSE) MCP servers from the connectors config and expose
  * their tools as LangChain tools for the chat agent. stdio servers cannot
  * run in the webview and are skipped (they stay agent-half only).
@@ -118,42 +159,24 @@ export async function loadMcpTools(
   projectDir?: string | null,
   /** Restrict to these connector store keys (sandboxed agents). undefined = all enabled; [] = none. */
   allowedServers?: string[],
+  /** How many eagerly-connected servers to allow (the MRU hot set). */
+  hotSetLimit = 3,
 ): Promise<McpToolsResult> {
   const tools: StructuredTool[] = [];
   const clients: Client[] = [];
   const entries = visibleMcpServers(projectDir);
+  // Only the most recently used servers connect eagerly (native mcp__ tools
+  // with full JSON schemas — costly); the rest stay reachable through the
+  // call_mcp_tool proxy, so a big connector library can't bloat the prompt
+  // or stack connect timeouts onto every send.
+  const hot = new Set(hotSetMcpServers(projectDir, hotSetLimit));
 
   for (const [serverName, entry] of Object.entries(entries)) {
     if (allowedServers && !allowedServers.includes(serverName)) continue;
+    if (!hot.has(serverName)) continue;
     if (!entry.url || !/^https?:\/\//.test(entry.url)) continue;
     try {
-      const corsFree = getCatalogEntry(serverName)?.corsFree === true;
-      if (corsFree) {
-        // Warm the local sidecar before connecting: an instant port probe
-        // when it's already up, a real spawn (up to ~15s) on first use.
-        await invoke("browser_mcp_start").catch(() => {});
-      }
-      // API-key servers: the key collected at add time goes on the wire
-      // (explicit entry headers win over the derived ones). OAuth servers:
-      // attach the token from the app's token store (written by the native
-      // browser sign-in flow) unless the entry already carries auth.
-      const headers: Record<string, string> = {
-        ...apiKeyHeadersForEntry(serverName, entry),
-        ...(entry.headers ?? {}),
-      };
-      const hasAuthHeader = Object.keys(headers).some(
-        (k) => k.toLowerCase() === "authorization" || k.toLowerCase() === "x-api-key",
-      );
-      if (!hasAuthHeader) {
-        const token = await getAccessToken(serverName);
-        if (token) headers.Authorization = `Bearer ${token}`;
-      }
-      const client = await Promise.race([
-        connectClient(entry, headers, corsFree),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("MCP connect timeout")), 10000),
-        ),
-      ]);
+      const client = await connectServer(serverName, entry);
       clients.push(client);
       const { tools: serverTools } = await client.listTools();
       for (const t of serverTools) {
@@ -167,6 +190,7 @@ export async function loadMcpTools(
             description: `${t.description ?? t.name} (MCP: ${serverName})${schemaHint}`,
             schema: z.record(z.string(), z.unknown()),
             func: async (args) => {
+              touchMcpUsage(serverName);
               try {
                 const result = await client.callTool({ name: t.name, arguments: args });
                 const content = (result.content as Array<{ type: string; text?: string }> | undefined) ?? [];
@@ -235,4 +259,119 @@ export async function listRemoteToolSummaries(
   } catch {
     return null;
   }
+}
+
+// ─── On-demand MCP proxy (connect mid-run, use in the same run) ────────────
+
+export interface McpProxy {
+  tools: StructuredTool[];
+  dispose: () => Promise<void>;
+}
+
+/**
+ * Lazy proxy tools for the non-hot connectors: any visible (allowed) server
+ * can be connected and used mid-run — including one the user just connected
+ * from a suggestion card, which previously only worked from the next
+ * message. Clients are cached per proxy instance (one per run) and closed on
+ * dispose.
+ */
+export function createMcpProxy(
+  projectDir?: string | null,
+  /** Restrict to these connector store keys (sandboxed agents). undefined = all visible. */
+  allowedServers?: string[],
+): McpProxy {
+  const clients = new Map<string, Promise<Client>>();
+
+  const connect = (serverName: string): Promise<Client> => {
+    const existing = clients.get(serverName);
+    if (existing) return existing;
+    const entry = visibleMcpServers(projectDir)[serverName];
+    if (!entry?.url || !/^https?:\/\//.test(entry.url)) {
+      return Promise.reject(new Error(`No remote MCP server "${serverName}" in the connector store`));
+    }
+    const pending = connectServer(serverName, entry).catch((err) => {
+      clients.delete(serverName); // failed connects must not poison the cache
+      throw err;
+    });
+    clients.set(serverName, pending);
+    return pending;
+  };
+
+  const checkAllowed = (serverName: string): string | null => {
+    if (allowedServers && !allowedServers.includes(serverName)) {
+      return `Connector "${serverName}" is not available in this run (not enabled for this agent).`;
+    }
+    return null;
+  };
+
+  const listTools = new DynamicStructuredTool({
+    name: "list_mcp_tools",
+    description:
+      "List the tools an external app connector (MCP server) exposes. Use after search_connectors " +
+      "to see what a connector can do, or to discover exact tool names + argument schemas before calling them. " +
+      "Works for connectors that are connected/authenticated — including ones the user just connected " +
+      "from a suggestion card.",
+    schema: z.object({
+      server: z.string().describe("Connector id from search_connectors, e.g. 'github' or 'zapier'."),
+    }),
+    func: async (input: { server: string }) => {
+      const denied = checkAllowed(input.server);
+      if (denied) return denied;
+      try {
+        const client = await connect(input.server);
+        const { tools } = await client.listTools();
+        if (tools.length === 0) return `Connector "${input.server}" exposes no tools.`;
+        const lines = tools.map(
+          (t) =>
+            `- ${t.name}: ${(t.description ?? t.name).replace(/\s+/g, " ").trim()}` +
+            (t.inputSchema ? `\n  args schema: ${JSON.stringify(t.inputSchema)}` : ""),
+        );
+        return `Connector "${input.server}" exposes ${tools.length} tool(s) — call them with call_mcp_tool:\n\n${lines.join("\n")}`;
+      } catch (err) {
+        return `Error: could not connect to "${input.server}" — ${err instanceof Error ? err.message : String(err)}`;
+      }
+    },
+  });
+
+  const callTool = new DynamicStructuredTool({
+    name: "call_mcp_tool",
+    description:
+      "Call a tool on an external app connector (MCP server) on demand — no restart needed. " +
+      "Use search_connectors to find the connector and list_mcp_tools for exact tool names and " +
+      "argument schemas (see the tool's args schema hint in the listing).",
+    schema: z.object({
+      server: z.string().describe("Connector id from search_connectors, e.g. 'github' or 'zapier'."),
+      tool: z.string().describe("Tool name from list_mcp_tools, e.g. 'create_issue'."),
+      args: z
+        .record(z.string(), z.unknown())
+        .optional()
+        .describe("Tool arguments object, matching the tool's args schema."),
+    }),
+    func: async (input: { server: string; tool: string; args?: Record<string, unknown> }) => {
+      const denied = checkAllowed(input.server);
+      if (denied) return denied;
+      try {
+        const client = await connect(input.server);
+        touchMcpUsage(input.server);
+        const result = await client.callTool({ name: input.tool, arguments: input.args ?? {} });
+        const content = (result.content as Array<{ type: string; text?: string }> | undefined) ?? [];
+        const text = content
+          .filter((c) => c.type === "text" && typeof c.text === "string")
+          .map((c) => c.text)
+          .join("\n");
+        return text.slice(0, 12000) || JSON.stringify(result).slice(0, 12000);
+      } catch (err) {
+        return `Error: MCP call failed — ${err instanceof Error ? err.message : String(err)}`;
+      }
+    },
+  });
+
+  return {
+    tools: [listTools, callTool],
+    dispose: async () => {
+      await Promise.allSettled(
+        [...clients.values()].map((p) => p.then((c) => c.close()).catch(() => {})),
+      );
+    },
+  };
 }

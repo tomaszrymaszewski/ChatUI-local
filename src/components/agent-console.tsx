@@ -21,7 +21,8 @@ import type { AgentUpdatePatch } from "@/lib/agents";
 import { modelLabel } from "@/lib/model-display";
 import { describeCadence, deleteSchedule, loadSchedules, subscribeToSchedules, updateSchedule } from "@/lib/schedules";
 import { deleteWorkflow, loadWorkflows, subscribeToWorkflows } from "@/lib/workflows";
-import { ensureAgentWorkspace } from "@/lib/agent/sandbox";
+import { displayHomePath, ensureAgentWorkspace } from "@/lib/agent/sandbox";
+import { useChatUiBaseDir } from "@/hooks/use-chat-ui-base-dir";
 import { AgentAvatar } from "@/components/agent-avatar";
 import type { AgentConsoleTab } from "@/components/app-sidebar";
 import { AgentUsageChart } from "@/components/agent-usage-chart";
@@ -301,6 +302,7 @@ export function AgentConsole({
   const [allChatsConfirm, setAllChatsConfirm] = useState(false);
   /** Confirm before granting "work in every project's folder". */
   const [allProjectsConfirm, setAllProjectsConfirm] = useState(false);
+  const baseDir = useChatUiBaseDir();
 
   // Identity drafts (General tab) — resync when the record changes
   // externally (e.g. the agent editing itself mid-chat).
@@ -604,7 +606,11 @@ export function AgentConsole({
                   <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                     <FolderBox
                       title="Private workspace"
-                      displayPath={`~/Documents/chatUI/agents/${agent.id}`}
+                      displayPath={
+                        baseDir
+                          ? `${displayHomePath(baseDir)}/agents/${agent.id}`
+                          : "…"
+                      }
                       workspace
                       onOpen={() => void openWorkspaceViewer()}
                     />
