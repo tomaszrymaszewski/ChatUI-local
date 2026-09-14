@@ -385,43 +385,18 @@ function buildRoleTools(
             parentId: subagentId,
           },
         });
-        const { httpFetch } = await import("@/lib/http-fetch");
-        try {
-          const resp = await httpFetch(url);
-          if (resp.status < 200 || resp.status >= 300) {
-            emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "error", url, parentId: subagentId } });
-            emit({ type: "activity", activity: { id: `${toolId}-src`, kind: "source", name: hostname, status: "error", url, title: hostname, parentId: subagentId } });
-            return `Error: HTTP ${resp.status}`;
-          }
-          let body: string;
-          if (resp.contentType.includes("text/html")) {
-            body = resp.body
-              .replace(/<script[\s\S]*?<\/script>/gi, "")
-              .replace(/<style[\s\S]*?<\/style>/gi, "")
-              .replace(/<nav[\s\S]*?<\/nav>/gi, "")
-              .replace(/<footer[\s\S]*?<\/footer>/gi, "")
-              .replace(/<header[\s\S]*?<\/header>/gi, "")
-              .replace(/<[^>]+>/g, " ")
-              .replace(/&nbsp;/g, " ")
-              .replace(/&amp;/g, "&")
-              .replace(/&lt;/g, "<")
-              .replace(/&gt;/g, ">")
-              .replace(/&quot;/g, '"')
-              .replace(/&#39;/g, "'")
-              .replace(/\s+/g, " ")
-              .trim()
-              .slice(0, 6000);
-          } else {
-            body = resp.body.slice(0, 6000);
-          }
-          emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "done", url, parentId: subagentId } });
-          emit({ type: "activity", activity: { id: `${toolId}-src`, kind: "source", name: hostname, status: "done", url, title: hostname, parentId: subagentId } });
-          return body;
-        } catch (err) {
+        // Plain HTTP first; bot-challenged pages are re-rendered in the
+        // user's headless Chrome (fetchPageText never throws).
+        const { fetchPageText } = await import("@/lib/http-fetch");
+        const body = await fetchPageText(url, 6000);
+        if (body.startsWith("Error:")) {
           emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "error", url, parentId: subagentId } });
           emit({ type: "activity", activity: { id: `${toolId}-src`, kind: "source", name: hostname, status: "error", url, title: hostname, parentId: subagentId } });
-          return `Error: ${err instanceof Error ? err.message : String(err)}`;
+          return body;
         }
+        emit({ type: "activity", activity: { id: toolId, kind: "tool", name: "web_fetch", status: "done", url, parentId: subagentId } });
+        emit({ type: "activity", activity: { id: `${toolId}-src`, kind: "source", name: hostname, status: "done", url, title: hostname, parentId: subagentId } });
+        return body;
       },
       {
         name: "web_fetch",

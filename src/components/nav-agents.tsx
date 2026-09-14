@@ -1,10 +1,13 @@
 import { useState } from "react";
 import {
+  Bot,
+  Check,
   MoreHorizontal,
   Pencil,
   Plus,
   Settings2,
   Trash2,
+  UserMinus,
 } from "lucide-react"
 import { AgentAvatar } from "@/components/agent-avatar"
 
@@ -13,6 +16,9 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -83,6 +89,7 @@ export function NavAgents({
   onSelectSession,
   onDeleteSession,
   onRenameSession,
+  onMoveSessionToAgent,
   onDeleteAgent,
   onOpenAgentSettings,
   runningIds,
@@ -96,6 +103,7 @@ export function NavAgents({
   onSelectSession: (id: string) => void
   onDeleteSession: (id: string) => void
   onRenameSession?: (id: string, title: string) => void
+  onMoveSessionToAgent?: (sessionId: string, agentId: string | null) => void
   onDeleteAgent: (id: string) => void
   onOpenAgentSettings?: (id: string) => void
   runningIds?: Set<string>
@@ -221,6 +229,44 @@ export function NavAgents({
                         <Pencil className="text-muted-foreground" />
                         <span>Rename</span>
                       </DropdownMenuItem>
+                    )}
+                    {onMoveSessionToAgent && (
+                      <DropdownMenuSub>
+                        <DropdownMenuSubTrigger>
+                          <Bot className="text-muted-foreground" />
+                          <span>Move to agent</span>
+                        </DropdownMenuSubTrigger>
+                        <DropdownMenuSubContent className="max-h-72 overflow-y-auto">
+                          {agents.length === 0 && (
+                            <DropdownMenuItem disabled>
+                              <span>No agents yet</span>
+                            </DropdownMenuItem>
+                          )}
+                          {agents.map((agent) => (
+                            <DropdownMenuItem
+                              key={agent.id}
+                              onClick={() => onMoveSessionToAgent(session.id, agent.id)}
+                            >
+                              <AgentAvatar seed={agent.id} className="size-4" />
+                              <span className="max-w-48 truncate">{agent.name}</span>
+                              {session.agentId === agent.id && (
+                                <Check className="ml-auto size-3.5" />
+                              )}
+                            </DropdownMenuItem>
+                          ))}
+                          {session.agentId && (
+                            <>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                onClick={() => onMoveSessionToAgent(session.id, null)}
+                              >
+                                <UserMinus className="text-muted-foreground" />
+                                <span>Remove from agent</span>
+                              </DropdownMenuItem>
+                            </>
+                          )}
+                        </DropdownMenuSubContent>
+                      </DropdownMenuSub>
                     )}
                     <DropdownMenuSeparator />
                     <DropdownMenuItem

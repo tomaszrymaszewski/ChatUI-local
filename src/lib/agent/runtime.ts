@@ -228,6 +228,9 @@ Local execution:
   short, safe, targeted commands, and explain why each is needed. The user approves commands
   depending on their settings; if one is denied, don't retry it.
 - run_python runs Python for calculations and data processing.
+- open_app opens a Mac app by name so the user can continue there; run_applescript automates
+  scriptable Mac apps (Mail, Calendar, Finder, Music, …) and returns the result. Both need user
+  approval like run_command.
 
 Coding tasks:
 - NEVER write application code files yourself for real coding work. Delegate to a local coding
@@ -309,23 +312,36 @@ function buildAgentSandboxPrompt(sandbox: AgentSandbox): string {
   return lines.join("\n");
 }
 
-const AGENT_BUILDER_PROMPT = `
+export const AGENT_BUILDER_PROMPT = `
 You are the agent builder. The user just clicked "New agent" and this chat sets up a new
 persistent, sandboxed agent.
 
-Your job — interview the user, then create the agent:
-1. Find out what the user wants the agent to do. Ask short follow-up questions with
-   request_structured_input forms (2-4 fields, simple language). If their first message is
-   already specific, confirm the scope in one form instead of interrogating them.
-2. Suggest add-ons: call search_connectors for capabilities that match the purpose, and show
+Your job — grill the user, then create the agent. Their first message is only the starting
+point: you do not know the project until you have asked. Interview one topic at a time with
+request_structured_input forms (2-4 fields, simple language) and cover every topic below,
+even when the first message looks specific — a specific-sounding request still hides
+decisions. Do not skip to creation early.
+1. Job: what the agent produces or does, in the user's own words. Pin down the concrete
+   deliverable or outcome, not just a domain ("help with email" → reading, drafting,
+   sending? which accounts?).
+2. Inputs: where its material comes from (which apps, files, folders, accounts, formats).
+3. Rhythm: one-off on demand, or recurring — how often, on what trigger, at what time.
+4. Scope: what is explicitly NOT its job. Record at least one non-goal before creating.
+5. Integrations: call search_connectors for capabilities that match the purpose, and show
    the best matches with suggest cards. Never suggest anything already connected. Skills need
    no setup — every agent automatically discovers installed skills when it needs them, so do
    not interview about skills.
-3. Final form: confirm the agent's name and whether it needs terminal/command access. Local
-   file access needs no permission — the agent can always work in its private workspace, and
-   the user grants extra folders in the agent's settings after creation.
-4. Call create_agent exactly once with the agreed definition, then confirm to the user that the
-   agent is ready and that they can start sessions with it from the sidebar (Agents).
+6. Permissions: confirm whether it needs terminal/command access. Local file access needs no
+   permission — the agent can always work in its private workspace, and the user grants extra
+   folders in the agent's settings after creation.
+7. Done means: how the user will tell the agent did its job. Record the success check.
+8. Final form: confirm the agent's name plus the settled job, rhythm, scope, and permissions
+   back to the user.
+Then call create_agent exactly once with the agreed definition — and write everything
+settled above into its system_prompt (identity, inputs, rhythm, non-goals, success check),
+so the agent knows the whole project, not just the first message. Afterwards confirm to the
+user in one short sentence that the agent is ready and that they can start sessions with it
+from the sidebar (Agents).
 
 The created agent is focused and self-contained: it runs only on its own system prompt, the
 connectors chosen here, and the tools it needs. It does not share the user's universal memory.
@@ -495,6 +511,10 @@ export function toolCallLabel(name: string, input: unknown): string | undefined 
   }
   if (name === "run_python") return "Running Python";
   if (name === "run_node") return "Running Node";
+  if (name === "open_app" && typeof args.app === "string") {
+    return `Opening ${args.app.slice(0, 40)}`;
+  }
+  if (name === "run_applescript") return "Running AppleScript";
   if (name === "create_artifact" && typeof args.title === "string") {
     return `Creating "${args.title.slice(0, 40)}"`;
   }
@@ -547,6 +567,9 @@ export function toolCallArgsPreview(name: string, input: unknown): string | unde
   }
   if (name === "run_command") {
     return typeof args.command === "string" ? clipPreview(args.command, ARGS_PREVIEW_COMMAND_CHARS) : undefined;
+  }
+  if (name === "run_applescript") {
+    return typeof args.script === "string" ? clipPreview(args.script, ARGS_PREVIEW_COMMAND_CHARS) : undefined;
   }
   if (name === "read_local_file") {
     return typeof args.path === "string" ? args.path : undefined;
@@ -610,7 +633,13 @@ export class DeepAgentSession {
       opts.deliverablesDir,
     );
     if (profile === "task" && opts.enableCommandTools === false) {
-      tools = tools.filter((t) => t.name !== "run_command" && t.name !== "run_coding_task");
+      tools = tools.filter(
+        (t) =>
+          t.name !== "run_command" &&
+          t.name !== "run_coding_task" &&
+          t.name !== "open_app" &&
+          t.name !== "run_applescript",
+      );
     }
 
     const agent = await createDeepAgent({

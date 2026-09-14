@@ -14,6 +14,7 @@ import {
   updateMessageHeadless,
 } from "@/hooks/use-messages";
 import { ensureAgentWorkspace } from "@/lib/agent/sandbox";
+import { notifyTaskFinished } from "@/lib/notify";
 import { globalSkillsDirectory } from "@/lib/skills-library";
 import { renderStepPrompt } from "@/lib/workflows";
 
@@ -182,12 +183,22 @@ export async function runHeadlessTask(opts: {
     files: result.files?.length ? result.files : undefined,
   });
 
-  return {
+  const outcome: HeadlessRunOutcome = {
     sessionId,
     content: result.content,
     cancelled: result.cancelled,
     error: result.cancelled ? "Run was stopped" : undefined,
   };
+  // Headless runs are never watched — ping on completion when enabled
+  // (notifyTaskFinished never rejects, so this can't break the outcome).
+  if (loadUserSettings().taskFinishNotifications) {
+    const label = opts.title || agentDef?.name || "Background task";
+    await notifyTaskFinished(
+      outcome.error ? `${label} failed` : `${label} finished`,
+      outcome.error ?? result.content.slice(0, 200) ?? "Done.",
+    );
+  }
+  return outcome;
 }
 
 /**

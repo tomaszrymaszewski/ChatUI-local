@@ -4,6 +4,8 @@ import { tool, type StructuredTool } from "langchain";
 import { executeTool } from "@/lib/tools";
 import { runPython } from "@/lib/run-python";
 import { runCommand } from "@/lib/run-command";
+import { runAppleScript } from "@/lib/run-applescript";
+import { openApp } from "@/lib/open-app";
 import { runNode } from "@/lib/run-node";
 import {
   detectCodingAgents,
@@ -1052,6 +1054,76 @@ export function buildAgentTools(
             command: z.string().describe("The shell command to execute."),
             cwd: z.string().optional().describe("Working directory (absolute path)."),
             reason: z.string().optional().describe("One line: why this command is needed."),
+          }),
+        },
+      ),
+      tool(
+        async ({ app, reason }: { app: string; reason?: string }) => {
+          const ctx = ctxFn();
+          if (!ctx?.requestApproval) {
+            return "Error: app approval is not available in this context. Tell the user what you wanted to open instead.";
+          }
+          // Same approval card as run_command: resolves immediately in auto
+          // mode, otherwise the user explicitly allows or denies the open.
+          const { approved } = await ctx.requestApproval({
+            command: `Open "${app}"`,
+            source: "open_app",
+            reason,
+          });
+          if (!approved) {
+            return "The user denied opening this app. Do not retry it — ask what to do differently or continue without it.";
+          }
+          try {
+            return await openApp(app);
+          } catch (err) {
+            return `Error: could not open "${app}" — ${err instanceof Error ? err.message : String(err)}`;
+          }
+        },
+        {
+          name: "open_app",
+          description:
+            "Open a Mac app by name (e.g. 'Mail', 'Calendar', 'Preview', 'Music') so the user can " +
+            "continue there. Use after preparing something for another app, or when the user asks to " +
+            "open one. The user approves each open.",
+          schema: z.object({
+            app: z.string().describe("App name as shown in /Applications, e.g. 'Mail'."),
+            reason: z.string().optional().describe("One line: why this app should be opened."),
+          }),
+        },
+      ),
+      tool(
+        async ({ script, reason }: { script: string; reason?: string }) => {
+          const ctx = ctxFn();
+          if (!ctx?.requestApproval) {
+            return "Error: app approval is not available in this context. Tell the user what you wanted to automate instead.";
+          }
+          const { approved } = await ctx.requestApproval({
+            command: script,
+            source: "run_applescript",
+            reason,
+          });
+          if (!approved) {
+            return "The user denied this automation. Do not retry it — ask what to do differently or continue without it.";
+          }
+          const result = await runAppleScript(script);
+          const parts: string[] = [];
+          if (result.stdout) parts.push(`stdout:\n${result.stdout.slice(0, 8000)}`);
+          if (result.stderr) parts.push(`stderr:\n${result.stderr.slice(0, 4000)}`);
+          if (result.timedOut) parts.push("(automation timed out and was killed)");
+          parts.push(`exit code: ${result.exitCode}`);
+          return parts.join("\n\n");
+        },
+        {
+          name: "run_applescript",
+          description:
+            "Automate scriptable Mac apps with AppleScript (Mail, Calendar, Finder, Music, " +
+            "System Events, …): read or organize emails and events, reveal files, start " +
+            "playlists, read window titles. Prefer `tell application \"X\"` blocks; GUI " +
+            "scripting via System Events only when no scripting dictionary exists. " +
+            "The user approves each script.",
+          schema: z.object({
+            script: z.string().describe("Complete AppleScript to execute."),
+            reason: z.string().optional().describe("One line: what this automation does."),
           }),
         },
       ),

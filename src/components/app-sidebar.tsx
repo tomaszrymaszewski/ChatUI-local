@@ -146,6 +146,7 @@ export function AppSidebar({
   onNewChat,
   onDeleteChat,
   onRenameChat,
+  onMoveSessionToAgent,
   onSettings,
   onSettingsTabChange,
   onExitSettings,
@@ -180,6 +181,7 @@ export function AppSidebar({
   onNewChat: () => void
   onDeleteChat: (id: string) => void
   onRenameChat?: (id: string, title: string) => void
+  onMoveSessionToAgent?: (sessionId: string, agentId: string | null) => void
   onSettings?: () => void
   onSettingsTabChange?: (tab: SettingsTab) => void
   onExitSettings?: () => void
@@ -415,6 +417,7 @@ export function AppSidebar({
                 onSelectSession={onSelectSession}
                 onDeleteSession={onDeleteChat}
                 onRenameSession={onRenameChat}
+                onMoveSessionToAgent={onMoveSessionToAgent}
                 onDeleteAgent={(id) => onDeleteAgent?.(id)}
                 onOpenAgentSettings={(id) => onOpenAgentSettings?.(id)}
                 runningIds={runningIds}

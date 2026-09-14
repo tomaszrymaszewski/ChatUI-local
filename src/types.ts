@@ -278,4 +278,6 @@ export interface UserSettings {
   knowledgeSources: KnowledgeSourceToggles;
   /** Compress tool outputs and chat history via the local Headroom proxy. */
   contextCompression: boolean;
+  /** Post a macOS notification when a background task finishes. */
+  taskFinishNotifications: boolean;
 }

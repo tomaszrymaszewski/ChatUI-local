@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { toolCallArgsPreview, toolCallLabel, usageOfMessage } from "./runtime";
+import { AGENT_BUILDER_PROMPT, toolCallArgsPreview, toolCallLabel, usageOfMessage } from "./runtime";
 
 describe("toolCallArgsPreview", () => {
   it("previews write_local_file with a path header and content head", () => {
@@ -76,6 +76,17 @@ describe("toolCallLabel", () => {
     expect(toolCallLabel("run_python", {})).toBe("Running Python");
     expect(toolCallLabel("create_artifact", { title: "Report" })).toBe('Creating "Report"');
   });
+
+  it("labels Mac app tools", () => {
+    expect(toolCallLabel("open_app", { app: "Mail" })).toBe("Opening Mail");
+    expect(toolCallLabel("run_applescript", { script: "tell X" })).toBe("Running AppleScript");
+  });
+
+  it("previews AppleScript source like shell commands", () => {
+    expect(toolCallArgsPreview("run_applescript", { script: "tell X" })).toBe("tell X");
+    const long = toolCallArgsPreview("run_applescript", { script: "x".repeat(3000) });
+    expect(long).toContain("… truncated (3000 chars total)");
+  });
 });
 
 describe("usageOfMessage", () => {
@@ -99,5 +110,28 @@ describe("usageOfMessage", () => {
     expect(usageOfMessage({})).toBeNull();
     expect(usageOfMessage({ usage_metadata: { input_tokens: 0, output_tokens: 0 } })).toBeNull();
     expect(usageOfMessage({ usage_metadata: { input_tokens: "x" } })).toBeNull();
+  });
+});
+
+describe("AGENT_BUILDER_PROMPT", () => {
+  it("grills every topic instead of trusting the first message", () => {
+    for (const topic of [
+      "Inputs",
+      "Rhythm",
+      "Scope",
+      "non-goal",
+      "Permissions",
+      "Done means",
+    ]) {
+      expect(AGENT_BUILDER_PROMPT).toContain(topic);
+    }
+    expect(AGENT_BUILDER_PROMPT).toMatch(/even when the first message looks specific/);
+    expect(AGENT_BUILDER_PROMPT).toMatch(/Do not skip to creation early/);
+  });
+
+  it("records everything into the agent via a single create_agent call", () => {
+    expect(AGENT_BUILDER_PROMPT).toMatch(/create_agent exactly once/);
+    expect(AGENT_BUILDER_PROMPT).toMatch(/write everything\s+settled above into its system_prompt/);
+    expect(AGENT_BUILDER_PROMPT).toMatch(/not just the first message/);
   });
 });

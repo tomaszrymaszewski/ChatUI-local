@@ -153,3 +153,36 @@ describe("mcp proxy tools", () => {
     await proxy.dispose();
   });
 });
+
+describe("Mac app tools", () => {
+  it("are available in the task profile alongside run_command", () => {
+    const names = buildAgentTools(true, () => null, "task", true).map((t) => t.name);
+    expect(names).toContain("open_app");
+    expect(names).toContain("run_applescript");
+    expect(names).toContain("run_command");
+    for (const name of names) {
+      expect(RESERVED.has(name), `${name} collides with a deepagents built-in`).toBe(false);
+    }
+  });
+
+  it("are withheld from the plain chat profile", () => {
+    const names = buildAgentTools(true, () => null, "chat").map((t) => t.name);
+    expect(names).not.toContain("open_app");
+    expect(names).not.toContain("run_applescript");
+  });
+
+  it("accepts (app) and (script) at the schema level", () => {
+    const tools = buildAgentTools(true, () => null, "task", true);
+    const open = tools.find((t) => t.name === "open_app");
+    const script = tools.find((t) => t.name === "run_applescript");
+    expect((open!.schema as z.ZodObject).parse({ app: "Mail" }).app).toBe("Mail");
+    expect((script!.schema as z.ZodObject).parse({ script: "tell X" }).script).toBe("tell X");
+  });
+
+  it("reports missing approval context instead of throwing", async () => {
+    const tools = buildAgentTools(true, () => null, "task", true);
+    const open = tools.find((t) => t.name === "open_app");
+    const result = await open!.invoke({ app: "Mail" });
+    expect(result).toContain("approval is not available");
+  });
+});

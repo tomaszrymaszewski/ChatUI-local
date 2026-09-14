@@ -1416,13 +1416,26 @@ fn exchange_code(
     Ok(body)
 }
 
-/// Merge a fresh token set for `name` into the app-owned store.
+/// Token endpoint persisted at sign-in, if any (bring-your-own-client
+/// entries — refresh prefers it over re-running discovery).
+fn stored_token_endpoint(entry: &serde_json::Value) -> Option<String> {
+    entry
+        .get("tokenEndpoint")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+/// Merge a fresh token set for `name` into the app-owned store. The token
+/// endpoint is persisted too so refresh works for bring-your-own-client
+/// servers (e.g. Google's MCP endpoints), which publish no discovery
+/// metadata to re-resolve it from.
 fn store_mcp_tokens(
     name: &str,
     server_url: &str,
     client_id: &str,
     client_secret: Option<&str>,
     tokens: &serde_json::Value,
+    token_endpoint: Option<&str>,
 ) -> Result<(), String> {
     let path = ensure_mcp_auth_file()?;
     let content = fs::read_to_string(&path).unwrap_or_else(|_| "{}".to_string());
@@ -1461,11 +1474,14 @@ fn store_mcp_tokens(
     }
     client_info.insert("clientIdIssuedAt".into(), serde_json::json!(now));
 
-    let entry = serde_json::json!({
+    let mut entry = serde_json::json!({
         "tokens": serde_json::Value::Object(token_obj),
         "clientInfo": serde_json::Value::Object(client_info),
         "serverUrl": server_url,
     });
+    if let Some(endpoint) = token_endpoint {
+        entry["tokenEndpoint"] = serde_json::Value::String(endpoint.to_string());
+    }
     if let Some(obj) = data.as_object_mut() {
         obj.insert(name.to_string(), entry);
     }
@@ -1588,9 +1604,14 @@ fn oauth_callback_loop(
             &code_verifier,
         ) {
             Ok(tokens) => {
-                if let Err(e) =
-                    store_mcp_tokens(&name, &server_url, &client_id, client_secret.as_deref(), &tokens)
-                {
+                if let Err(e) = store_mcp_tokens(
+                    &name,
+                    &server_url,
+                    &client_id,
+                    client_secret.as_deref(),
+                    &tokens,
+                    Some(&token_endpoint),
+                ) {
                     eprintln!("[mcp-oauth] failed to store tokens for {}: {}", name, e);
                 }
             }
@@ -1612,6 +1633,42 @@ struct StaticOauthClient {
     /// Scopes to request; replaces the AS metadata's (GitHub advertises only
     /// "offline_access", which alone grants no API access).
     scopes: &'static str,
+}
+
+/// Fully resolved OAuth parameters for one sign-in flow.
+struct ResolvedOAuth {
+    token_endpoint: String,
+    authorization_endpoint: String,
+    scopes: Vec<String>,
+    client_id: String,
+    client_secret: Option<String>,
+    redirect_uri: String,
+    extra_params: Vec<(String, String)>,
+}
+
+/// Resolve a caller-supplied OAuth client (bring-your-own-client): the user
+/// created this client at the provider — e.g. a Google Cloud OAuth client
+/// for the official Google Workspace MCP servers, which publish no
+/// registration endpoint — and pasted its credentials into the app. Fixed
+/// provider endpoints, no discovery or registration to attempt. Pure (no
+/// network) so the mapping stays unit-tested.
+fn resolve_custom_oauth(
+    client_id: String,
+    client_secret: Option<String>,
+    authorize_url: String,
+    token_url: String,
+    scopes: String,
+    extra_params: Option<std::collections::HashMap<String, String>>,
+) -> ResolvedOAuth {
+    ResolvedOAuth {
+        token_endpoint: token_url,
+        authorization_endpoint: authorize_url,
+        scopes: scopes.split_whitespace().map(|s| s.to_string()).collect(),
+        client_id,
+        client_secret,
+        redirect_uri: format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT),
+        extra_params: extra_params.unwrap_or_default().into_iter().collect(),
+    }
 }
 
 /// The static client for an authorization server, if one is known.
@@ -1641,7 +1698,16 @@ fn static_client_for(meta: &serde_json::Value) -> Option<StaticOauthClient> {
 /// exchange + token storage happen in the background; the frontend polls
 /// read_mcp_auth to observe completion.
 #[tauri::command]
-async fn mcp_oauth_begin(name: String, server_url: String) -> Result<String, String> {
+async fn mcp_oauth_begin(
+    name: String,
+    server_url: String,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    authorize_url: Option<String>,
+    token_url: Option<String>,
+    scopes: Option<String>,
+    extra_params: Option<std::collections::HashMap<String, String>>,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         // Abort any previous flow so two sign-ins never race for the port.
         if let Some(prev) = AUTH_FLOW.lock().unwrap().as_ref() {
@@ -1654,87 +1720,121 @@ async fn mcp_oauth_begin(name: String, server_url: String) -> Result<String, Str
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| e.to_string())?;
-        let meta = discover_oauth_metadata(&client, &server_url)?;
-        let token_endpoint = meta
-            .get("token_endpoint")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "OAuth metadata missing token_endpoint".to_string())?
-            .to_string();
-        let authorization_endpoint = meta
-            .get("authorization_endpoint")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "OAuth metadata missing authorization_endpoint".to_string())?
-            .to_string();
-        let mut scopes: Vec<String> = meta
-            .get("scopes_supported")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|s| s.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
 
-        // Dynamic client registration (RFC 7591) — the MCP-spec path.
-        // Servers without it fall back to a pre-registered public client
-        // (see static_client_for).
-        let (client_id, client_secret, redirect_uri) =
-            match meta.get("registration_endpoint").and_then(|v| v.as_str()) {
-                Some(registration_endpoint) => {
-                    let resp = client
-                        .post(registration_endpoint)
-                        .json(&serde_json::json!({
-                            "client_name": "AI Studio",
-                            "redirect_uris": [format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT)],
-                            "grant_types": ["authorization_code"],
-                            "response_types": ["code"],
-                            "token_endpoint_auth_method": "none",
-                        }))
-                        .send()
-                        .map_err(|e| format!("Client registration failed: {}", e))?;
-                    let status = resp.status();
-                    let body: serde_json::Value = resp.json().map_err(|e| format!("Bad registration response: {}", e))?;
-                    if !status.is_success() {
-                        let detail = body
-                            .get("error_description")
-                            .or_else(|| body.get("error"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown error");
-                        return Err(format!(
-                            "Client registration rejected ({}): {}",
-                            status, detail
-                        ));
-                    }
-                    let id = body
-                        .get("client_id")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| "Registration response missing client_id".to_string())?
-                        .to_string();
-                    let secret = body
-                        .get("client_secret")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                    (
-                        id,
-                        secret,
-                        format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT),
-                    )
+        // Bring-your-own-client: all custom fields present means fixed
+        // provider endpoints with user-supplied credentials — no discovery,
+        // no registration to attempt. Any custom field missing falls back to
+        // the standard discovery + registration path.
+        let custom = match (client_id, authorize_url, token_url, scopes) {
+            (Some(id), Some(authz), Some(token), Some(sc)) => Some(resolve_custom_oauth(
+                id, client_secret, authz, token, sc, extra_params,
+            )),
+            _ => None,
+        };
+        let resolved = match custom {
+            Some(resolved) => resolved,
+            None => {
+                let meta = discover_oauth_metadata(&client, &server_url)?;
+                let token_endpoint = meta
+                    .get("token_endpoint")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "OAuth metadata missing token_endpoint".to_string())?
+                    .to_string();
+                let authorization_endpoint = meta
+                    .get("authorization_endpoint")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "OAuth metadata missing authorization_endpoint".to_string())?
+                    .to_string();
+                let mut scopes: Vec<String> = meta
+                    .get("scopes_supported")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                // Dynamic client registration (RFC 7591) — the MCP-spec path.
+                // Servers without it fall back to a pre-registered public client
+                // (see static_client_for).
+                let (client_id, client_secret, redirect_uri) =
+                    match meta.get("registration_endpoint").and_then(|v| v.as_str()) {
+                        Some(registration_endpoint) => {
+                            let resp = client
+                                .post(registration_endpoint)
+                                .json(&serde_json::json!({
+                                    "client_name": "AI Studio",
+                                    "redirect_uris": [format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT)],
+                                    "grant_types": ["authorization_code"],
+                                    "response_types": ["code"],
+                                    "token_endpoint_auth_method": "none",
+                                }))
+                                .send()
+                                .map_err(|e| format!("Client registration failed: {}", e))?;
+                            let status = resp.status();
+                            let body: serde_json::Value = resp.json().map_err(|e| format!("Bad registration response: {}", e))?;
+                            if !status.is_success() {
+                                let detail = body
+                                    .get("error_description")
+                                    .or_else(|| body.get("error"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown error");
+                                return Err(format!(
+                                    "Client registration rejected ({}): {}",
+                                    status, detail
+                                ));
+                            }
+                            let id = body
+                                .get("client_id")
+                                .and_then(|v| v.as_str())
+                                .ok_or_else(|| "Registration response missing client_id".to_string())?
+                                .to_string();
+                            let secret = body
+                                .get("client_secret")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            (
+                                id,
+                                secret,
+                                format!("http://localhost:{}/callback", MCP_OAUTH_CALLBACK_PORT),
+                            )
+                        }
+                        None => {
+                            let sc = static_client_for(&meta).ok_or_else(|| {
+                                "This MCP server does not support dynamic client registration, which this app needs for sign-in."
+                                    .to_string()
+                            })?;
+                            if !sc.scopes.is_empty() {
+                                scopes = sc.scopes.split_whitespace().map(|s| s.to_string()).collect();
+                            }
+                            (
+                                sc.client_id.to_string(),
+                                sc.client_secret.map(|s| s.to_string()),
+                                format!("http://{}:{}/callback", sc.redirect_host, MCP_OAUTH_CALLBACK_PORT),
+                            )
+                        }
+                    };
+                ResolvedOAuth {
+                    token_endpoint,
+                    authorization_endpoint,
+                    scopes,
+                    client_id,
+                    client_secret,
+                    redirect_uri,
+                    extra_params: Vec::new(),
                 }
-                None => {
-                    let sc = static_client_for(&meta).ok_or_else(|| {
-                        "This MCP server does not support dynamic client registration, which this app needs for sign-in."
-                            .to_string()
-                    })?;
-                    if !sc.scopes.is_empty() {
-                        scopes = sc.scopes.split_whitespace().map(|s| s.to_string()).collect();
-                    }
-                    (
-                        sc.client_id.to_string(),
-                        sc.client_secret.map(|s| s.to_string()),
-                        format!("http://{}:{}/callback", sc.redirect_host, MCP_OAUTH_CALLBACK_PORT),
-                    )
-                }
-            };
+            }
+        };
+        let ResolvedOAuth {
+            token_endpoint,
+            authorization_endpoint,
+            scopes,
+            client_id,
+            client_secret,
+            redirect_uri,
+            extra_params,
+        } = resolved;
 
         let code_verifier = random_token(32);
         let challenge = pkce_challenge(&code_verifier);
@@ -1751,6 +1851,9 @@ async fn mcp_oauth_begin(name: String, server_url: String) -> Result<String, Str
             .append_pair("code_challenge_method", "S256");
         if !scopes.is_empty() {
             authorize.query_pairs_mut().append_pair("scope", &scopes.join(" "));
+        }
+        for (k, v) in &extra_params {
+            authorize.query_pairs_mut().append_pair(k, v);
         }
 
         // Bind before returning so a busy port fails fast, then hand the
@@ -1818,11 +1921,16 @@ async fn refresh_mcp_token(name: String) -> Result<String, String> {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| e.to_string())?;
-        let token_endpoint = discover_oauth_metadata(&client, &server_url)?
-            .get("token_endpoint")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "OAuth metadata missing token_endpoint".to_string())?
-            .to_string();
+        // Bring-your-own-client entries persist their token endpoint at
+        // sign-in (no discovery metadata to re-resolve it from).
+        let token_endpoint = stored_token_endpoint(entry).or_else(|| {
+            discover_oauth_metadata(&client, &server_url)
+                .ok()?
+                .get("token_endpoint")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .ok_or_else(|| "OAuth metadata missing token_endpoint".to_string())?;
 
         let mut form = vec![
             ("grant_type", "refresh_token".to_string()),
@@ -2079,6 +2187,190 @@ async fn http_post_json(url: String, body: String, timeout_ms: Option<u64>) -> R
         let body: String = body.chars().take(500_000).collect();
 
         Ok(HttpFetchResponse { status, status_text, content_type, body })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ─── Headless-browser fetch ────────────────────────────────────────────────
+
+/// macOS .app bundle executables for Chromium-based browsers, most preferred
+/// first. Chrome is primary; Chromium / Brave / Edge share the same
+/// `--headless --dump-dom` CLI, so any of them renders pages the same way.
+#[cfg(target_os = "macos")]
+fn browser_app_candidates() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = vec![PathBuf::from("/Applications")];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join("Applications"));
+    }
+    let rels = [
+        "Google Chrome.app/Contents/MacOS/Google Chrome",
+        "Chromium.app/Contents/MacOS/Chromium",
+        "Brave Browser.app/Contents/MacOS/Brave Browser",
+        "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ];
+    roots
+        .iter()
+        .flat_map(|root| rels.iter().map(|rel| root.join(rel)))
+        .collect()
+}
+
+/// Binary names probed on PATH (covers macOS homebrew, Linux, Windows).
+fn browser_path_names() -> Vec<&'static str> {
+    vec![
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "brave-browser",
+        "microsoft-edge",
+        "chrome",
+    ]
+}
+
+/// Locate a Chromium-based browser binary: installed .app bundles first
+/// (macOS), then PATH. Returns the executable path.
+fn find_headless_browser() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    for candidate in browser_app_candidates() {
+        if candidate.is_file() {
+            return Some(candidate.to_string_lossy().to_string());
+        }
+    }
+    for name in browser_path_names() {
+        let found = Command::new("sh")
+            .arg("-lc")
+            .arg(format!("command -v {}", name))
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|p| !p.is_empty());
+        if let Some(path) = found {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// CLI args that render a URL to its post-JS DOM on stdout (`--dump-dom`).
+/// A throwaway profile dir keeps the user's real browser profile untouched
+/// (and avoids Singleton lock failures while the browser is already running).
+fn headless_dump_args(profile_dir: &str, url: &str, timeout_ms: u64) -> Vec<String> {
+    vec![
+        "--headless=new".to_string(),
+        "--no-sandbox".to_string(),
+        "--disable-gpu".to_string(),
+        "--disable-dev-shm-usage".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        format!("--user-data-dir={}", profile_dir),
+        // Let in-page JS settle (search pages render results asynchronously).
+        "--virtual-time-budget=8000".to_string(),
+        // Hard cap on the page load itself, inside the outer kill timeout.
+        format!("--timeout={}", timeout_ms.min(60000)),
+        "--dump-dom".to_string(),
+        url.to_string(),
+    ]
+}
+
+/// Render a URL in the user's installed headless Chrome (Chromium / Brave /
+/// Edge when Chrome is absent) and return the post-JS DOM as HTML.
+///
+/// Plain `http_fetch` (reqwest) is increasingly answered with bot challenges
+/// (Bing/DuckDuckGo interstitials, JS-gated pages), which made every agent
+/// search unusable. A real browser engine executes the page's JS and carries
+/// a genuine UA, so search-result pages and article bodies come back rendered.
+/// Same `HttpFetchResponse` shape as `http_fetch` so callers can swap between
+/// them. The URL travels as a single argv entry (no shell), and only
+/// http(s) URLs are accepted.
+#[tauri::command]
+async fn browser_fetch(url: String, timeout_ms: Option<u64>) -> Result<HttpFetchResponse, String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("browser_fetch only supports http(s) URLs".to_string());
+    }
+    let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000));
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+
+        let browser = find_headless_browser().ok_or_else(|| {
+            "No Chrome/Chromium browser found — install Google Chrome, Chromium, Brave, or Edge to enable browser search".to_string()
+        })?;
+
+        let profile_dir = std::env::temp_dir().join(format!(
+            "chatui-browser-profile-{}-{}",
+            std::process::id(),
+            now_unix()
+        ));
+        let profile = profile_dir.to_string_lossy().to_string();
+        let total_ms: u64 = timeout.as_millis().try_into().unwrap_or(30000);
+
+        let mut child = Command::new(&browser)
+            .args(headless_dump_args(&profile, &url, total_ms))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Failed to start browser ({}): {}", browser, e))?;
+
+        let stdout_handle = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = out.read_to_string(&mut s);
+                s
+            })
+        });
+        let stderr_handle = child.stderr.take().map(|mut err| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = err.read_to_string(&mut s);
+                s
+            })
+        });
+
+        let start = std::time::Instant::now();
+        let mut timed_out = false;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        timed_out = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    let _ = fs::remove_dir_all(&profile_dir);
+                    return Err(format!("Failed to wait on browser: {}", e));
+                }
+            }
+        }
+
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let _ = fs::remove_dir_all(&profile_dir);
+
+        if timed_out {
+            return Err(format!("Browser fetch timed out after {}ms: {}", total_ms, url));
+        }
+        if stdout.trim().is_empty() {
+            let tail: String = stderr.chars().rev().take(500).collect::<String>().chars().rev().collect();
+            return Err(format!("Browser returned an empty page for {}: {}", url, tail.trim()));
+        }
+        // Bound the payload crossing IPC, like http_fetch.
+        let body: String = stdout.chars().take(500_000).collect();
+        Ok(HttpFetchResponse {
+            status: 200,
+            status_text: "OK".to_string(),
+            content_type: "text/html".to_string(),
+            body,
+        })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -2426,6 +2718,143 @@ async fn run_node(
         let stderr: String = stderr.chars().take(200_000).collect();
 
         Ok(NodeRunResult { stdout, stderr, exit_code, timed_out })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ─── macOS app control (agent open_app / run_applescript tools) ───────────
+
+/// Reject blank app names up front so `open -a` never runs with junk.
+fn validate_open_target(app: &str) -> Result<(), String> {
+    if app.trim().is_empty() {
+        return Err("App name cannot be empty".to_string());
+    }
+    Ok(())
+}
+
+/// Open a macOS app by name (`open -a`) so agents can hand off to other apps
+/// on the machine (Mail, Calendar, Preview, …). The app launches
+/// asynchronously — `open` exits once the launch is handed off — so there is
+/// no timeout to enforce; a non-zero exit means the app wasn't found.
+#[tauri::command]
+async fn open_app(app: String, args: Option<Vec<String>>) -> Result<String, String> {
+    validate_open_target(&app)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut cmd = Command::new("open");
+        cmd.arg("-a").arg(&app);
+        if let Some(extra) = args.as_ref() {
+            // Cap forwarded arguments; each travels as its own argv entry.
+            for a in extra.iter().take(20) {
+                cmd.arg(a);
+            }
+        }
+        let status = cmd
+            .status()
+            .map_err(|e| format!("Failed to open {}: {}", app, e))?;
+        if status.success() {
+            Ok(format!("Opened {}", app))
+        } else {
+            Err(format!("Could not open \"{}\" (is the app installed?)", app))
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Run an AppleScript snippet with the system osascript (the agent's
+/// run_applescript tool — automating scriptable Mac apps). Same safety
+/// pattern as run_python: the script is written to a temp file (no shell
+/// quoting pitfalls), pipes drained on separate threads, try_wait polling,
+/// kill on timeout. Reuses CommandRunResult so the frontend reads the same
+/// exitCode/timedOut shape as run_command.
+#[tauri::command]
+async fn run_applescript(
+    script: String,
+    timeout_ms: Option<u64>,
+) -> Result<CommandRunResult, String> {
+    if script.trim().is_empty() {
+        return Err("AppleScript cannot be empty".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+
+        let timeout = Duration::from_millis(timeout_ms.unwrap_or(30000));
+
+        let script_path = std::env::temp_dir().join(format!(
+            "chatui-applescript-{}-{}.scpt",
+            std::process::id(),
+            now_unix()
+        ));
+        fs::write(&script_path, &script)
+            .map_err(|e| format!("Failed to write temp script: {}", e))?;
+
+        let mut child = Command::new("osascript")
+            .arg(&script_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                let _ = fs::remove_file(&script_path);
+                format!("Failed to start osascript: {}", e)
+            })?;
+
+        let stdout_handle = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = out.read_to_string(&mut s);
+                s
+            })
+        });
+        let stderr_handle = child.stderr.take().map(|mut err| {
+            std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = err.read_to_string(&mut s);
+                s
+            })
+        });
+
+        let start = std::time::Instant::now();
+        let mut timed_out = false;
+        let mut final_status: Option<std::process::ExitStatus> = None;
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    final_status = Some(status);
+                    break;
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        timed_out = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    let _ = fs::remove_file(&script_path);
+                    return Err(format!("Failed to wait on osascript: {}", e));
+                }
+            }
+        }
+
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+
+        let exit_code = final_status.and_then(|s| s.code()).unwrap_or(-1);
+
+        let _ = fs::remove_file(&script_path);
+
+        // Bound the payloads crossing IPC.
+        let stdout: String = stdout.chars().take(200_000).collect();
+        let stderr: String = stderr.chars().take(200_000).collect();
+
+        Ok(CommandRunResult { stdout, stderr, exit_code, timed_out })
     })
     .await
     .map_err(|e| e.to_string())?
@@ -3598,6 +4027,45 @@ mod tests {
         assert!(!obj.contains_key("content_type"));
     }
 
+    // browser_fetch renders through the user's installed browser: Chrome
+    // first, Chromium-family fallbacks next, PATH lookup last.
+    #[test]
+    fn headless_browser_prefers_chrome_over_fallbacks() {
+        let names = super::browser_path_names();
+        assert_eq!(names[0], "google-chrome");
+        assert!(names.contains(&"chromium"));
+        assert!(names.contains(&"brave-browser"));
+        assert!(names.contains(&"microsoft-edge"));
+    }
+
+    #[test]
+    fn headless_dump_args_render_to_stdout_with_throwaway_profile() {
+        let args = super::headless_dump_args("/tmp/prof", "https://example.com/?a=1&b=2", 30000);
+        assert!(args.contains(&"--headless=new".to_string()));
+        assert!(args.contains(&"--dump-dom".to_string()));
+        assert!(args.contains(&"--user-data-dir=/tmp/prof".to_string()));
+        assert!(args.contains(&"--timeout=30000".to_string()));
+        // The URL travels as one argv entry (no shell), so `&` can't split it.
+        assert_eq!(args.last().unwrap(), "https://example.com/?a=1&b=2");
+    }
+
+    #[test]
+    fn headless_dump_args_caps_inner_timeout() {
+        let args = super::headless_dump_args("/tmp/prof", "https://example.com/", 300000);
+        assert!(args.contains(&"--timeout=60000".to_string()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn headless_browser_app_candidates_prefer_chrome() {
+        let candidates = super::browser_app_candidates();
+        assert!(!candidates.is_empty());
+        assert!(candidates[0].to_string_lossy().contains("Google Chrome"));
+        assert!(candidates.iter().any(|p| p.to_string_lossy().contains("Chromium")));
+        assert!(candidates.iter().any(|p| p.to_string_lossy().contains("Brave Browser")));
+        assert!(candidates.iter().any(|p| p.to_string_lossy().contains("Microsoft Edge")));
+    }
+
     #[test]
     fn headroom_health_uses_localhost_port() {
         assert_eq!(super::HEADROOM_PORT, "8787");
@@ -3643,6 +4111,69 @@ mod tests {
         assert!(obj.contains_key("timedOut"));
         assert!(!obj.contains_key("exit_code"));
         assert!(!obj.contains_key("timed_out"));
+    }
+
+    // Bring-your-own-client OAuth: fixed endpoints pass through untouched,
+    // scopes split on whitespace, extra authorize params carried along, and
+    // the loopback callback is stamped — no discovery involved.
+    #[test]
+    fn resolve_custom_oauth_maps_fields_without_discovery() {
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("access_type".to_string(), "offline".to_string());
+        let resolved = super::resolve_custom_oauth(
+            "abc.apps.googleusercontent.com".to_string(),
+            Some("shh".to_string()),
+            "https://accounts.google.com/o/oauth2/v2/auth".to_string(),
+            "https://oauth2.googleapis.com/token".to_string(),
+            "a b".to_string(),
+            Some(extra),
+        );
+        assert_eq!(resolved.token_endpoint, "https://oauth2.googleapis.com/token");
+        assert_eq!(
+            resolved.authorization_endpoint,
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        );
+        assert_eq!(resolved.scopes, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(resolved.client_secret.as_deref(), Some("shh"));
+        assert!(resolved.redirect_uri.starts_with("http://localhost:"));
+        assert!(resolved.redirect_uri.ends_with("/callback"));
+        assert_eq!(
+            resolved.extra_params,
+            vec![("access_type".to_string(), "offline".to_string())]
+        );
+    }
+
+    #[test]
+    fn stored_token_endpoint_prefers_persisted_endpoint() {
+        let with = serde_json::json!({ "tokenEndpoint": "https://oauth2.googleapis.com/token" });
+        assert_eq!(
+            super::stored_token_endpoint(&with).as_deref(),
+            Some("https://oauth2.googleapis.com/token")
+        );
+        assert_eq!(super::stored_token_endpoint(&serde_json::json!({})), None);
+    }
+
+    // open_app rejects blank names before touching `open -a`.
+    #[test]
+    fn open_app_rejects_blank_names() {
+        assert!(super::validate_open_target("").is_err());
+        assert!(super::validate_open_target("   ").is_err());
+        assert!(super::validate_open_target("Mail").is_ok());
+    }
+
+    // Live smoke test (macOS osascript, no GUI side effects) — run
+    // explicitly: cargo test -- --ignored.
+    #[test]
+    #[ignore]
+    fn run_applescript_live_smoke() {
+        let resp = tauri::async_runtime::block_on(super::run_applescript(
+            "return \"hi\"".into(),
+            Some(15000),
+        ))
+        .expect("osascript should run");
+        assert!(!resp.timed_out);
+        assert_eq!(resp.exit_code, 0);
+        assert!(resp.stdout.contains("hi"), "got: {}", resp.stdout);
     }
 
     // The frontend reads result.exitCode / result.timedOut (src/lib/run-node.ts);
@@ -3833,6 +4364,25 @@ mod tests {
         .expect("Bing RSS fetch should not error");
         assert_eq!(resp.status, 200, "Bing RSS should return 200, got {}", resp.status);
         assert!(resp.body.contains("<item>"), "Bing RSS should contain result items");
+    }
+
+    // Live smoke test (network + installed Chrome) — run explicitly:
+    // cargo test -- --ignored. Renders example.com through the headless
+    // browser and checks the DOM comes back.
+    #[test]
+    #[ignore]
+    fn browser_fetch_live_smoke() {
+        if super::find_headless_browser().is_none() {
+            println!("no Chrome/Chromium browser installed — skipping");
+            return;
+        }
+        let resp = tauri::async_runtime::block_on(super::browser_fetch(
+            "https://example.com/".into(),
+            Some(30000),
+        ))
+        .expect("browser_fetch should not error");
+        assert_eq!(resp.status, 200);
+        assert!(resp.body.contains("Example Domain"), "got: {}", &resp.body[..resp.body.len().min(200)]);
     }
 
     // Live smoke test (network) for MCP OAuth metadata discovery against every
@@ -4155,6 +4705,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|_app| {
             // Must run before any command can open the vector index or read
@@ -4192,6 +4743,7 @@ pub fn run() {
             detect_coding_agents,
             http_fetch,
             http_post_json,
+            browser_fetch,
             headroom_status,
             headroom_start,
             headroom_stop,
@@ -4202,6 +4754,8 @@ pub fn run() {
             run_python,
             run_command,
             run_node,
+            open_app,
+            run_applescript,
             read_local_file,
             write_local_file,
             read_shared_file,

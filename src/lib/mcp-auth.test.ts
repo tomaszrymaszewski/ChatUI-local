@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { readMcpAuth, hasToken, getAccessToken, type McpAuthData } from "./mcp-auth";
+import { readMcpAuth, hasToken, getAccessToken, isMcpAuthError, beginMcpOauth, type McpAuthData } from "./mcp-auth";
 
 const mockedInvoke = vi.mocked(invoke);
 
@@ -96,5 +96,63 @@ describe("getAccessToken", () => {
   it("returns null for unknown servers", async () => {
     mockedInvoke.mockResolvedValueOnce(JSON.stringify(SAMPLE));
     await expect(getAccessToken("nope")).resolves.toBeNull();
+  });
+});
+
+describe("beginMcpOauth", () => {
+  it("passes no custom fields for standard connectors", async () => {
+    mockedInvoke.mockResolvedValueOnce("https://auth.example/authorize");
+    await expect(beginMcpOauth("notion", "https://mcp.notion.com/mcp")).resolves.toBe(
+      "https://auth.example/authorize",
+    );
+    expect(mockedInvoke).toHaveBeenCalledWith("mcp_oauth_begin", {
+      name: "notion",
+      serverUrl: "https://mcp.notion.com/mcp",
+      clientId: null,
+      clientSecret: null,
+      authorizeUrl: null,
+      tokenUrl: null,
+      scopes: null,
+      extraParams: null,
+    });
+  });
+
+  it("passes the user's client and fixed endpoints for bring-your-own-client connectors", async () => {
+    mockedInvoke.mockResolvedValueOnce("https://accounts.google.com/o/oauth2/v2/auth?x=1");
+    await beginMcpOauth("gmail", "https://gmailmcp.googleapis.com/mcp/v1", {
+      clientId: "abc.apps.googleusercontent.com",
+      clientSecret: "shh",
+      authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+      tokenUrl: "https://oauth2.googleapis.com/token",
+      scopes: "https://www.googleapis.com/auth/gmail.modify",
+      extraParams: { access_type: "offline" },
+    });
+    expect(mockedInvoke).toHaveBeenCalledWith("mcp_oauth_begin", {
+      name: "gmail",
+      serverUrl: "https://gmailmcp.googleapis.com/mcp/v1",
+      clientId: "abc.apps.googleusercontent.com",
+      clientSecret: "shh",
+      authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+      tokenUrl: "https://oauth2.googleapis.com/token",
+      scopes: "https://www.googleapis.com/auth/gmail.modify",
+      extraParams: { access_type: "offline" },
+    });
+  });
+});
+
+describe("isMcpAuthError", () => {
+  it("flags rejected-credential failures", () => {
+    expect(isMcpAuthError(new Error("Error POSTing to endpoint (HTTP 401): Unauthorized"))).toBe(true);
+    expect(isMcpAuthError(new Error("SSE error: 403 Forbidden"))).toBe(true);
+    expect(isMcpAuthError(new Error("invalid_token: the access token expired"))).toBe(true);
+    expect(isMcpAuthError(new Error("Token has expired, please reauthenticate"))).toBe(true);
+    expect(isMcpAuthError("sign-in required")).toBe(true);
+  });
+
+  it("ignores network and server failures", () => {
+    expect(isMcpAuthError(new Error("MCP connect timeout"))).toBe(false);
+    expect(isMcpAuthError(new Error("fetch failed: connection refused"))).toBe(false);
+    expect(isMcpAuthError(new Error("Error POSTing to endpoint (HTTP 500): Internal Server Error"))).toBe(false);
+    expect(isMcpAuthError(null)).toBe(false);
   });
 });

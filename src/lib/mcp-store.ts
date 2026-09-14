@@ -12,6 +12,13 @@ export interface McpServerEntry {
   enabled?: boolean;
   environment?: Record<string, string>;
   headers?: Record<string, string>;
+  /**
+   * Bring-your-own-OAuth-client credentials (Google Workspace connectors):
+   * the user's own provider OAuth client, pasted in Settings → Connectors.
+   * Used at sign-in instead of dynamic registration.
+   */
+  oauthClientId?: string;
+  oauthClientSecret?: string;
   /** Set when the connector was added for one project's sessions. */
   projectDir?: string;
   addedAt: string;

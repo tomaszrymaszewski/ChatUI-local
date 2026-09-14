@@ -415,6 +415,20 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                 </div>
                 <div className="flex items-center justify-between">
                   <div className="flex flex-col gap-0.5">
+                    <span className="text-sm">Task finish notifications</span>
+                    <span className="text-xs text-muted-foreground">
+                      Notify when scheduled or background agent runs finish
+                    </span>
+                  </div>
+                  <Switch
+                    checked={settings.taskFinishNotifications}
+                    onCheckedChange={(v) =>
+                      updateSettings({ taskFinishNotifications: v })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col gap-0.5">
                     <span className="text-sm">Temporary chats by default</span>
                     <span className="text-xs text-muted-foreground">
                       New chats aren't saved to history unless you keep them

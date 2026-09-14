@@ -11,6 +11,8 @@
  * and each vendor's published MCP endpoint.
  */
 
+import type { CustomOAuthArgs } from "./mcp-auth";
+
 export type McpAuthType = "oauth" | "apikey" | "none";
 export type McpCategory =
   | "Productivity"
@@ -50,6 +52,63 @@ export interface McpCatalogEntry {
   install: { type: "remote"; url: string };
   /** Optional registry namespace for validation/lookup. */
   registryName?: string;
+  /**
+   * Bring-your-own-OAuth-client config. Present when the provider publishes
+   * no dynamic-registration endpoint (Google's Workspace MCP servers): the
+   * user creates the OAuth client themselves and pastes its credentials in
+   * Settings, and sign-in uses these fixed endpoints + scopes instead of
+   * discovery. The Rust shell's mcp_oauth_begin takes the same fields.
+   */
+  customOAuth?: CustomOAuthConfig;
+}
+
+/** Fixed-endpoint OAuth config for bring-your-own-client connectors. */
+export interface CustomOAuthConfig {
+  authorizeUrl: string;
+  tokenUrl: string;
+  /** Space-separated scopes requested at sign-in for this connector. */
+  scopes: string;
+  /** Extra authorize-URL params (e.g. access_type=offline for refresh tokens). */
+  extraParams?: Record<string, string>;
+  /** Where the user creates the OAuth client. */
+  setupUrl: string;
+  /** One-line setup guidance shown next to the credential fields. */
+  setupHint: string;
+}
+
+/**
+ * NOTE: Google Workspace entries (Gmail, Drive, Docs, Sheets, Slides,
+ * Calendar, Chat, Contacts) were removed until a Google OAuth client ID is
+ * available. To re-add them, restore one entry per product with
+ * `customOAuth` (Google endpoints, per-product scopes, offline-access extra
+ * params) — the sign-in, refresh, panel, and card plumbing below already
+ * supports it. Official endpoints: https://gmailmcp.googleapis.com/mcp/v1,
+ * https://drivemcp.googleapis.com/mcp/v1, https://docsmcp.googleapis.com/mcp/v1,
+ * https://sheetsmcp.googleapis.com/mcp/v1, https://slidesmcp.googleapis.com/mcp/v1,
+ * https://calendarmcp.googleapis.com/mcp/v1, https://chatmcp.googleapis.com/mcp/v1,
+ * https://people.googleapis.com/mcp/v1 (all verified live, HTTP 200).
+ */
+
+/**
+ * Build the sign-in args for a bring-your-own-client connector — or undefined
+ * when the entry has no customOAuth config or no client credentials were
+ * stored yet. Shared by Settings and the in-session suggestion card so both
+ * build identical args.
+ */
+export function customOAuthArgsFor(
+  entry: McpCatalogEntry,
+  clientId: string | undefined,
+  clientSecret: string | undefined,
+): CustomOAuthArgs | undefined {
+  if (!entry.customOAuth || !clientId) return undefined;
+  return {
+    clientId,
+    ...(clientSecret ? { clientSecret } : {}),
+    authorizeUrl: entry.customOAuth.authorizeUrl,
+    tokenUrl: entry.customOAuth.tokenUrl,
+    scopes: entry.customOAuth.scopes,
+    ...(entry.customOAuth.extraParams ? { extraParams: entry.customOAuth.extraParams } : {}),
+  };
 }
 
 export const MCP_CATALOG: McpCatalogEntry[] = [

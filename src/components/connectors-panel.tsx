@@ -68,6 +68,7 @@ import {
 } from "@/lib/mcp-store";
 import { searchMcpRegistry, type RegistryServer } from "@/lib/mcp-registry";
 import {
+  customOAuthArgsFor,
   listCachedConnectors,
   MCP_CATEGORIES,
   type McpCatalogEntry,
@@ -119,7 +120,7 @@ export function mcpIcon(id: string): { Icon: IconComponent; tile: string } {
 function authLabel(entry: McpCatalogEntry): string {
   switch (entry.auth) {
     case "oauth":
-      return "Sign in once";
+      return entry.customOAuth ? "Needs your Google client" : "Sign in once";
     case "apikey":
       return "Needs an API key";
     case "none":
@@ -145,6 +146,11 @@ export function ConnectorsPanel({
   // API-key entry form
   const [apikeyTarget, setApikeyTarget] = useState<McpCatalogEntry | null>(null);
   const [apikeyValues, setApikeyValues] = useState<Record<string, string>>({});
+
+  // Bring-your-own-OAuth-client form (Google Workspace connectors)
+  const [oauthTarget, setOauthTarget] = useState<McpCatalogEntry | null>(null);
+  const [oauthClientId, setOauthClientId] = useState("");
+  const [oauthClientSecret, setOauthClientSecret] = useState("");
 
   // Advanced (manual + registry search)
   const [advancedOpen, setAdvancedOpen] = useState(false);
@@ -198,7 +204,19 @@ export function ConnectorsPanel({
     saveMcpServer(name, entry);
   };
 
+  const openOauthForm = (cat: McpCatalogEntry) => {
+    const existing = loadMcpServers()[cat.id];
+    setOauthTarget(cat);
+    setOauthClientId(existing?.oauthClientId ?? "");
+    setOauthClientSecret(existing?.oauthClientSecret ?? "");
+  };
+
   const handleAddCatalog = async (cat: McpCatalogEntry) => {
+    if (cat.customOAuth) {
+      // Google-style connectors need the user's own OAuth client first.
+      openOauthForm(cat);
+      return;
+    }
     if (cat.auth === "apikey" && cat.envKeys && cat.envKeys.length > 0) {
       // Open the API-key form instead of adding immediately.
       setApikeyTarget(cat);
@@ -256,6 +274,38 @@ export function ConnectorsPanel({
     }
   };
 
+  const confirmOAuthAdd = async () => {
+    if (!oauthTarget?.customOAuth) return;
+    if (!oauthClientId.trim() || !oauthClientSecret.trim()) {
+      toast.error("Paste both the OAuth client ID and secret");
+      return;
+    }
+    setAdding(oauthTarget.id);
+    try {
+      const entry: McpServerEntry = {
+        type: "remote",
+        url: oauthTarget.install.url,
+        enabled: true,
+        oauthClientId: oauthClientId.trim(),
+        oauthClientSecret: oauthClientSecret.trim(),
+        ...(directory ? { projectDir: directory } : {}),
+        addedAt: new Date().toISOString(),
+      };
+      await addEntry(oauthTarget.id, entry);
+      const target = oauthTarget;
+      setOauthTarget(null);
+      setOauthClientId("");
+      setOauthClientSecret("");
+      setTick((t) => t + 1);
+      // Credentials saved — start the sign-in right away.
+      await handleAuth(target.id);
+    } catch {
+      toast.error(`Failed to add ${oauthTarget.name}`);
+    } finally {
+      setAdding(null);
+    }
+  };
+
   const handleUninstall = async (cat: McpCatalogEntry) => {
     setUninstalling(cat.id);
     try {
@@ -277,13 +327,25 @@ export function ConnectorsPanel({
   };
 
   const handleAuth = async (name: string) => {
-    const entry = mcpEntries[name];
+    // Read the store directly — state can lag a just-saved entry (the OAuth
+    // form saves credentials and starts sign-in in one go).
+    const entry = loadMcpServers()[name] ?? mcpEntries[name];
     if (!entry) return;
+    const cat = listCachedConnectors().find((c) => c.id === name);
+    if (cat?.customOAuth && !entry.oauthClientId) {
+      openOauthForm(cat);
+      return;
+    }
     setAuthing(name);
     try {
-      // Native OAuth flow: the Rust side registers a client, binds the
+      // Native OAuth flow: the Rust side registers a client (or uses the
+      // user's own for bring-your-own-client connectors), binds the
       // callback listener, and returns the authorize URL for the browser.
-      const url = await beginMcpOauth(name, entry.url);
+      const url = await beginMcpOauth(
+        name,
+        entry.url,
+        cat ? customOAuthArgsFor(cat, entry.oauthClientId, entry.oauthClientSecret) : undefined,
+      );
       await openUrl(url);
       // The browser flow writes tokens to the store when done; poll it
       // for up to ~5 minutes.
@@ -452,6 +514,54 @@ export function ConnectorsPanel({
           {/* ─── Directory ─── */}
           <div className="flex flex-col gap-3 pt-4">
             <span className="text-sm font-medium">Browse official apps</span>
+
+            {/* Bring-your-own-OAuth-client form (Google Workspace) */}
+            {oauthTarget?.customOAuth && (
+              <div className="flex flex-col gap-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
+                <div className="flex items-center gap-2 text-sm font-medium">
+                  <KeyRound className="size-3.5" /> {oauthTarget.name} needs your Google client
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {oauthTarget.customOAuth.setupHint}{" "}
+                  <button
+                    className="underline underline-offset-2 hover:text-foreground"
+                    onClick={() => void openUrl(oauthTarget.customOAuth!.setupUrl)}
+                  >
+                    Open Google Cloud console
+                  </button>
+                </p>
+                <div className="flex flex-col gap-1">
+                  <Label className="text-xs">OAuth client ID</Label>
+                  <Input
+                    value={oauthClientId}
+                    onChange={(e) => setOauthClientId(e.target.value)}
+                    placeholder="….apps.googleusercontent.com"
+                  />
+                </div>
+                <div className="flex flex-col gap-1">
+                  <Label className="text-xs">OAuth client secret</Label>
+                  <Input
+                    value={oauthClientSecret}
+                    onChange={(e) => setOauthClientSecret(e.target.value)}
+                    placeholder="Paste your client secret…"
+                    type="password"
+                  />
+                </div>
+                <div className="flex items-center justify-end gap-2">
+                  <Button size="sm" variant="ghost" onClick={() => setOauthTarget(null)}>
+                    Cancel
+                  </Button>
+                  <Button size="sm" disabled={adding === oauthTarget.id} onClick={confirmOAuthAdd}>
+                    {adding === oauthTarget.id ? (
+                      <Loader2 className="size-3.5 animate-spin" />
+                    ) : (
+                      <Plus className="size-3.5" />
+                    )}
+                    Save & sign in
+                  </Button>
+                </div>
+              </div>
+            )}
 
             {/* API-key form */}
             {apikeyTarget && (

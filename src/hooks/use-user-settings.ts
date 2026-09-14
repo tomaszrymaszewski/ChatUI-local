@@ -27,6 +27,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   knowledgeEnabled: true,
   knowledgeSources: DEFAULT_KNOWLEDGE_SOURCES,
   contextCompression: false,
+  taskFinishNotifications: true,
 };
 
 function loadSettings(): UserSettings {

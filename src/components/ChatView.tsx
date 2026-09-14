@@ -156,6 +156,7 @@ import { useAgentController, getAgentController, useRunningSessionIds, disposeAg
 import { useScheduler } from "@/hooks/use-scheduler";
 import type { ActivityItem, AgentMode, AgentRunResult, SharedFile, TodoItem } from "@/lib/agent/types";
 import { WidgetStack, TasksWidget, FilesWidget, ContextWidget } from "@/components/agent-widgets";
+import { resolveWidgetsHidden, widgetsStorageKey } from "@/lib/widget-visibility";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { ensureAgentWorkspace, removeAgentWorkspace } from "@/lib/agent/sandbox";
 import { applyAgentConfigPatch } from "@/lib/agent/tools";
@@ -373,14 +374,22 @@ export function ChatView() {
   const [artifactPanel, setArtifactPanel] = useState<{ artifacts: Artifact[]; activeIndex: number } | null>(null);
   const [artifactWindowMode, setArtifactWindowMode] = useState<"open" | "minimized" | "expanded">("open");
   const [artifactWidth, setArtifactWidth] = useState<number | null>(null);
-  // Master show/hide for the session widget stack (hamburger in the header).
-  const [widgetsHidden, setWidgetsHidden] = useState(
-    () => localStorage.getItem("chatui:widgets-hidden") === "1",
-  );
+  // Master show/hide for the session widget stack (hamburger in the header),
+  // stored per tab: hidden by default in chat, open by default in agent (see
+  // src/lib/widget-visibility.ts).
+  const [widgetsHiddenByTab, setWidgetsHiddenByTab] = useState<Record<"chat" | "agent", boolean>>(() => {
+    const next = { chat: resolveWidgetsHidden("chat"), agent: resolveWidgetsHidden("agent") };
+    localStorage.setItem(widgetsStorageKey("chat"), next.chat ? "1" : "0");
+    localStorage.setItem(widgetsStorageKey("agent"), next.agent ? "1" : "0");
+    localStorage.removeItem("chatui:widgets-hidden");
+    return next;
+  });
+  const widgetsHidden = widgetsHiddenByTab[activeTab];
   const toggleWidgetsHidden = () =>
-    setWidgetsHidden((prev) => {
-      localStorage.setItem("chatui:widgets-hidden", prev ? "0" : "1");
-      return !prev;
+    setWidgetsHiddenByTab((prev) => {
+      const next = { ...prev, [activeTab]: !prev[activeTab] };
+      localStorage.setItem(widgetsStorageKey(activeTab), next[activeTab] ? "1" : "0");
+      return next;
     });
   // Sidebar open state is controlled so opening the widgets can auto-collapse
   // it when the widgets, sidebar, and chat text cannot fit width-wise.
@@ -2490,6 +2499,7 @@ export function ChatView() {
         onNewChat={handleNewChat}
         onDeleteChat={handleDeleteSession}
         onRenameChat={(id, title) => updateSession(id, { title })}
+        onMoveSessionToAgent={(id, agentId) => updateSession(id, { agent_id: agentId })}
         onSettings={openSettings}
         onSettingsTabChange={setSettingsTab}
         onExitSettings={() => setView("chat")}

@@ -3,7 +3,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
-import { apiKeyHeadersForEntry, corsFreeMcpFetch } from "./mcp";
+import { apiKeyHeadersForEntry, corsFreeMcpFetch, mcpAuthFailureHint } from "./mcp";
 
 const mockedInvoke = vi.mocked(invoke);
 
@@ -134,5 +134,16 @@ describe("corsFreeMcpFetch", () => {
     await expect(
       fetch("http://localhost:8931/mcp", { method: "POST", body: "{}" }),
     ).rejects.toBe("Connection refused");
+  });
+});
+
+describe("mcpAuthFailureHint", () => {
+  it("tells the model to show the re-connect card for the failing server", () => {
+    const hint = mcpAuthFailureHint("github");
+    expect(hint).toContain('"github"');
+    expect(hint).toContain('kind="connector"');
+    expect(hint).toContain('target="github"');
+    expect(hint).toMatch(/re-connect card/);
+    expect(hint).toMatch(/retry/);
   });
 });

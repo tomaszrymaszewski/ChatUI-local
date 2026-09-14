@@ -6,7 +6,21 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { visibleMcpServers, hotSetMcpServers, touchMcpUsage, type McpServerEntry } from "@/lib/mcp-store";
 import { getCatalogEntry } from "@/lib/mcp-catalog";
-import { getAccessToken } from "@/lib/mcp-auth";
+import { getAccessToken, isMcpAuthError } from "@/lib/mcp-auth";
+
+/**
+ * Follow-up instruction for the model when a connector call fails with
+ * rejected credentials: surface a one-click re-connect card (the same card
+ * as first-time connect — it re-runs the OAuth sign-in and overwrites the
+ * stored tokens) and retry once the user connects.
+ */
+export function mcpAuthFailureHint(serverName: string): string {
+  return (
+    `The "${serverName}" sign-in looks expired or revoked. Call suggest with ` +
+    `kind="connector" and target="${serverName}" to show the user a one-click ` +
+    `re-connect card, then retry the call after they connect.`
+  );
+}
 
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60);
@@ -200,7 +214,8 @@ export async function loadMcpTools(
                   .join("\n");
                 return text.slice(0, 12000) || JSON.stringify(result).slice(0, 12000);
               } catch (err) {
-                return `Error: MCP tool failed — ${err instanceof Error ? err.message : String(err)}`;
+                const hint = isMcpAuthError(err) ? ` ${mcpAuthFailureHint(serverName)}` : "";
+                return `Error: MCP tool failed — ${err instanceof Error ? err.message : String(err)}.${hint}`;
               }
             },
           }),
@@ -328,7 +343,8 @@ export function createMcpProxy(
         );
         return `Connector "${input.server}" exposes ${tools.length} tool(s) — call them with call_mcp_tool:\n\n${lines.join("\n")}`;
       } catch (err) {
-        return `Error: could not connect to "${input.server}" — ${err instanceof Error ? err.message : String(err)}`;
+        const hint = isMcpAuthError(err) ? ` ${mcpAuthFailureHint(input.server)}` : "";
+        return `Error: could not connect to "${input.server}" — ${err instanceof Error ? err.message : String(err)}.${hint}`;
       }
     },
   });
@@ -338,7 +354,9 @@ export function createMcpProxy(
     description:
       "Call a tool on an external app connector (MCP server) on demand — no restart needed. " +
       "Use search_connectors to find the connector and list_mcp_tools for exact tool names and " +
-      "argument schemas (see the tool's args schema hint in the listing).",
+      "argument schemas (see the tool's args schema hint in the listing). " +
+      "If a call fails with an authorization/401-style error, the user's sign-in likely expired: " +
+      "call suggest with kind=\"connector\" for that server so they can re-authenticate, then retry.",
     schema: z.object({
       server: z.string().describe("Connector id from search_connectors, e.g. 'github' or 'zapier'."),
       tool: z.string().describe("Tool name from list_mcp_tools, e.g. 'create_issue'."),
@@ -361,7 +379,8 @@ export function createMcpProxy(
           .join("\n");
         return text.slice(0, 12000) || JSON.stringify(result).slice(0, 12000);
       } catch (err) {
-        return `Error: MCP call failed — ${err instanceof Error ? err.message : String(err)}`;
+        const hint = isMcpAuthError(err) ? ` ${mcpAuthFailureHint(input.server)}` : "";
+        return `Error: MCP call failed — ${err instanceof Error ? err.message : String(err)}.${hint}`;
       }
     },
   });

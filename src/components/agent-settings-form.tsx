@@ -357,7 +357,7 @@ export function AgentSettingsForm({
         />
         <PermissionRow
           label="Terminal & coding"
-          description="Run shell commands and delegate coding tasks — each command approved"
+          description="Run shell commands, open and automate Mac apps, and delegate coding tasks — each action approved"
           checked={agent.capabilities.terminal}
           onCheckedChange={(terminal) => update({ capabilities: { terminal } })}
         />

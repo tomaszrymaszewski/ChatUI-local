@@ -11,6 +11,7 @@ import { getModelCost, priceUsage, type ModelPrices } from "@/lib/model-capabili
 import { ensureDeliverablesDir } from "@/lib/deliverables";
 import { loadMessages } from "@/hooks/use-messages";
 import { loadUserSettings } from "@/hooks/use-user-settings";
+import { notifyIfBackground } from "@/lib/notify";
 import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
 import { retrieveKnowledgeContext } from "@/lib/knowledge-retrieval";
 import { estimateTokens, recordAgentUsage } from "@/lib/agent-usage";
@@ -491,7 +492,9 @@ class AgentController implements AgentControllerApi {
     this.artifacts = [];
     this.files = [];
     this.pendingInput = null;
-    this.pendingSuggestion = null;
+    // NOTE: pendingSuggestion is deliberately never cleared by run
+    // lifecycle (here or when the run ends below) — a suggestion card stays
+    // up until the user explicitly connects or dismisses it.
     this.pendingApprovals = [];
     this.approvalResolvers.clear();
     this.createdAgent = null;
@@ -657,6 +660,7 @@ class AgentController implements AgentControllerApi {
     this.abortRef = controller;
 
     let cancelled = false;
+    let failedMessage: string | null = null;
     let pipelineCompleted = true;
     let session: DeepAgentSession | null = null;
     try {
@@ -808,9 +812,11 @@ class AgentController implements AgentControllerApi {
       if (controller.signal.aborted) {
         cancelled = true;
       } else {
+        failedMessage = err instanceof Error ? err.message : String(err);
         throw err;
       }
     } finally {
+      const wasUnattended = this.unattended;
       this.normalizeOnEnd();
       if (session) {
         try { await session.dispose(); } catch { /* best-effort */ }
@@ -821,13 +827,22 @@ class AgentController implements AgentControllerApi {
       this.isRunning = false;
       this.unattended = false;
       this.pendingInput = null;
-      this.pendingSuggestion = null;
+      // NOTE: pendingSuggestion survives run end (see resetState) — only an
+      // explicit connect/dismiss (dismissSuggestion) clears the card.
       this.pendingApprovals = [];
       setRetrievedDocIds([]);
       // The run changed (or added) chats/messages/files — re-index shortly.
       scheduleKnowledgeSweep();
       this.notify();
       registryNotify();
+      // Background ping for interactive runs finishing while the window is
+      // hidden (headless/scheduled runs notify from runHeadlessTask instead).
+      if (!wasUnattended) {
+        void notifyIfBackground(
+          cancelled ? "Task stopped" : failedMessage ? "Task failed" : "Task finished",
+          (failedMessage ?? this.contentRef ?? "Done.").slice(0, 200),
+        );
+      }
     }
 
     const finalActivities = Array.from(this.activitiesRef.values());

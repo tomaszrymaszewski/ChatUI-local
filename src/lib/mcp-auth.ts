@@ -44,17 +44,59 @@ export async function readMcpAuth(): Promise<McpAuthData> {
 }
 
 /**
+ * Bring-your-own-client OAuth config: the Rust shell's mcp_oauth_begin takes
+ * the same fields (camelCase here — Tauri converts command args).
+ */
+export interface CustomOAuthArgs {
+  clientId: string;
+  clientSecret?: string;
+  authorizeUrl: string;
+  tokenUrl: string;
+  scopes: string;
+  extraParams?: Record<string, string>;
+}
+
+/**
  * Start a native OAuth sign-in for an MCP server: resolves the authorize URL
  * (the Rust side registers a client, generates PKCE, and binds the callback
- * listener) and returns it — open it in the browser. Completion is observed
- * by polling readMcpAuth.
+ * listener) and returns it — open it in the browser. Pass `custom` for
+ * bring-your-own-client connectors (Google Workspace): fixed provider
+ * endpoints and the user's own client credentials, no registration.
+ * Completion is observed by polling readMcpAuth.
  */
-export async function beginMcpOauth(name: string, serverUrl: string): Promise<string> {
-  return invoke<string>("mcp_oauth_begin", { name, serverUrl });
+export async function beginMcpOauth(
+  name: string,
+  serverUrl: string,
+  custom?: CustomOAuthArgs,
+): Promise<string> {
+  return invoke<string>("mcp_oauth_begin", {
+    name,
+    serverUrl,
+    clientId: custom?.clientId ?? null,
+    clientSecret: custom?.clientSecret ?? null,
+    authorizeUrl: custom?.authorizeUrl ?? null,
+    tokenUrl: custom?.tokenUrl ?? null,
+    scopes: custom?.scopes ?? null,
+    extraParams: custom?.extraParams ?? null,
+  });
 }
 
 export function hasToken(data: McpAuthData, name: string): boolean {
   return !!data[name]?.tokens?.accessToken;
+}
+
+/**
+ * True when a connector failure looks like rejected credentials (expired or
+ * revoked OAuth token, wrong API key) rather than a network or server error.
+ * Matched against transport/connect error text — a 401/403 from the MCP
+ * endpoint, an invalid/expired-token message, or an explicit re-auth prompt.
+ */
+const MCP_AUTH_ERROR_PATTERN =
+  /\b401\b|\b403\b|unauthori[sz]ed|unauthenticated|forbidden|invalid[_-]?token|invalid[_-]?grant|token (has )?(expired|revoked|invalid)|(access )?token expired|authentication (required|failed|expired)|reauthenticat|sign-?in (required|expired)/i;
+
+export function isMcpAuthError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err ?? "");
+  return MCP_AUTH_ERROR_PATTERN.test(msg);
 }
 
 /**

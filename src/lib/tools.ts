@@ -1,4 +1,4 @@
-import { httpFetch } from "@/lib/http-fetch";
+import { fetchPageText } from "@/lib/http-fetch";
 
 export interface ToolDefinition {
   type: "function";
@@ -198,37 +198,9 @@ async function executeWebFetch(args: Record<string, unknown>): Promise<string> {
   const url = args.url as string;
   if (!url) return "Error: No URL provided.";
 
-  try {
-    // Goes through the Rust shell under Tauri — a webview fetch() would be
-    // blocked by CORS for most websites (see src/lib/http-fetch.ts).
-    const resp = await httpFetch(url);
-    if (resp.status < 200 || resp.status >= 300) {
-      return `Error: Fetch failed (${resp.status} ${resp.statusText}).`;
-    }
-
-    if (resp.contentType.includes("text/html")) {
-      const text = resp.body
-        .replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/<style[\s\S]*?<\/style>/gi, "")
-        .replace(/<nav[\s\S]*?<\/nav>/gi, "")
-        .replace(/<footer[\s\S]*?<\/footer>/gi, "")
-        .replace(/<header[\s\S]*?<\/header>/gi, "")
-        .replace(/<[^>]+>/g, " ")
-        .replace(/&nbsp;/g, " ")
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/\s+/g, " ")
-        .trim();
-      return text.slice(0, 8000);
-    }
-
-    return resp.body.slice(0, 8000);
-  } catch (err) {
-    return `Error: Failed to fetch URL - ${err instanceof Error ? err.message : String(err)}`;
-  }
+  // Plain HTTP first; on bot challenges the page is re-rendered in the
+  // user's headless Chrome (see src/lib/http-fetch.ts fetchPageText).
+  return fetchPageText(url);
 }
 
 export async function executeTool(call: ToolCall): Promise<ToolResult> {

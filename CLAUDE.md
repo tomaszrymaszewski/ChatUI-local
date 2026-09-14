@@ -78,6 +78,11 @@ old folder.
 - **web_fetch has three transports** (`src/lib/http-fetch.ts`): Rust `http_fetch` command
   under Tauri, a vite dev middleware (`/__http-fetch` in `vite.config.ts`, skipped under
   vitest via `MODE !== "test"`), and native fetch as last resort (CORS-restricted).
+  When plain HTTP is blocked or bot-challenged, `fetchPageText` re-renders the page in
+  the user's headless Chrome via the Rust `browser_fetch` command (Chrome preferred,
+  Chromium/Brave/Edge fallback, `--dump-dom` with a throwaway profile); `web_search`
+  uses the same browser rendering as its primary keyless backends (DDG HTML, then Bing
+  HTML with `/ck/a` redirect unwrapping) before falling back to plain-HTTP Bing RSS.
 - **History is truncated to a token budget** (`src/lib/agent/history.ts`) before replay:
   models.dev `limit.context` when known, 8k for localhost providers, 32k fallback, minus
   4k reserve for system prompt + tool schemas + output.
@@ -88,6 +93,15 @@ old folder.
   Files are invisible to the user until `share_files` is called — it emits the `files`
   AgentEvent; `ChatView` renders download/Open/Reveal chips (persisted + live mid-run).
   `share_files` expands `~` and emits a visible error activity when every path is skipped.
+- **Task-finish notifications** (`src/lib/notify.ts`, `tauri-plugin-notification`):
+  headless/scheduled runs notify from `runHeadlessTask`; interactive runs notify from the
+  controller's run `finally` only when `document.hidden` (Setting → General toggle
+  `taskFinishNotifications`, default on). Clicking focuses the app window. Never rejects.
+- **Mac app control**: task-profile agents with terminal access get `open_app` (Rust
+  `open_app` → `open -a`) and `run_applescript` (Rust `run_applescript` → temp-file
+  osascript, same try_wait/kill pattern as run_python). Both go through the
+  `requestApproval` card like `run_command` and are stripped with it when
+  `enableCommandTools === false`; the agent-settings "Terminal & coding" toggle covers them.
 - **App updates** (`src/lib/updater.ts` + `src/components/updates-panel.tsx`): the app
   pings a static `latest.json` on GitHub Releases on launch (if auto-check is on in
   Settings → Updates). `tauri-plugin-updater` verifies the signed bundle against the
@@ -111,7 +125,10 @@ old folder.
     **"Disk location" header** into each SKILL.md (`applySkillDiskHeader`) — the real
     path is how the agent stops guessing and wandering into other apps' folders.
   - **Connectors**: `listAllConnectors()` (mcp-catalog.ts) = bundled + registry; UI
-    renders use the sync `listCachedConnectors()`. Access is hybrid: only the 3 most
+    renders use the sync `listCachedConnectors()`. Connectors with `customOAuth`
+    (Google Workspace) are bring-your-own-client: the user pastes their provider
+    OAuth client into the entry (`oauthClientId/Secret`), and sign-in/refresh use
+    its fixed endpoints instead of discovery + dynamic registration. Access is hybrid: only the 3 most
     recently used servers connect eagerly (`hotSetMcpServers` → native `mcp__` tools);
     everything else goes through the lazy **`list_mcp_tools` / `call_mcp_tool` proxy**
     (`createMcpProxy` in `src/lib/agent/mcp.ts`, one instance per run) — which is also

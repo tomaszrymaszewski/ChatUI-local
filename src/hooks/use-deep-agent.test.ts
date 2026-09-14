@@ -24,7 +24,7 @@ function approvalGate(sessionId: string) {
 /** Let queued microtasks (emits, promise resolutions) settle. */
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
-const SESSION_IDS = ["approval-parallel", "approval-auto", "approval-task", "approval-stop", "approval-rows", "usage-switch"];
+const SESSION_IDS = ["approval-parallel", "approval-auto", "approval-task", "approval-stop", "approval-rows", "usage-switch", "suggestion-sticky"];
 
 beforeEach(() => {
   storage.clear();
@@ -162,6 +162,48 @@ describe("session spend across model switches", () => {
     const ctrl = emitUsage("usage-switch", null, { inputTokens: 10_000, cachedTokens: 0, outputTokens: 500 });
     expect(ctrl.usage.costDollars).toBe(0);
     expect(ctrl.usage.inputTokens).toBe(10_000);
+  });
+});
+
+describe("suggestion cards", () => {
+  /** Drive the controller's private event funnel the way run() output does. */
+  function emitSuggestion() {
+    const ctrl = getAgentController("suggestion-sticky");
+    (ctrl as unknown as { emit: (e: AgentEvent) => void }).emit({
+      type: "suggestion",
+      suggestion: {
+        kind: "connector",
+        target: "github",
+        title: "Connect GitHub",
+        reason: "The task needs repo access.",
+      },
+    });
+    return ctrl;
+  }
+
+  it("stays up across run boundaries until explicitly dismissed", () => {
+    const ctrl = emitSuggestion();
+    expect(ctrl.pendingSuggestion?.target).toBe("github");
+    // A new run starting must not wipe an unanswered card — previously the
+    // card vanished when the emitting run ended or the next one began.
+    (ctrl as unknown as { resetState: () => void }).resetState();
+    expect(ctrl.pendingSuggestion?.target).toBe("github");
+    ctrl.dismissSuggestion();
+    expect(ctrl.pendingSuggestion).toBeNull();
+  });
+
+  it("a newer suggestion replaces the pending one", () => {
+    const ctrl = emitSuggestion();
+    (ctrl as unknown as { emit: (e: AgentEvent) => void }).emit({
+      type: "suggestion",
+      suggestion: {
+        kind: "skill",
+        target: "docx",
+        title: "Install Word skill",
+        reason: "The task needs a document.",
+      },
+    });
+    expect(ctrl.pendingSuggestion?.target).toBe("docx");
   });
 });
 

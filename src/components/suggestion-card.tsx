@@ -13,6 +13,8 @@ import {
   Settings2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { InputGroup } from "@/components/ui/input-group";
 import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -23,7 +25,7 @@ import {
 } from "@/lib/skills-library";
 import { listAllCatalogSkills } from "@/lib/skill-registry";
 import { summarizeAgentPatch } from "@/lib/agent/tools";
-import { MCP_CATALOG } from "@/lib/mcp-catalog";
+import { customOAuthArgsFor, MCP_CATALOG } from "@/lib/mcp-catalog";
 import { getMcpServer, saveMcpServer } from "@/lib/mcp-store";
 import { beginMcpOauth, hasToken, readMcpAuth } from "@/lib/mcp-auth";
 import type { AgentConfigPatch } from "@/types";
@@ -53,10 +55,35 @@ export function SuggestionCard({
   const [connected, setConnected] = useState(false);
 
   const catalogEntry = MCP_CATALOG.find((c) => c.id === suggestion.target);
-  // API-key connectors still need their key form in Settings; everything
-  // else connects right from the card.
+  const storedEntry =
+    suggestion.kind === "connector" ? getMcpServer(suggestion.target) : undefined;
+  // Bring-your-own-client connectors need the user's OAuth client before
+  // sign-in can start — collected on the card below, never in Settings.
+  const needsCustomCreds = !!catalogEntry?.customOAuth && !storedEntry?.oauthClientId;
+  // API-key connectors need their keys — collected on the card below.
+  const isApikeyEntry =
+    suggestion.kind === "connector" &&
+    !!catalogEntry &&
+    catalogEntry.auth === "apikey" &&
+    !!catalogEntry.envKeys &&
+    catalogEntry.envKeys.length > 0;
+  const hasStoredKeys =
+    !!isApikeyEntry &&
+    catalogEntry!.envKeys!.every((k) => !!storedEntry?.environment?.[k]);
+  // Everything with credentials in place connects right from the card.
   const directConnect =
-    suggestion.kind === "connector" && catalogEntry?.auth !== "apikey";
+    suggestion.kind === "connector" &&
+    !!catalogEntry &&
+    catalogEntry.install.type === "remote" &&
+    (catalogEntry.auth !== "apikey" || hasStoredKeys) &&
+    !needsCustomCreds;
+  const showKeyForm = !!isApikeyEntry && !hasStoredKeys && !connected;
+  const showOAuthForm = needsCustomCreds && !connected;
+
+  // Credential drafts live in card state only — secrets never enter chat.
+  const [apiKeys, setApiKeys] = useState<Record<string, string>>({});
+  const [oauthClientId, setOauthClientId] = useState("");
+  const [oauthClientSecret, setOauthClientSecret] = useState("");
 
   const icon =
     suggestion.kind === "skill" ? (
@@ -93,6 +120,36 @@ export function SuggestionCard({
     onDismiss();
   };
 
+  /** Browser OAuth sign-in with the freshly saved credentials, then poll
+   * for the tokens. Reads the store directly so just-saved credentials are
+   * picked up. The card stays put until this succeeds or the user dismisses. */
+  const runOAuthSignIn = async () => {
+    if (!catalogEntry || catalogEntry.install.type !== "remote") return;
+    const fresh = getMcpServer(catalogEntry.id);
+    const custom = customOAuthArgsFor(
+      catalogEntry,
+      fresh?.oauthClientId,
+      fresh?.oauthClientSecret,
+    );
+    const url = await beginMcpOauth(catalogEntry.id, catalogEntry.install.url, custom);
+    await openUrl(url);
+    // The browser flow writes tokens when done; poll for up to ~5 min.
+    for (let i = 0; i < 150; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      try {
+        if (hasToken(await readMcpAuth(), catalogEntry.id)) {
+          setConnected(true);
+          toast.success(`${catalogEntry.name} connected — its tools are available from your next message`);
+          onDismiss();
+          return;
+        }
+      } catch {
+        /* keep polling */
+      }
+    }
+    toast.error(`Sign-in to ${catalogEntry.name} didn't complete`);
+  };
+
   /** One-click connect: add the connector, then run the native OAuth
    * sign-in in the browser when the provider needs it. */
   const handleDirectConnect = async () => {
@@ -108,23 +165,7 @@ export function SuggestionCard({
         });
       }
       if (catalogEntry.auth === "oauth") {
-        const url = await beginMcpOauth(catalogEntry.id, catalogEntry.install.url);
-        await openUrl(url);
-        // The browser flow writes tokens when done; poll for up to ~5 min.
-        for (let i = 0; i < 150; i++) {
-          await new Promise((r) => setTimeout(r, 2000));
-          try {
-            if (hasToken(await readMcpAuth(), catalogEntry.id)) {
-              setConnected(true);
-              toast.success(`${catalogEntry.name} connected — its tools are available from your next message`);
-              onDismiss();
-              return;
-            }
-          } catch {
-            /* keep polling */
-          }
-        }
-        toast.error(`Sign-in to ${catalogEntry.name} didn't complete`);
+        await runOAuthSignIn();
       } else {
         setConnected(true);
         toast.success(`${catalogEntry.name} connected — its tools are available from your next message`);
@@ -137,6 +178,65 @@ export function SuggestionCard({
           : typeof err === "string" && err
             ? err
             : `Failed to connect ${catalogEntry.name}`,
+      );
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  /** Save API keys from the card form, then connect without leaving the session. */
+  const handleSaveKeysAndConnect = async () => {
+    if (!catalogEntry || catalogEntry.install.type !== "remote" || !isApikeyEntry) return;
+    const missing = catalogEntry.envKeys!.filter((k) => !apiKeys[k]?.trim());
+    if (missing.length > 0) {
+      toast.error(`Fill in ${missing.join(", ")}`);
+      return;
+    }
+    setConnecting(true);
+    try {
+      const environment = Object.fromEntries(
+        catalogEntry.envKeys!.map((k) => [k, apiKeys[k].trim()]),
+      );
+      saveMcpServer(catalogEntry.id, {
+        type: "remote",
+        url: catalogEntry.install.url,
+        enabled: true,
+        environment,
+        addedAt: new Date().toISOString(),
+      });
+      setConnected(true);
+      toast.success(`${catalogEntry.name} connected — its tools are available from your next message`);
+      onDismiss();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : `Failed to save keys`);
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  /** Save the OAuth client from the card form, then start browser sign-in. */
+  const handleSaveOAuthAndConnect = async () => {
+    if (!catalogEntry || catalogEntry.install.type !== "remote") return;
+    if (!oauthClientId.trim() || !oauthClientSecret.trim()) {
+      toast.error("Paste both the OAuth client ID and secret");
+      return;
+    }
+    setConnecting(true);
+    try {
+      saveMcpServer(catalogEntry.id, {
+        type: "remote",
+        url: catalogEntry.install.url,
+        enabled: true,
+        oauthClientId: oauthClientId.trim(),
+        oauthClientSecret: oauthClientSecret.trim(),
+        addedAt: new Date().toISOString(),
+      });
+      await runOAuthSignIn();
+    } catch (err) {
+      toast.error(
+        err instanceof Error && err.message
+          ? err.message
+          : `Failed to connect ${catalogEntry.name}`,
       );
     } finally {
       setConnecting(false);
@@ -214,12 +314,16 @@ export function SuggestionCard({
             Connected
           </Button>
         )}
-        {suggestion.kind === "connector" && !directConnect && (
-          <Button size="sm" onClick={handleConnect}>
-            <Plug />
-            Open Connectors
-          </Button>
-        )}
+        {suggestion.kind === "connector" &&
+          !directConnect &&
+          !showKeyForm &&
+          !showOAuthForm &&
+          !connected && (
+            <Button size="sm" onClick={handleConnect}>
+              <Plug />
+              Open Connectors
+            </Button>
+          )}
         {suggestion.kind === "mode" && (
           <Button size="sm" onClick={handleEnableMode}>
             <ArrowUp />
@@ -252,6 +356,74 @@ export function SuggestionCard({
           Dismiss
         </Button>
       </div>
+
+      {/* Inline credential forms: auth completes in-session (plus the
+          browser for OAuth) — never in Settings, and secrets never enter
+          chat. The card stays until connect succeeds or the user dismisses. */}
+      {showKeyForm && (
+        <div className="flex flex-col gap-2">
+          {catalogEntry!.envKeys!.map((k) => (
+            <div key={k} className="flex flex-col gap-1">
+              <Label className="text-xs">{k.toUpperCase()}</Label>
+              <Input
+                value={apiKeys[k] ?? ""}
+                onChange={(e) => setApiKeys((prev) => ({ ...prev, [k]: e.target.value }))}
+                placeholder={`Paste your ${k}…`}
+                type="password"
+              />
+            </div>
+          ))}
+          <p className="text-[11px] text-muted-foreground">
+            Keys stay on this device and are never sent as chat.
+          </p>
+          <div>
+            <Button
+              size="sm"
+              onClick={() => void handleSaveKeysAndConnect()}
+              disabled={connecting}
+            >
+              {connecting ? <Loader2 className="animate-spin" /> : <Plug />}
+              Save & connect
+            </Button>
+          </div>
+        </div>
+      )}
+      {showOAuthForm && (
+        <div className="flex flex-col gap-2">
+          {catalogEntry!.customOAuth?.setupHint && (
+            <p className="text-[11px] text-muted-foreground">
+              {catalogEntry!.customOAuth!.setupHint}
+            </p>
+          )}
+          <div className="flex flex-col gap-1">
+            <Label className="text-xs">OAuth client ID</Label>
+            <Input
+              value={oauthClientId}
+              onChange={(e) => setOauthClientId(e.target.value)}
+              placeholder="….apps.googleusercontent.com"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <Label className="text-xs">OAuth client secret</Label>
+            <Input
+              value={oauthClientSecret}
+              onChange={(e) => setOauthClientSecret(e.target.value)}
+              placeholder="Paste your client secret…"
+              type="password"
+            />
+          </div>
+          <div>
+            <Button
+              size="sm"
+              onClick={() => void handleSaveOAuthAndConnect()}
+              disabled={connecting}
+            >
+              {connecting ? <Loader2 className="animate-spin" /> : <Plug />}
+              Save & sign in
+            </Button>
+          </div>
+        </div>
+      )}
     </InputGroup>
   );
 }
