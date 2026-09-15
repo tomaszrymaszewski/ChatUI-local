@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import type { UserSettings } from "@/types";
+import { setItemOrThrowFriendly } from "@/lib/storage-pressure";
 
 const STORAGE_KEY = "chatui:settings";
 const SETTINGS_EVENT = "chatui:settings-changed";
@@ -52,7 +53,7 @@ export function loadUserSettings(): UserSettings {
 }
 
 function saveSettings(settings: UserSettings) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+  setItemOrThrowFriendly(STORAGE_KEY, JSON.stringify(settings));
   window.dispatchEvent(new Event(SETTINGS_EVENT));
 }
 

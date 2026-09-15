@@ -5,6 +5,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { parse as parseJsonc } from "jsonc-parser";
+import { setItemOrThrowFriendly, trySetItem } from "./storage-pressure";
 
 export interface McpServerEntry {
   type: "remote";
@@ -39,7 +40,7 @@ function readStore(): Record<string, McpServerEntry> {
 }
 
 function writeStore(entries: Record<string, McpServerEntry>): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(entries));
+  setItemOrThrowFriendly(STORAGE_KEY, JSON.stringify(entries));
   window.dispatchEvent(new Event("chatui:mcp-changed"));
 }
 
@@ -173,8 +174,9 @@ function importRemoteEntries(
  */
 export async function ensureMcpMigrated(): Promise<void> {
   if (localStorage.getItem(MIGRATED_KEY)) return;
-  localStorage.setItem(MIGRATED_KEY, "1");
   try {
+    // Best-effort: when the flag can't persist the migration just reruns.
+    trySetItem(MIGRATED_KEY, "1");
     if (!("__TAURI_INTERNALS__" in window)) return;
     importRemoteEntries(await readLegacyConfig(null), undefined);
     try {

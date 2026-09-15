@@ -1,4 +1,5 @@
 import type { Provider } from "@/types";
+import { setItemOrThrowFriendly } from "./storage-pressure";
 
 const CACHE_KEY = "chatui:modelsdev-cache";
 const CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
@@ -165,7 +166,7 @@ export function setVisionOverride(providerId: string, modelName: string, value: 
   const key = `${providerId}:${modelName}`;
   if (value === undefined) delete overrides[key];
   else overrides[key] = value;
-  localStorage.setItem(OVERRIDE_KEY, JSON.stringify(overrides));
+  setItemOrThrowFriendly(OVERRIDE_KEY, JSON.stringify(overrides));
 }
 
 export function getVisionOverride(providerId: string, modelName: string): boolean | undefined {

@@ -1,3 +1,5 @@
+import { trySetItem } from "./storage-pressure";
+
 const PREFIX = "chatui:mcp-disabled:";
 
 export function getDisabledMcps(sessionId: string | null): string[] {
@@ -11,7 +13,8 @@ export function getDisabledMcps(sessionId: string | null): string[] {
 
 export function setDisabledMcps(sessionId: string | null, names: string[]) {
   if (!sessionId) return;
-  localStorage.setItem(PREFIX + sessionId, JSON.stringify(names));
+  // Best-effort: a full store must never crash the connector toggle.
+  trySetItem(PREFIX + sessionId, JSON.stringify(names));
 }
 
 /** Build the opencode `tools` map that disables the given MCP servers. */

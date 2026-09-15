@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import type { Project, ProjectFile, ProjectImage } from "@/types";
 import { extractFileText } from "@/lib/files";
 import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store";
+import { setItemOrThrowFriendly } from "@/lib/storage-pressure";
 
 const STORAGE_KEY = "chatui:projects";
 
@@ -36,7 +37,7 @@ export function loadProjectDirectories(): Array<{ id: string; directory?: string
 }
 
 function saveProjects(projects: StoredProject[]) {
-  localStorage.setItem(
+  setItemOrThrowFriendly(
     STORAGE_KEY,
     JSON.stringify(
       // Blob URLs are runtime-only — never persist them.

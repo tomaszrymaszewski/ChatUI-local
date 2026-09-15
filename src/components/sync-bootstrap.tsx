@@ -34,9 +34,15 @@ export function SyncBootstrap() {
         // debounced pushes only fire on later local writes).
         toastedForRef.current = userId;
         if (result.error) {
-          toast.error(
-            "Couldn't reach your cloud data. Your chats are safe on this device — sync will retry.",
-          );
+          if (/device storage is full/i.test(result.error)) {
+            toast.warning(
+              `Cloud sync is paused: ${result.error} Your chats are safe on this device — free up space (Settings → Account → Data shows per-key sizes) and sync will resume.`,
+            );
+          } else {
+            toast.error(
+              "Couldn't reach your cloud data. Your chats are safe on this device — sync will retry.",
+            );
+          }
           return;
         }
         if (result.undecryptable.length > 0) {

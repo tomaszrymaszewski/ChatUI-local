@@ -1,3 +1,5 @@
+import { setItemOrThrowFriendly } from "./storage-pressure";
+
 const STORAGE_KEY = "chatui:onboarding";
 
 interface OnboardingState {
@@ -17,7 +19,7 @@ export function isOnboardingDone(): boolean {
 }
 
 export function markOnboardingDone(): void {
-  localStorage.setItem(
+  setItemOrThrowFriendly(
     STORAGE_KEY,
     JSON.stringify({ completedAt: new Date().toISOString() }),
   );

@@ -1,4 +1,5 @@
 import type { AgentWorkflow, WorkflowStep } from "@/types";
+import { setItemOrThrowFriendly } from "./storage-pressure";
 
 // Linear agent workflows (step chains) — localStorage-backed, same pattern as
 // schedules.ts. The headless runner (headless-run.ts) executes steps in order;
@@ -22,7 +23,7 @@ export function loadWorkflows(): AgentWorkflow[] {
 }
 
 function persistWorkflows(workflows: AgentWorkflow[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(workflows));
+  setItemOrThrowFriendly(STORAGE_KEY, JSON.stringify(workflows));
   window.dispatchEvent(new Event(WORKFLOWS_EVENT));
 }
 

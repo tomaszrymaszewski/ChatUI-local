@@ -1,4 +1,5 @@
 import type { Provider, ProviderModel, UserSettings } from "@/types";
+import { setItemOrThrowFriendly } from "./storage-pressure";
 import type { ToolDefinition, ToolCall } from "@/lib/tools";
 import { executeTool } from "@/lib/tools";
 import { streamAnthropicCompletion, isAnthropicProvider } from "@/lib/providers/anthropic";
@@ -28,7 +29,7 @@ function loadProviders(): StoredProvider[] {
 }
 
 function saveProviders(providers: StoredProvider[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(providers));
+  setItemOrThrowFriendly(STORAGE_KEY, JSON.stringify(providers));
   window.dispatchEvent(new Event(PROVIDERS_EVENT));
 }
 

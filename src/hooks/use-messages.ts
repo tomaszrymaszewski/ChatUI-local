@@ -3,6 +3,7 @@ import type { Message } from "@/types";
 import type { ActivityItem, ReasoningStream, SharedFile } from "@/lib/agent/types";
 import type { Artifact } from "@/lib/artifacts";
 import { deleteFileBlob } from "@/lib/attachment-store";
+import { evictRebuildableCaches } from "@/lib/storage-pressure";
 
 function storageKey(sessionId: string) {
   return `chatui:messages:${sessionId}`;
@@ -147,7 +148,16 @@ function saveMessages(sessionId: string, messages: Message[]) {
     touchRecency(sessionId);
     return;
   } catch {
-    // quota pressure — fall through to eviction
+    // quota pressure — drop rebuildable caches first (cheaper than chats),
+    // then fall through to message eviction below.
+    evictRebuildableCaches();
+    try {
+      localStorage.setItem(key, payload);
+      touchRecency(sessionId);
+      return;
+    } catch {
+      // still full — evict old chats below
+    }
   }
   try {
     const recency = readRecency();

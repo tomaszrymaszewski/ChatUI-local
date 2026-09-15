@@ -98,4 +98,22 @@ describe("sync-crypto", () => {
     storage.set("chatui:sync:key", "definitely-not-base64!!!");
     await expect(encryptForSync("x")).rejects.toThrow(/corrupt/);
   });
+
+  it("reports a full store distinctly so sync can explain the pause", async () => {
+    vi.stubGlobal("localStorage", {
+      getItem: (k: string) => storage.get(k) ?? null,
+      setItem: () => {
+        throw new DOMException("The quota has been exceeded.", "QuotaExceededError");
+      },
+      removeItem: (k: string) => void storage.delete(k),
+      key: (i: number) => [...storage.keys()][i] ?? null,
+      get length() {
+        return storage.size;
+      },
+    });
+    await expect(encryptForSync("x")).rejects.toThrow(/device storage is full/i);
+    await expect(
+      importSyncRecoveryCode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    ).rejects.toThrow(/device storage is full/i);
+  });
 });

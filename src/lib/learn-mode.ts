@@ -21,6 +21,8 @@ export type LearnSubject =
   | "technology"
   | "arts";
 
+import { setItemOrThrowFriendly } from "./storage-pressure";
+
 const STORAGE_KEY = "chatui:learn-mode";
 
 export interface LearnPreferences {
@@ -68,7 +70,7 @@ export function loadLearnPreferences(): LearnPreferences {
 }
 
 export function saveLearnPreferences(prefs: LearnPreferences): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(prefs));
+  setItemOrThrowFriendly(STORAGE_KEY, JSON.stringify(prefs));
 }
 
 // --- Pedagogy pieces ---

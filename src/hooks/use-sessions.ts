@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import type { ChatSession, ReasoningEffort, SessionChatMode } from "@/types";
+import { trySetItem } from "@/lib/storage-pressure";
 
 const STORAGE_KEY = "chatui:sessions";
 const SESSIONS_EVENT = "chatui:sessions-changed";
@@ -47,7 +48,7 @@ function loadSessions(): ChatSession[] {
  */
 function saveSessions(sessions: ChatSession[]) {
   try {
-    localStorage.setItem(
+    trySetItem(
       STORAGE_KEY,
       JSON.stringify(
         sessions.map((s) => ({

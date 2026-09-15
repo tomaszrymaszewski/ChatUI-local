@@ -1,5 +1,6 @@
 // Council roster selection — which models the council-mode prompt asks the
 // agent to simulate as subagent perspectives. Persisted in localStorage.
+import { setItemOrThrowFriendly } from "./storage-pressure";
 
 const STORAGE_KEY = "chatui:council-models";
 
@@ -20,7 +21,7 @@ export function loadCouncilRoster(): string[] {
 }
 
 export function saveCouncilRoster(models: string[]): void {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(models));
+  setItemOrThrowFriendly(STORAGE_KEY, JSON.stringify(models));
 }
 
 export interface RosterModelMeta {

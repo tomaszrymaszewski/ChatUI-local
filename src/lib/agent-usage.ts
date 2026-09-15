@@ -3,6 +3,7 @@
 // runs are logged with a chars/4 estimate (the chart labels values as such).
 // Recording starts when the user first runs an agent; history before that
 // simply shows zeros.
+import { trySetItem } from "./storage-pressure";
 
 export interface AgentUsageEntry {
   agentId: string;
@@ -50,7 +51,8 @@ export function loadAgentUsage(): AgentUsageEntry[] {
 
 function persistUsage(entries: AgentUsageEntry[]) {
   const trimmed = entries.slice(-MAX_ENTRIES);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+  // Telemetry must never break a run: drop the write when the store is full.
+  if (!trySetItem(STORAGE_KEY, JSON.stringify(trimmed))) return;
   window.dispatchEvent(new Event(USAGE_EVENT));
 }
 

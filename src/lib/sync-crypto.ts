@@ -10,6 +10,7 @@
 //
 // Rows written before encryption shipped are legacy plaintext: pulls accept
 // them as-is and the next sync re-pushes them encrypted (see sync.ts).
+import { trySetItem } from "./storage-pressure";
 
 const SYNC_KEY_STORAGE = "chatui:sync:key";
 
@@ -77,13 +78,13 @@ export async function getSyncKey(): Promise<CryptoKey> {
     const bytes = new Uint8Array(32);
     globalThis.crypto.getRandomValues(bytes);
     raw = bytesToBase64(bytes);
-    try {
-      // Local-only key (excluded from sync, so this write never uploads itself
-      // or schedules a push). Included in local file backups + data exports so
-      // a restore keeps the cloud rows decryptable.
-      localStorage.setItem(SYNC_KEY_STORAGE, raw);
-    } catch {
-      throw new Error("Couldn't persist the sync key (storage unavailable)");
+    // Local-only key (excluded from sync, so this write never uploads itself
+    // or schedules a push). Included in local file backups + data exports so
+    // a restore keeps the cloud rows decryptable.
+    if (!trySetItem(SYNC_KEY_STORAGE, raw)) {
+      throw new Error(
+        "Device storage is full — the sync encryption key couldn't be saved, so cloud sync is paused.",
+      );
     }
   }
   if (cachedKey && cachedRaw === raw) return cachedKey;
@@ -194,10 +195,8 @@ export async function importSyncRecoveryCode(code: string): Promise<void> {
   if (bytes.length !== 32 || compact.length === 0) {
     throw new Error("That doesn't look like a sync recovery code");
   }
-  try {
-    localStorage.setItem(SYNC_KEY_STORAGE, bytesToBase64(bytes));
-  } catch {
-    throw new Error("Couldn't save the recovery code (storage unavailable)");
+  if (!trySetItem(SYNC_KEY_STORAGE, bytesToBase64(bytes))) {
+    throw new Error("Device storage is full — free up space, then enter the recovery code again.");
   }
   cachedRaw = null;
   cachedKey = null;

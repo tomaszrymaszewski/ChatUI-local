@@ -1,5 +1,6 @@
 import { unzipSync, strFromU8 } from "fflate";
 import type { Message } from "@/types";
+import { setItemOrThrowFriendly } from "./storage-pressure";
 
 // Data export/import: full AI Studio backups (a snapshot of every chatui* localStorage
 // key — chats, agents, projects, providers, settings, schedules, workflows,
@@ -127,7 +128,7 @@ function restoreChatUiBackup(parsed: { data?: unknown }): void {
     if (value === null) {
       localStorage.removeItem(key);
     } else {
-      localStorage.setItem(key, value);
+      setItemOrThrowFriendly(key, value);
     }
   }
 }
@@ -366,7 +367,7 @@ function mergeImportedSessions(
   for (const s of newSessions) {
     if (!ids.has(s.id)) stored.push(s);
   }
-  localStorage.setItem(SESSIONS_KEY, JSON.stringify(stored));
+  setItemOrThrowFriendly(SESSIONS_KEY, JSON.stringify(stored));
   window.dispatchEvent(new Event(SESSIONS_EVENT));
   window.dispatchEvent(new Event(MESSAGES_EVENT));
 }
@@ -397,7 +398,7 @@ function persistImportedThread(
     parent_id: i === 0 ? null : finalIds[i - 1],
     is_temporary: false,
   }));
-  localStorage.setItem(`${MESSAGES_KEY_PREFIX}${sessionId}`, JSON.stringify(records));
+  setItemOrThrowFriendly(`${MESSAGES_KEY_PREFIX}${sessionId}`, JSON.stringify(records));
   return records[records.length - 1].timestamp;
 }
 

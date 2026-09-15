@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getSupabase } from "@/lib/supabase";
 import { decryptFromSync, encryptForSync, isSyncEnvelope } from "@/lib/sync-crypto";
+import { trySetItem } from "./storage-pressure";
 import { chatUiBaseDir } from "@/lib/agent/sandbox";
 import { isTauri } from "@/lib/platform";
 import { exportChatUiBackup } from "@/lib/data-transfer";
@@ -122,11 +123,9 @@ function loadMeta(): SyncMeta {
 }
 
 function saveMeta(meta: SyncMeta): void {
-  try {
-    localStorage.setItem(META_KEY, JSON.stringify(meta));
-  } catch {
-    // Non-fatal: the next sync just re-detects changes by hash.
-  }
+  // Best-effort (evicts rebuildable caches under quota pressure): when the
+  // write can't land, the next sync just re-detects changes by hash.
+  trySetItem(META_KEY, JSON.stringify(meta));
 }
 
 function readLocal(): Map<string, string> {
@@ -543,9 +542,8 @@ export async function syncNow(
   }
 
   for (const { key, value } of plan.toLocal) {
-    try {
-      localStorage.setItem(key, value);
-    } catch {
+    // trySetItem evicts rebuildable caches under quota pressure first.
+    if (!trySetItem(key, value)) {
       // Quota pressure — the key stays stale locally; meta still advances so
       // we don't flap. The next successful write re-syncs by hash.
     }

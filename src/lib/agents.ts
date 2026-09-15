@@ -1,4 +1,5 @@
 import type { AgentDefinition } from "@/types";
+import { setItemOrThrowFriendly } from "./storage-pressure";
 import { invoke } from "@tauri-apps/api/core";
 import { chatUiBaseDir, remapLegacyChatUiPath } from "@/lib/agent/sandbox";
 
@@ -39,7 +40,7 @@ export function loadAgentDefinitions(): AgentDefinition[] {
 }
 
 function persistAgents(agents: AgentDefinition[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(agents));
+  setItemOrThrowFriendly(STORAGE_KEY, JSON.stringify(agents));
   window.dispatchEvent(new Event(AGENTS_EVENT));
 }
 

@@ -964,14 +964,17 @@ function SyncEncryptionCard() {
 function DataTab() {
   const [rows, setRows] = useState<StoredRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [localTotal, setLocalTotal] = useState(0);
 
   const refresh = async () => {
     const seen = new Map<string, StoredRow>();
+    let localBytes = 0;
     try {
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i);
         if (!key || !/^chatui/.test(key) || key === "chatui:sync:meta") continue;
         const value = localStorage.getItem(key) ?? "";
+        localBytes += value.length;
         seen.set(key, {
           key,
           bytes: value.length,
@@ -982,6 +985,7 @@ function DataTab() {
     } catch {
       // Storage unreadable — fall through to the cloud rows.
     }
+    setLocalTotal(localBytes);
     try {
       const { data, error: fetchError } = await getSupabase()
         .from("user_data")
@@ -1009,16 +1013,21 @@ function DataTab() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const total = rows?.reduce((n, r) => n + r.bytes, 0) ?? 0;
-
   return (
     <div className="flex flex-col gap-3">
       <SyncEncryptionCard />
+      {rows !== null && localTotal > 4_000_000 && (
+        <p className="text-xs leading-relaxed text-amber-600 dark:text-amber-500">
+          Device storage is nearly full (localStorage caps at ~5 MB) — if sync or saving starts
+          failing, delete old chats you no longer need. Cached data is cleared automatically under
+          pressure.
+        </p>
+      )}
       <div className="flex items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground">
           {rows === null
             ? "Loading…"
-            : `${rows.length} synced ${rows.length === 1 ? "key" : "keys"} · ${formatBytes(total)}`}
+            : `${rows.length} synced ${rows.length === 1 ? "key" : "keys"} · ${formatBytes(localTotal)} on this device`}
         </p>
         <Button variant="ghost" size="sm" onClick={() => void refresh()}>
           <RefreshCw className="size-3.5" />

@@ -10,6 +10,7 @@
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
+import { trySetItem } from "./storage-pressure";
 
 const isTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 
@@ -39,7 +40,9 @@ export function loadUpdateSettings(): UpdateSettings {
 }
 
 export function saveUpdateSettings(settings: UpdateSettings): void {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  // Best-effort: a full store must never fail the update check (lastChecked
+  // just won't persist until there's room again).
+  trySetItem(SETTINGS_KEY, JSON.stringify(settings));
 }
 
 export interface UpdateInfo {

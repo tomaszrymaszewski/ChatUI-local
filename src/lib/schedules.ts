@@ -1,4 +1,5 @@
 import type { AgentSchedule, ScheduleCadence } from "@/types";
+import { setItemOrThrowFriendly } from "./storage-pressure";
 
 // Scheduled agent runs — localStorage-backed, same pattern as agents.ts.
 // The scheduler hook (use-scheduler.ts) advances nextRun and fires headless
@@ -20,7 +21,7 @@ export function loadSchedules(): AgentSchedule[] {
 }
 
 function persistSchedules(schedules: AgentSchedule[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(schedules));
+  setItemOrThrowFriendly(STORAGE_KEY, JSON.stringify(schedules));
   window.dispatchEvent(new Event(SCHEDULES_EVENT));
 }
 
