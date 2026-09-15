@@ -8,15 +8,12 @@ import {
   addModelToProvider as addModelRPC,
   removeModelFromProvider as removeModelRPC,
   updateModelDisplayName as updateDisplayNameRPC,
+  PROVIDERS_EVENT,
 } from "@/lib/llm";
 
 export function useProviders() {
   const [providers, setProviders] = useState<Provider[]>([]);
   const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    loadProviders();
-  }, []);
 
   const loadProviders = useCallback(async () => {
     try {
@@ -27,6 +24,14 @@ export function useProviders() {
     }
     setLoading(false);
   }, []);
+
+  useEffect(() => {
+    void loadProviders();
+    // Cloud-sync pulls (and other tabs) refresh the list without a remount.
+    const sync = () => void loadProviders();
+    window.addEventListener(PROVIDERS_EVENT, sync);
+    return () => window.removeEventListener(PROVIDERS_EVENT, sync);
+  }, [loadProviders]);
 
   const createProvider = useCallback(
     async (

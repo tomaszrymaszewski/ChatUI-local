@@ -202,3 +202,15 @@ export function MicrosoftLogo(props: SVGProps<SVGSVGElement>) {
     </svg>
   );
 }
+
+export function GoogleLogo(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" {...props}>
+      <path d="M3.84 15.81A9 9 0 0 1 19.37 6.84" stroke="#EA4335" strokeWidth="3.8" />
+      <path d="M19.37 6.84A9 9 0 0 1 18.36 18.36" stroke="#4285F4" strokeWidth="3.8" />
+      <path d="M18.36 18.36A9 9 0 0 1 7.5 19.79" stroke="#34A853" strokeWidth="3.8" />
+      <path d="M7.5 19.79A9 9 0 0 1 3.84 15.81" stroke="#FBBC05" strokeWidth="3.8" />
+      <rect x="11.5" y="10.1" width="10" height="3.8" fill="#4285F4" />
+    </svg>
+  );
+}

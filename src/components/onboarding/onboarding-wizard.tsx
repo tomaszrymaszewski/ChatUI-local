@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, PartyPopper } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { AccountStep } from "@/components/onboarding/account-step";
 import { WelcomeStep } from "@/components/onboarding/welcome-step";
 import { ThemeStep } from "@/components/onboarding/theme-step";
 import { ProvidersStep } from "@/components/onboarding/providers-step";
 import { ProviderKeyStep } from "@/components/onboarding/provider-key-step";
 import { ProviderModelsStep } from "@/components/onboarding/provider-models-step";
 import { EmbeddingsStep } from "@/components/onboarding/embeddings-step";
+import { ImportStep } from "@/components/onboarding/import-step";
 import { StepFooter } from "@/components/onboarding/step-chrome";
 import { PatternBackground } from "@/components/background-pattern";
 import { useProviders } from "@/hooks/use-providers";
@@ -24,28 +26,34 @@ import { cn } from "@/lib/utils";
 import type { Provider } from "@/types";
 
 type Step =
+  | "account"
   | "welcome"
   | "theme"
   | "providers"
   | "provider-key"
   | "provider-models"
   | "embeddings"
+  | "import"
   | "done";
 
 const ALL_STEPS: Step[] = [
+  "account",
   "welcome",
   "theme",
   "providers",
   "provider-key",
   "provider-models",
   "embeddings",
+  "import",
   "done",
 ];
 
 const TOP_STEPS: Array<{ label: string; steps: Step[] }> = [
+  { label: "Account", steps: ["account"] },
   { label: "Welcome", steps: ["welcome"] },
   { label: "Theme", steps: ["theme"] },
   { label: "Providers", steps: ["providers", "provider-key", "provider-models", "embeddings"] },
+  { label: "Import", steps: ["import"] },
   { label: "Done", steps: ["done"] },
 ];
 
@@ -54,7 +62,7 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
     const saved = loadOnboardingStep();
     return saved && (ALL_STEPS as string[]).includes(saved)
       ? (saved as Step)
-      : "welcome";
+      : "account";
   });
   const [setupKey, setSetupKey] = useState<string | null>(null);
   const [setupProviderId, setSetupProviderId] = useState<string | null>(null);
@@ -188,11 +196,20 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
           <main ref={mainRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto px-6 pb-8">
             <div className="mx-auto my-auto w-full max-w-3xl">
               <div key={step} className="animate-in fade-in slide-in-from-bottom-3 duration-300">
+            {step === "account" && (
+              <AccountStep
+                headerBox={headerBox}
+                footerBox={footerBox}
+                onNext={() => gotoStep("welcome")}
+              />
+            )}
+
             {step === "welcome" && (
               <WelcomeStep
                 initialName={settings.nickname}
                 headerBox={headerBox}
                 footerBox={footerBox}
+                onBack={() => gotoStep("account")}
                 onNext={(name) => {
                   if (name) void updateSettings({ nickname: name });
                   gotoStep("theme");
@@ -250,10 +267,19 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
                   setEmbeddingChoice(modelId);
                   void updateSettings({ embeddingModel: modelId });
                 }}
-                onDone={() => gotoStep("done")}
+                onDone={() => gotoStep("import")}
                 onBack={() => gotoStep("providers")}
                 headerBox={headerBox}
                 footerBox={footerBox}
+              />
+            )}
+
+            {step === "import" && (
+              <ImportStep
+                headerBox={headerBox}
+                footerBox={footerBox}
+                onBack={() => gotoStep("embeddings")}
+                onNext={() => gotoStep("done")}
               />
             )}
 

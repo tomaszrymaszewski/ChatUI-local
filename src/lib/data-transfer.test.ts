@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { zipSync, strToU8 } from "fflate";
 import {
   exportChatUiBackup,
   exportOpenAiConversations,
   exportAnthropicConversations,
   importData,
+  importFile,
 } from "./data-transfer";
 import { buildMessageTree, getActivePath } from "./message-tree";
 import type { Message } from "@/types";
@@ -137,12 +139,12 @@ describe("portable exports", () => {
 
     const claude = JSON.parse(exportAnthropicConversations()) as Array<{
       name: string;
-      chats: Array<{ sender: string; text?: string; content_feature_store?: Array<{ text: string }> }>;
+      chat_messages: Array<{ sender: string; text?: string; content?: Array<{ type: string; text: string }> }>;
     }>;
     expect(claude).toHaveLength(1);
-    expect(claude[0].chats.map((c) => c.sender)).toEqual(["human", "assistant", "human"]);
-    expect(claude[0].chats[0].text).toBe("how do threads work");
-    expect(claude[0].chats[1].content_feature_store?.[0].text).toBe("regenerated answer");
+    expect(claude[0].chat_messages.map((c) => c.sender)).toEqual(["human", "assistant", "human"]);
+    expect(claude[0].chat_messages[0].text).toBe("how do threads work");
+    expect(claude[0].chat_messages[1].content?.[0]).toEqual({ type: "text", text: "regenerated answer" });
   });
 
   it("skips sessions with no portable messages", () => {
@@ -229,7 +231,50 @@ describe("import from ChatGPT format", () => {
 });
 
 describe("import from Claude format", () => {
-  it("maps human/assistant chats with text or content_feature_store", () => {
+  it("reads the real export shape: chat_messages with typed content blocks", () => {
+    const file = JSON.stringify([
+      {
+        uuid: "c-claude-real",
+        name: "Real Claude chat",
+        created_at: "2026-01-02T03:04:05.000000Z",
+        updated_at: "2026-01-02T03:05:05.000000Z",
+        account: { uuid: "acct-1" },
+        chat_messages: [
+          {
+            uuid: "h1",
+            text: "explain recursion",
+            sender: "human",
+            created_at: "2026-01-02T03:04:05Z",
+            updated_at: "2026-01-02T03:04:05Z",
+          },
+          {
+            uuid: "a1",
+            sender: "assistant",
+            content: [
+              { type: "thinking", text: "internal reasoning, not conversation" },
+              { type: "text", text: "Recursion is " },
+              { type: "text", text: "a function calling itself." },
+              { type: "tool_use", name: "search", input: {} },
+            ],
+            created_at: "2026-01-02T03:04:30Z",
+            updated_at: "2026-01-02T03:04:30Z",
+          },
+        ],
+      },
+    ]);
+
+    const result = importData(file);
+    expect(result).toEqual({ kind: "anthropic", sessions: 1, messages: 2, skipped: 0 });
+    expect(storedSession("c-claude-real")).toMatchObject({ title: "Real Claude chat", type: "chat" });
+    const msgs = storedMessages("c-claude-real");
+    expect(msgs.map((m) => [m.role, m.content])).toEqual([
+      ["user", "explain recursion"],
+      ["assistant", "Recursion is a function calling itself."],
+    ]);
+    expect(msgs[1].parent_id).toBe("h1");
+  });
+
+  it("still reads the legacy chats shape with text or content_feature_store", () => {
     const file = JSON.stringify([
       {
         uuid: "c-claude-1",
@@ -294,6 +339,144 @@ describe("round trip", () => {
     const { roots, nodeMap } = buildMessageTree(asMessages);
     const thread = getActivePath(roots, nodeMap, new Map());
     expect(thread.map((n) => n.message.content)).toEqual(["question", "answer"]);
+  });
+});
+
+describe("explicit format choice", () => {
+  const gptFile = JSON.stringify([
+    {
+      title: "GPT chat",
+      mapping: {
+        root: { id: "root", message: null, parent: null, children: ["u1"] },
+        u1: {
+          id: "u1",
+          parent: "root",
+          children: [],
+          message: {
+            id: "u1",
+            author: { role: "user" },
+            create_time: 1700000000,
+            content: { content_type: "text", parts: ["hi"] },
+          },
+        },
+      },
+      current_node: "u1",
+      conversation_id: "c-choice-1",
+    },
+  ]);
+  const claudeFile = JSON.stringify([
+    {
+      uuid: "c-choice-2",
+      name: "Claude chat",
+      chat_messages: [{ uuid: "h1", sender: "human", text: "hey" }],
+    },
+  ]);
+
+  it("imports when the file matches the chosen format", () => {
+    expect(importData(gptFile, { format: "openai" })).toMatchObject({ kind: "openai", sessions: 1 });
+    expect(importData(claudeFile, { format: "anthropic" })).toMatchObject({ kind: "anthropic", sessions: 1 });
+  });
+
+  it("rejects a file that matches a different format", () => {
+    expect(() => importData(gptFile, { format: "anthropic" })).toThrow(
+      'looks like a ChatGPT export, but "Claude" is selected',
+    );
+    expect(() => importData(claudeFile, { format: "openai" })).toThrow(
+      'looks like a Claude export, but "ChatGPT" is selected',
+    );
+  });
+
+  it("rejects an unreadable file with a format-specific hint", () => {
+    expect(() => importData('{"foo": 1}', { format: "openai" })).toThrow(
+      "Couldn't read this file as a ChatGPT export",
+    );
+  });
+});
+
+describe("import from zip files", () => {
+  function zipFile(name: string, entries: Record<string, string>): File {
+    const zipped = zipSync(
+      Object.fromEntries(Object.entries(entries).map(([k, v]) => [k, strToU8(v)])),
+    );
+    const copy = new Uint8Array(zipped);
+    return new File([copy.buffer as ArrayBuffer], name, { type: "application/zip" });
+  }
+
+  const gptConversations = JSON.stringify([
+    {
+      title: "Zipped GPT chat",
+      mapping: {
+        root: { id: "root", message: null, parent: null, children: ["u1"] },
+        u1: {
+          id: "u1",
+          parent: "root",
+          children: [],
+          message: {
+            id: "u1",
+            author: { role: "user" },
+            create_time: 1700000000,
+            content: { content_type: "text", parts: ["from zip"] },
+          },
+        },
+      },
+      current_node: "u1",
+      conversation_id: "c-zip-1",
+    },
+  ]);
+
+  it("reads conversations.json out of a vendor export zip", async () => {
+    const file = zipFile("chatgpt-export.zip", {
+      "conversations.json": gptConversations,
+      "message_feedback.json": "[]",
+    });
+    const result = await importFile(file, { format: "openai" });
+    expect(result).toEqual({ kind: "openai", sessions: 1, messages: 1, skipped: 0 });
+    expect(storedSession("c-zip-1")).toMatchObject({ title: "Zipped GPT chat" });
+  });
+
+  it("finds conversations.json nested in a folder and merges shards", async () => {
+    const file = zipFile("big-export.zip", {
+      "data-2026/conversations-000.json": gptConversations,
+      "data-2026/conversations-001.json": JSON.stringify([
+        {
+          title: "Second shard",
+          mapping: {
+            root: { id: "root", message: null, parent: null, children: ["u9"] },
+            u9: {
+              id: "u9",
+              parent: "root",
+              children: [],
+              message: {
+                id: "u9",
+                author: { role: "user" },
+                create_time: 1700000001,
+                content: { content_type: "text", parts: ["shard two"] },
+              },
+            },
+          },
+          current_node: "u9",
+          conversation_id: "c-zip-2",
+        },
+      ]),
+    });
+    const result = await importFile(file);
+    expect(result).toEqual({ kind: "openai", sessions: 2, messages: 2, skipped: 0 });
+  });
+
+  it("rejects zips without a conversations file", async () => {
+    const file = zipFile("random.zip", { "readme.txt": "hello" });
+    await expect(importFile(file)).rejects.toThrow("No conversations file found in this zip");
+  });
+
+  it("rejects a zip when the AI Studio backup format is selected", async () => {
+    const file = zipFile("chatgpt-export.zip", { "conversations.json": gptConversations });
+    await expect(importFile(file, { format: "chatui" })).rejects.toThrow("not zips");
+  });
+
+  it("passes plain .json files straight through", async () => {
+    const file = new File([gptConversations], "conversations.json", { type: "application/json" });
+    const result = await importFile(file);
+    expect(result).toEqual({ kind: "openai", sessions: 1, messages: 1, skipped: 0 });
   });
 });
 

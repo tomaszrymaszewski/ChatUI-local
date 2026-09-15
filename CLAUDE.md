@@ -5,13 +5,14 @@ Persistent instructions for AI coding agents on this repo. Keep changes tightly 
 ## What this repo is
 
 A local-first desktop chat app: **Tauri 2 (Rust shell) + React 19 + TypeScript + Vite 7
-+ Tailwind + shadcn/ui**. No Supabase, no router, no auth — all persistence is
-localStorage (chats, sessions, agents, projects, schedules, provider keys) plus files
-under the OS app-data dir `~/Library/Application Support/com.tomaszrymaszewski.chatui/`
-(managed by the Rust side). **Never use `~/Documents`** — that base was removed; a
-one-time startup migration (`migrate_legacy_chat_ui_dir` in `src-tauri/src/lib.rs`,
-runs in `setup()`) moved skills/agents/mcp-tokens/logs/index.db over and deleted the
-old folder.
++ Tailwind + shadcn/ui**, no router. All persistence is localStorage (chats, sessions,
+agents, projects, schedules, provider keys) plus files under the OS app-data dir
+`~/Library/Application Support/com.tomaszrymaszewski.chatui/` (managed by the Rust
+side). **Never use `~/Documents`** — that base was removed; a one-time startup
+migration (`migrate_legacy_chat_ui_dir` in `src-tauri/src/lib.rs`, runs in `setup()`)
+moved skills/agents/mcp-tokens/logs/index.db over and deleted the old folder.
+Optional **Supabase accounts** (`@supabase/supabase-js`, creds in `.env`) add cloud
+sync on top of the local store — anonymous mode works fully offline and is unchanged.
 
 - **Chat** — `src/components/ChatView.tsx` (the whole UI: sessions, projects, settings
   views). Every send runs through a **LangChain Deep Agents** runtime:
@@ -108,6 +109,15 @@ old folder.
   pubkey in `tauri.conf.json` before installing. Building release artifacts requires
   `TAURI_SIGNING_PRIVATE_KEY` env var (set in CI secrets, not committed). The release
   workflow is `.github/workflows/release.yml` (tauri-action on `v*` tag push).
+- **Accounts + cloud sync** (`src/lib/supabase.ts`, `src/hooks/use-auth.ts`,
+  `src/lib/sync.ts`, `supabase/schema.sql`): email/password auth; every tracked
+  `chatui:*` key mirrors verbatim to one `user_data` row per (user, key). Sync is
+  per-key last-write-wins with tombstones, except sessions/message stores which
+  union-merge by record id (`mergeRecordLists`, `planSync` — pure, unit-tested).
+  Hooks must re-read storage in mutations and dispatch `*-changed` events so pulls
+  can't be clobbered or go stale. Successful syncs also write JSON backups to
+  `<base>/backups/` via the existing `write_text_file` command. Never put the
+  Supabase *secret* key in the app — only the publishable key in `.env`.
 - **Mode triggers** (`src/lib/mode-triggers.ts`): typing "discuss…", "teach me…",
   "i want to learn…", or "research…" as the first word of the composer auto-activates
   the corresponding chat mode (button lights up blue + expands). Detection is live:

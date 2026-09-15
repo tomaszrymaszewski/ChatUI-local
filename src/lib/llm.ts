@@ -5,6 +5,9 @@ import { streamAnthropicCompletion, isAnthropicProvider } from "@/lib/providers/
 
 const STORAGE_KEY = "chatui:providers";
 
+/** Fired whenever providers change (local edits and cloud-sync pulls). */
+export const PROVIDERS_EVENT = "chatui:providers-changed";
+
 interface StoredProvider {
   id: string;
   name: string;
@@ -26,6 +29,7 @@ function loadProviders(): StoredProvider[] {
 
 function saveProviders(providers: StoredProvider[]) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(providers));
+  window.dispatchEvent(new Event(PROVIDERS_EVENT));
 }
 
 function generateId(): string {

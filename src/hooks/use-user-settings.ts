@@ -78,11 +78,11 @@ export function useUserSettings() {
 
   const updateSettings = useCallback(
     async (updates: Partial<UserSettings>) => {
-      setSettings((prev) => {
-        const next = { ...prev, ...updates };
-        saveSettings(next);
-        return next;
-      });
+      // Merge over fresh storage (not in-memory state) so an update never
+      // clobbers settings a cloud-sync pull applied after this render.
+      const next = { ...loadSettings(), ...updates };
+      saveSettings(next);
+      setSettings(next);
     },
     [],
   );

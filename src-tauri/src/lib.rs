@@ -17,6 +17,15 @@ use tauri::{Emitter, Manager};
 /// receives the browser redirect and validates `state`.
 const MCP_OAUTH_CALLBACK_PORT: u16 = 19876;
 
+/// Port of the account (Supabase) sign-in callback listener — one higher so
+/// the two flows never share a socket. Must match OAUTH_CALLBACK_PORT in
+/// src/lib/oauth-callback.ts.
+const ACCOUNT_OAUTH_CALLBACK_PORT: u16 = 19877;
+
+/// Path the browser lands on after the provider approves the account sign-in.
+/// Must match OAUTH_CALLBACK_PATH in src/lib/oauth-callback.ts.
+const ACCOUNT_OAUTH_CALLBACK_PATH: &str = "/auth/callback";
+
 /// Bundle identifier (tauri.conf.json) — names our app-data directory.
 const APP_DATA_DIR_ID: &str = "com.tomaszrymaszewski.chatui";
 
@@ -1876,6 +1885,78 @@ async fn mcp_oauth_begin(
         });
 
         Ok(authorize.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Wait for the system-browser account sign-in to redirect back to
+/// `http://localhost:<port>/auth/callback`, then return the request target
+/// (path + query) so the frontend can exchange the PKCE code for a session.
+/// The PKCE verifier lives in the webview's storage, so only the frontend can
+/// do the exchange — Rust just captures the redirect and shows the browser a
+/// "you can close this tab" page. Times out after 10 minutes; a busy port
+/// means another sign-in is already waiting.
+#[tauri::command]
+async fn wait_for_account_oauth_callback() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let listener = TcpListener::bind(("127.0.0.1", ACCOUNT_OAUTH_CALLBACK_PORT))
+            .map_err(|e| format!("Another sign-in is already in progress ({})", e))?;
+        let _ = listener.set_nonblocking(true);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let mut buf = [0u8; 4096];
+                    let n = match std::io::Read::read(&mut stream, &mut buf) {
+                        Ok(n) => n,
+                        Err(_) => continue,
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]);
+                    let target = head
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    if !target.starts_with(ACCOUNT_OAUTH_CALLBACK_PATH) {
+                        write_response(stream, "404 Not Found", "Not found");
+                        continue;
+                    }
+                    // Reuse the tested query decoder; the frontend interprets
+                    // the returned target (code vs provider error) the same way.
+                    let (code, _state, error) = parse_callback_params(&target);
+                    if code.is_none() && error.is_none() {
+                        write_response(stream, "400 Bad Request", "Missing sign-in parameters");
+                        continue;
+                    }
+                    if error.is_some() {
+                        write_response(
+                            stream,
+                            "200 OK",
+                            "<html><body><h2>Sign-in failed</h2><p>The provider returned an error. Return to AI Studio and try again.</p></body></html>",
+                        );
+                    } else {
+                        write_response(
+                            stream,
+                            "200 OK",
+                            "<html><body><h2>Signed in</h2><p>You can close this tab and return to AI Studio.</p></body></html>",
+                        );
+                    }
+                    return Ok(target);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() > deadline {
+                        return Err("Sign-in timed out. Try again.".to_string());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => continue,
+            }
+        }
     })
     .await
     .map_err(|e| e.to_string())?
@@ -4737,6 +4818,7 @@ pub fn run() {
             opencode_server_log,
             opencode_serve_in_dir,
             mcp_oauth_begin,
+            wait_for_account_oauth_callback,
             read_mcp_auth,
             clear_mcp_auth,
             refresh_mcp_token,

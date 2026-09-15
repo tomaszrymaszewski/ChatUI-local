@@ -48,6 +48,7 @@ import { AgentAvatar } from "@/components/agent-avatar";
 import { AgentConsole } from "@/components/agent-console";
 import { AgentDashboard, type DashboardComposeMode } from "@/components/agent-dashboard";
 import { AgentSettingsDialog } from "@/components/agent-settings-dialog";
+import { AccountSettings, AccountView, type AccountTab } from "@/pages/account";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { MessageStream } from "@/components/message-stream";
 import { SettingsView, type SettingsTab } from "@/pages/settings";
@@ -139,6 +140,8 @@ import type {
   AgentDefinition,
   ReasoningEffort,
 } from "@/types";
+import { useAuth } from "@/hooks/use-auth";
+import { getAccountProfile } from "@/lib/account-profile";
 import { useSessions, getSessionChatMode } from "@/hooks/use-sessions";
 import { useMessages, loadMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
@@ -336,9 +339,30 @@ export function ChatView() {
   // The Agents tab's default view: the fleet dashboard (agent grid + smart
   // composer). "New Task"/"New Agent" swap it for the plain composer.
   const [agentDashboardOpen, setAgentDashboardOpen] = useState(true);
-  const [view, setView] = useState<"chat" | "settings" | "projects" | "history">("chat");
+  const [view, setView] = useState<"chat" | "settings" | "account" | "projects" | "history">("chat");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
+  const [accountTab, setAccountTab] = useState<AccountTab>("profile");
+  const { user: accountUser, signOut: signAccountOut } = useAuth();
+  const accountProfile = getAccountProfile(accountUser);
+  const [accountOpen, setAccountOpen] = useState(false);
   const openSettings = () => setView("settings");
+  const handleAccountSignOut = useCallback(() => {
+    void signAccountOut().then(() => {
+      toast.success("Signed out — your data stays on this device");
+    });
+  }, [signAccountOut]);
+  // A fresh sign-in from the connect modal lands on the account settings
+  // page. Gated on the modal being open so restored sessions (and sign-outs)
+  // never yank the view around.
+  const prevAccountUserId = useRef<string | null>(null);
+  useEffect(() => {
+    const id = accountUser?.id ?? null;
+    if (accountOpen && prevAccountUserId.current === null && id !== null) {
+      setAccountOpen(false);
+      setView("account");
+    }
+    prevAccountUserId.current = id;
+  }, [accountUser, accountOpen]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [projectSearch, setProjectSearch] = useState("");
   const [historySearch, setHistorySearch] = useState("");
@@ -2529,6 +2553,14 @@ export function ChatView() {
         agentSessions={activeAgentSessions}
         agentConsoleComposing={agentConsoleComposing}
         onNewAgentSession={activeAgentConsole ? enterAgentCompose : undefined}
+        accountEmail={accountProfile?.email ?? null}
+        accountName={accountProfile?.name ?? null}
+        accountAvatarUrl={accountProfile?.avatarUrl ?? null}
+        accountTab={accountTab}
+        onAccountTabChange={setAccountTab}
+        onOpenAccount={() => setView("account")}
+        onConnectAccount={() => setAccountOpen(true)}
+        onSignOut={handleAccountSignOut}
       />
 
       <SidebarTrigger
@@ -2559,6 +2591,41 @@ export function ChatView() {
             </header>
             <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-4 sm:px-8">
               <SettingsView activeTab={settingsTab} />
+            </div>
+          </div>
+        ) : view === "account" ? (
+          <div
+            key="account-view"
+            className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-right-3 duration-300"
+          >
+            <header
+              data-tauri-drag-region
+              onMouseDown={startDrag}
+              className="relative flex h-10 shrink-0 select-none items-center px-4"
+            >
+              <span className="absolute left-1/2 -translate-x-1/2 text-sm font-medium">
+                Account
+              </span>
+            </header>
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-4 sm:px-8">
+              <div className="mx-auto w-[90%] pb-16">
+                {accountProfile ? (
+                  <AccountSettings
+                    onDone={() => setView("chat")}
+                    signingOut={false}
+                    onSignOut={handleAccountSignOut}
+                    activeTab={accountTab}
+                    onTabChange={setAccountTab}
+                  />
+                ) : (
+                  <div className="flex flex-col items-center gap-4 py-16 text-center">
+                    <p className="text-sm text-muted-foreground">
+                      Connect your account to manage your profile, password, and stored data here.
+                    </p>
+                    <Button onClick={() => setAccountOpen(true)}>Connect account</Button>
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         ) : view === "projects" ? (
@@ -4063,6 +4130,26 @@ export function ChatView() {
           />
         ) : null;
       })()}
+
+      {accountOpen && (
+        <div className="fixed inset-0 z-[60] flex h-dvh flex-col overflow-hidden bg-background motion-safe:animate-in motion-safe:fade-in motion-safe:duration-200">
+          <div
+            data-tauri-drag-region
+            onMouseDown={startDrag}
+            className="h-10 w-full shrink-0"
+          />
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setAccountOpen(false)}
+            aria-label="Back"
+            className="absolute left-4 top-12 z-10 rounded-full"
+          >
+            <ArrowLeft />
+          </Button>
+          <AccountView hideClose onDone={() => setAccountOpen(false)} />
+        </div>
+      )}
 
     </SidebarProvider>
     </OpenCodeProvider>

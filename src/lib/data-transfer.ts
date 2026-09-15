@@ -1,11 +1,14 @@
+import { unzipSync, strFromU8 } from "fflate";
 import type { Message } from "@/types";
 
 // Data export/import: full AI Studio backups (a snapshot of every chatui* localStorage
 // key — chats, agents, projects, providers, settings, schedules, workflows,
 // memories, connectors) plus portable conversation exports in the formats
 // ChatGPT (OpenAI) and Claude (Anthropic) use for their official data exports,
-// so conversations can always migrate away. importData() auto-detects which of
-// the three formats a file is and restores/merges it.
+// so conversations can always migrate away. importData()/importFile() detect
+// which of the three formats a file is and restore/merge it; both vendors ship
+// their export as a .zip containing conversations.json, so importFile() reads
+// straight out of the zip.
 
 const SESSIONS_KEY = "chatui:sessions";
 const MESSAGES_KEY_PREFIX = "chatui:messages:";
@@ -249,7 +252,10 @@ function chatGptThread(
 export function exportAnthropicConversations(): string {
   const conversations = portableSessions()
     .map(({ session, thread }) => {
-      const chats = thread
+      // Matches the real Claude data-export shape: a flat `chat_messages`
+      // array, human turns carrying `text`, assistant turns carrying typed
+      // `content` blocks.
+      const chat_messages = thread
         .filter((m) => m.role === "user" || m.role === "assistant")
         .map((m) => {
           const at = m.timestamp.toISOString();
@@ -264,25 +270,42 @@ export function exportAnthropicConversations(): string {
             : {
                 uuid: m.id,
                 sender: "assistant",
+                content: [{ type: "text", text: m.content }],
                 created_at: at,
                 updated_at: at,
-                content_feature_store: [{ content_type: "text", text: m.content }],
               };
         });
       return {
         uuid: session.id,
         name: session.title,
-        created_at: chats.length > 0 ? chats[0].created_at : session.updatedAt,
-        updated_at: chats.length > 0 ? chats[chats.length - 1].created_at : session.updatedAt,
-        chats,
+        created_at: chat_messages.length > 0 ? chat_messages[0].created_at : session.updatedAt,
+        updated_at: chat_messages.length > 0 ? chat_messages[chat_messages.length - 1].created_at : session.updatedAt,
+        chat_messages,
       };
     })
-    .filter((c) => c.chats.length > 0);
+    .filter((c) => c.chat_messages.length > 0);
   return JSON.stringify(conversations, null, 2);
 }
 
 function anthropicChatText(chat: StoredRecord): string {
-  if (typeof chat.text === "string") return chat.text;
+  if (typeof chat.text === "string" && chat.text.trim() !== "") return chat.text;
+  // Real Claude exports: assistant turns carry typed `content` blocks
+  // (text, thinking, tool_use, tool_result, ...). Only `text` blocks are
+  // readable conversation; thinking/tool payloads are skipped.
+  const content = chat.content;
+  if (Array.isArray(content)) {
+    const text = content
+      .filter(
+        (c): c is { text: string } =>
+          !!c && typeof c === "object" &&
+          (c as StoredRecord).type === "text" &&
+          typeof (c as StoredRecord).text === "string",
+      )
+      .map((c) => c.text)
+      .join("");
+    if (text.trim() !== "") return text;
+  }
+  // Older/alternate shape: content_feature_store with content_type blocks.
   const store = chat.content_feature_store;
   if (!Array.isArray(store)) return "";
   return store
@@ -427,7 +450,11 @@ function importAnthropicConversations(conversations: unknown[]): { sessions: num
       typeof c.updated_at === "string" && Number.isFinite(Date.parse(c.updated_at))
         ? Date.parse(c.updated_at)
         : Date.now();
-    const thread = anthropicThread(c.chats, fallbackTime);
+    // Real Claude exports use `chat_messages`; older shapes used `chats`.
+    const thread = anthropicThread(
+      Array.isArray(c.chat_messages) ? c.chat_messages : c.chats,
+      fallbackTime,
+    );
     if (thread.length === 0) continue;
     // Reuse the source conversation uuid so re-importing the same file is a no-op.
     const sessionId = typeof c.uuid === "string" && c.uuid ? c.uuid : crypto.randomUUID();
@@ -456,22 +483,60 @@ function looksLikeAnthropicExport(items: unknown[]): boolean {
   const first = items.find((c) => c && typeof c === "object");
   if (!first) return false;
   const c = first as StoredRecord;
-  if (!Array.isArray(c.chats)) return false;
-  const chat = c.chats.find((ch) => ch && typeof ch === "object") as StoredRecord | undefined;
+  const chats = Array.isArray(c.chat_messages) ? c.chat_messages : c.chats;
+  if (!Array.isArray(chats)) return false;
+  const chat = chats.find((ch) => ch && typeof ch === "object") as StoredRecord | undefined;
   return !!chat && typeof chat.sender === "string";
 }
 
-/**
- * Import an export file, auto-detecting the format: an AI Studio backup
- * (restores everything and needs an app reload) or a conversations.json from
- * ChatGPT/Claude (merged in as new chat sessions).
- */
-export function importData(jsonString: string): ImportResult {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(jsonString);
-  } catch {
-    throw new Error("The file is not valid JSON.");
+export type ImportFormat = "chatui" | "openai" | "anthropic";
+
+/** The format the user picked in the UI: a fixed format or auto-detect. */
+export type ImportFormatChoice = "auto" | ImportFormat;
+
+export interface ImportOptions {
+  format?: ImportFormatChoice;
+}
+
+const FORMAT_LABELS: Record<ImportFormat, string> = {
+  chatui: "AI Studio backup",
+  openai: "ChatGPT",
+  anthropic: "Claude",
+};
+
+function detectFormat(parsed: unknown): ImportFormat | null {
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+    const obj = parsed as StoredRecord;
+    if (obj.__chatui_export__ === true) return "chatui";
+    // Some tools wrap a conversations array in an object.
+    if (Array.isArray(obj.conversations)) parsed = obj.conversations;
+    else return null;
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return null;
+  if (looksLikeChatGptExport(parsed)) return "openai";
+  if (looksLikeAnthropicExport(parsed)) return "anthropic";
+  return null;
+}
+
+function importParsed(parsed: unknown, choice: ImportFormatChoice): ImportResult {
+  if (Array.isArray(parsed) && parsed.length === 0) {
+    throw new Error("The import file contains no conversations.");
+  }
+  const detected = detectFormat(parsed);
+  if (choice !== "auto" && detected && detected !== choice) {
+    throw new Error(
+      `This file looks like a ${FORMAT_LABELS[detected]} export, but "${FORMAT_LABELS[choice]}" is selected. Switch the format above or pick a different file.`,
+    );
+  }
+  if (choice !== "auto" && !detected) {
+    throw new Error(
+      `Couldn't read this file as a ${FORMAT_LABELS[choice]} export. Check the steps above to download the right file.`,
+    );
+  }
+  if (!detected) {
+    throw new Error(
+      "Unrecognized import format. Expected an AI Studio backup or a ChatGPT/Claude conversations.json export.",
+    );
   }
 
   if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
@@ -480,31 +545,101 @@ export function importData(jsonString: string): ImportResult {
       restoreChatUiBackup(obj as { data?: unknown });
       return { kind: "chatui", sessions: 0, messages: 0, skipped: 0 };
     }
-    // Some tools wrap a conversations array in an object.
     if (Array.isArray(obj.conversations)) parsed = obj.conversations;
   }
 
   if (Array.isArray(parsed)) {
-    if (parsed.length === 0) {
-      throw new Error("The import file contains no conversations.");
+    const importer =
+      detected === "anthropic" ? importAnthropicConversations : importChatGptConversations;
+    const { sessions, messages, skipped } = importer(parsed);
+    if (sessions === 0 && skipped === 0) {
+      throw new Error("No conversations with messages were found in the file.");
     }
-    if (looksLikeChatGptExport(parsed)) {
-      const { sessions, messages, skipped } = importChatGptConversations(parsed);
-      if (sessions === 0 && skipped === 0) {
-        throw new Error("No conversations with messages were found in the file.");
-      }
-      return { kind: "openai", sessions, messages, skipped };
-    }
-    if (looksLikeAnthropicExport(parsed)) {
-      const { sessions, messages, skipped } = importAnthropicConversations(parsed);
-      if (sessions === 0 && skipped === 0) {
-        throw new Error("No conversations with messages were found in the file.");
-      }
-      return { kind: "anthropic", sessions, messages, skipped };
-    }
+    return { kind: detected, sessions, messages, skipped };
   }
 
   throw new Error(
     "Unrecognized import format. Expected an AI Studio backup or a ChatGPT/Claude conversations.json export.",
   );
+}
+
+/**
+ * Import an export file's JSON text: an AI Studio backup (restores everything
+ * and needs an app reload) or a conversations.json from ChatGPT/Claude
+ * (merged in as new chat sessions). Pass the UI's format choice to get
+ * format-specific errors instead of silent auto-detection.
+ */
+export function importData(jsonString: string, opts?: ImportOptions): ImportResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonString);
+  } catch {
+    throw new Error("The file is not valid JSON.");
+  }
+  return importParsed(parsed, opts?.format ?? "auto");
+}
+
+// ChatGPT/Claude exports ship as a zip containing conversations.json (large
+// ChatGPT exports split it into numbered shards: conversations-000.json, ...).
+const CONVERSATIONS_FILE_RE = /^conversations(-\d+)?\.json$/i;
+
+function basename(path: string): string {
+  const parts = path.split("/");
+  return parts[parts.length - 1];
+}
+
+/**
+ * Import a user-picked file: plain .json goes straight through, a .zip is
+ * opened and its conversations file(s) are imported. Zip support matters
+ * because both ChatGPT and Claude deliver their data export as a zip — asking
+ * users to unzip first is where the old import flow died.
+ */
+export async function importFile(file: File, opts?: ImportOptions): Promise<ImportResult> {
+  const choice = opts?.format ?? "auto";
+  const looksZipped =
+    /\.zip$/i.test(file.name) ||
+    file.type === "application/zip" ||
+    file.type === "application/x-zip-compressed";
+  if (!looksZipped) {
+    return importData(await file.text(), opts);
+  }
+  if (choice === "chatui") {
+    throw new Error(
+      'AI Studio backups are .json files, not zips. Pick your backup .json, or switch the format to "ChatGPT"/"Claude" for a vendor export zip.',
+    );
+  }
+  let entries: Record<string, Uint8Array>;
+  try {
+    entries = unzipSync(new Uint8Array(await file.arrayBuffer()));
+  } catch {
+    throw new Error("Couldn't open this zip file. Try downloading the export again.");
+  }
+  const names = Object.keys(entries)
+    .filter((p) => CONVERSATIONS_FILE_RE.test(basename(p)))
+    .sort((a, b) => basename(a).localeCompare(basename(b)));
+  if (names.length === 0) {
+    throw new Error(
+      "No conversations file found in this zip. ChatGPT and Claude exports contain a conversations.json file — check the steps above.",
+    );
+  }
+  const combined: unknown[] = [];
+  for (const name of names) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(strFromU8(entries[name]));
+    } catch {
+      throw new Error(`Couldn't read ${basename(name)} inside the zip. Try downloading the export again.`);
+    }
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const obj = parsed as StoredRecord;
+      if (Array.isArray(obj.conversations)) parsed = obj.conversations;
+    }
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `Couldn't read ${basename(name)} inside the zip. Try downloading the export again.`,
+      );
+    }
+    combined.push(...parsed);
+  }
+  return importParsed(combined, choice);
 }

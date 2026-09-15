@@ -180,7 +180,7 @@ export function scheduleFromToolInput(
     return { error: "A schedule needs a prompt (what the agent should do each run) or a workflow_id." };
   }
   if (args.workflow_id && !loadWorkflows().some((w) => w.id === args.workflow_id)) {
-    return { error: `No workflow with id ${args.workflow_id} — create it with create_workflow first.` };
+    return { error: `No workflow with id ${args.workflow_id} (create it with create_workflow first).` };
   }
   const cadence = cadenceFromToolInput(args.cadence);
   const nextRun = computeNextRun(cadence, now);
@@ -263,7 +263,7 @@ export function buildAgentTools(
     tool(
       async ({ title, language, content }: { title: string; language: string; content: string }) => {
         const ctx = ctxFn();
-        if (!ctx) return "Error: no active run — artifact could not be registered.";
+        if (!ctx) return "Error: no active run (artifact could not be registered).";
         artifactCounter += 1;
         ctx.emit({
           type: "artifact",

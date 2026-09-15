@@ -7,19 +7,23 @@ import {
   CalendarClock,
   ChartColumnBig,
   CircleFadingPlus,
+  CloudUpload,
   Cpu,
   GalleryVerticalEnd,
   KeyRound,
   LayoutDashboard,
+  LogOut,
   MessageCircle,
   MoreHorizontal,
   Pencil,
   Plus,
   Plug,
   Settings,
+  ShieldCheck,
   Sparkles,
   Trash2,
   User,
+  UserRound,
 } from "lucide-react"
 import {
   DropdownMenu,
@@ -31,11 +35,14 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
+import { avatarColorStyle, profileInitials, sidebarAccountLabel } from "@/lib/account-profile"
 import { getCurrentWindow } from "@tauri-apps/api/window"
 import { isMacOS } from "@/lib/platform"
 import { cn } from "@/lib/utils"
@@ -58,6 +65,7 @@ import {
 } from "@/components/ui/sidebar"
 import type { AgentDefinition, ChatSession, Project } from "@/types"
 import type { SettingsTab } from "@/pages/settings"
+import { ACCOUNT_TABS, type AccountTab } from "@/pages/account"
 import { Spinner } from "@/components/ui/spinner"
 
 /** Main-content panel selected for the open agent console. */
@@ -141,6 +149,7 @@ export function AppSidebar({
   activeSessionId,
   view = "chat",
   settingsTab = "general",
+  accountTab = "profile",
   activeTab = "chat",
   onSelectSession,
   onNewChat,
@@ -170,12 +179,20 @@ export function AppSidebar({
   agentSessions = [],
   onNewAgentSession,
   agentConsoleComposing = false,
+  accountEmail = null,
+  accountName = null,
+  accountAvatarUrl = null,
+  onOpenAccount,
+  onConnectAccount,
+  onAccountTabChange,
+  onSignOut,
   ...props
 }: React.ComponentProps<typeof Sidebar> & {
   sessions: ChatSession[]
   activeSessionId: string | null
-  view?: "chat" | "settings" | "projects" | "history"
+  view?: "chat" | "settings" | "account" | "projects" | "history"
   settingsTab?: SettingsTab
+  accountTab?: AccountTab
   activeTab?: "chat" | "agent"
   onSelectSession: (id: string) => void
   onNewChat: () => void
@@ -208,13 +225,30 @@ export function AppSidebar({
   onNewAgentSession?: () => void
   /** The console's new-session page is open — nothing else highlights. */
   agentConsoleComposing?: boolean
+  /** Signed-in account email, or null for anonymous mode. */
+  accountEmail?: string | null
+  /** Display name for the signed-in account footer. */
+  accountName?: string | null
+  /** Avatar URL for the signed-in account footer. */
+  accountAvatarUrl?: string | null
+  /** Open the account settings page. */
+  onOpenAccount?: () => void
+  /** Open the connect-account dialog (signed-out settings footer). */
+  onConnectAccount?: () => void
+  /** Switch the account view's tab. */
+  onAccountTabChange?: (tab: AccountTab) => void
+  /** Sign out of the connected account. */
+  onSignOut?: () => void
 }) {
 
   const { isMobile } = useSidebar()
+  /** Settings + account views share the sidebar chrome, only the tabs differ. */
+  const inPrefsView = view === "settings" || view === "account"
 
   // Rename dialog state for the agent-console session list.
   const [agentSessionRename, setAgentSessionRename] = React.useState<{ id: string; title: string } | null>(null)
   const [agentSessionRenameDraft, setAgentSessionRenameDraft] = React.useState("")
+  const [privacyOpen, setPrivacyOpen] = React.useState(false)
 
   const startDrag = (e: React.MouseEvent) => {
     if (e.button === 0) getCurrentWindow().startDragging();
@@ -224,14 +258,14 @@ export function AppSidebar({
       <Sidebar collapsible="icon" {...props}>
         {isMacOS && <div data-tauri-drag-region onMouseDown={startDrag} className="h-10 w-full shrink-0" />}
 
-      {view !== "settings" && !activeAgentConsole && (
+      {!inPrefsView && !activeAgentConsole && (
         <ModeSwitcher
           activeTab={activeTab}
           onTabChange={onTabChange ?? (() => {})}
         />
       )}
 
-      {view !== "settings" && activeAgentConsole ? (
+      {!inPrefsView && activeAgentConsole ? (
         <div key="agent-detail" className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
           <SidebarHeader>
             <SidebarMenu>
@@ -393,7 +427,7 @@ export function AppSidebar({
             </DialogContent>
           </Dialog>
         </div>
-      ) : view !== "settings" ? (
+      ) : !inPrefsView ? (
         activeTab === "agent" ? (
           <div key="agent" className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
             <SidebarHeader>
@@ -465,7 +499,7 @@ export function AppSidebar({
         </div>
         )
       ) : (
-        <div key="settings" className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
+        <div key={view} className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
           <SidebarHeader>
             <SidebarMenu>
               <SidebarMenuItem>
@@ -479,40 +513,197 @@ export function AppSidebar({
 
           <SidebarContent>
             <SidebarGroup>
-              <SidebarGroupLabel>Settings</SidebarGroupLabel>
+              <SidebarGroupLabel>{view === "account" ? "Account" : "Settings"}</SidebarGroupLabel>
               <SidebarMenu>
-                {SETTINGS_TABS.map(([key, label, icon]) => (
-                  <SidebarMenuItem key={key}>
-                    <SidebarMenuButton
-                      isActive={settingsTab === key}
-                      onClick={() => onSettingsTabChange?.(key)}
-                      tooltip={label}
-                    >
-                      {icon}
-                      <span>{label}</span>
-                    </SidebarMenuButton>
-                  </SidebarMenuItem>
-                ))}
+                {view === "account"
+                  ? ACCOUNT_TABS.map((t) => (
+                      <SidebarMenuItem key={t.id}>
+                        <SidebarMenuButton
+                          isActive={accountTab === t.id}
+                          onClick={() => onAccountTabChange?.(t.id)}
+                          tooltip={t.label}
+                        >
+                          <t.icon className="size-4" />
+                          <span>{t.label}</span>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    ))
+                  : SETTINGS_TABS.map(([key, label, icon]) => (
+                      <SidebarMenuItem key={key}>
+                        <SidebarMenuButton
+                          isActive={settingsTab === key}
+                          onClick={() => onSettingsTabChange?.(key)}
+                          tooltip={label}
+                        >
+                          {icon}
+                          <span>{label}</span>
+                        </SidebarMenuButton>
+                      </SidebarMenuItem>
+                    ))}
               </SidebarMenu>
             </SidebarGroup>
           </SidebarContent>
         </div>
       )}
 
-      {view !== "settings" && (
+      {!inPrefsView ? (
+        <SidebarFooter>
+          <SidebarMenu>
+            {accountEmail ? (
+              <SidebarMenuItem>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <SidebarMenuButton size="lg" tooltip={accountEmail}>
+                      <Avatar size="sm">
+                        {accountAvatarUrl && (
+                          <AvatarImage
+                            src={accountAvatarUrl}
+                            alt={accountName ?? accountEmail}
+                          />
+                        )}
+                        <AvatarFallback style={avatarColorStyle(accountEmail)}>
+                          {profileInitials(accountName ?? "", accountEmail)}
+                        </AvatarFallback>
+                      </Avatar>
+                      <span className="truncate">
+                        {sidebarAccountLabel({
+                          email: accountEmail,
+                          name: accountName ?? accountEmail,
+                          avatarUrl: accountAvatarUrl,
+                        })}
+                      </span>
+                    </SidebarMenuButton>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent
+                    className="w-56 rounded-lg"
+                    side={isMobile ? "bottom" : "top"}
+                    align={isMobile ? "end" : "start"}
+                  >
+                    <div className="flex items-center gap-2 px-2 py-1.5">
+                      <Avatar size="sm">
+                        {accountAvatarUrl && (
+                          <AvatarImage
+                            src={accountAvatarUrl}
+                            alt={accountName ?? accountEmail}
+                          />
+                        )}
+                        <AvatarFallback style={avatarColorStyle(accountEmail)}>
+                          {profileInitials(accountName ?? "", accountEmail)}
+                        </AvatarFallback>
+                      </Avatar>
+                      <div className="flex min-w-0 flex-col">
+                        {accountName && (
+                          <span className="truncate text-sm font-medium">{accountName}</span>
+                        )}
+                        <span className="truncate text-xs text-muted-foreground">
+                          {accountEmail}
+                        </span>
+                      </div>
+                    </div>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onClick={onSettings}>
+                      <Settings />
+                      <span>App settings</span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={onOpenAccount}>
+                      <UserRound />
+                      <span>Account</span>
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onClick={() => setPrivacyOpen(true)}>
+                      <ShieldCheck />
+                      <span>Privacy &amp; terms</span>
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem variant="destructive" onClick={onSignOut}>
+                      <LogOut />
+                      <span>Sign out</span>
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </SidebarMenuItem>
+            ) : (
+              <SidebarMenuItem>
+                <SidebarMenuButton onClick={onSettings} tooltip="Settings">
+                  <Settings />
+                  <span>Settings</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            )}
+          </SidebarMenu>
+        </SidebarFooter>
+      ) : view === "settings" && !accountEmail ? (
         <SidebarFooter>
           <SidebarMenu>
             <SidebarMenuItem>
-              <SidebarMenuButton onClick={onSettings} tooltip="Settings">
-                <Settings />
-                <span>Settings</span>
+              <SidebarMenuButton
+                onClick={onConnectAccount}
+                tooltip="Connect account"
+              >
+                <CloudUpload />
+                <span className="truncate">Connect account</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           </SidebarMenu>
         </SidebarFooter>
-      )}
+      ) : null}
+
+      <PrivacyTermsDialog open={privacyOpen} onOpenChange={setPrivacyOpen} />
 
       <SidebarRail />
     </Sidebar>
+  )
+}
+
+/** What the app stores, where it goes, and on what terms — no legalese. */
+function PrivacyTermsDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <ShieldCheck className="size-5" />
+            Privacy &amp; terms
+          </DialogTitle>
+          <DialogDescription>
+            The short version of how your data is handled.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="flex flex-col gap-3 text-sm leading-relaxed">
+          <p>
+            <span className="font-medium">Local-first.</span> Your chats, agents,
+            projects, and settings live on this device. The app works fully
+            offline and anonymous — no account needed.
+          </p>
+          <p>
+            <span className="font-medium">Sync.</span> When you sign in, those
+            same items are mirrored to your account&apos;s cloud database so
+            your devices merge instead of overwriting each other. A copy always
+            stays on this device, and signing out never deletes it.
+          </p>
+          <p>
+            <span className="font-medium">Keys.</span> Provider API keys live
+            in this app&apos;s storage (mirrored with the rest of your data
+            while signed in) and are never committed to source code. Message
+            text is sent to whichever AI provider you chose when you send it.
+          </p>
+          <p>
+            <span className="font-medium">Deletion.</span> Account settings
+            lets you erase your synced data and everything on this device at
+            any time. That action can&apos;t be undone.
+          </p>
+          <p className="text-xs text-muted-foreground">
+            The app is provided as-is for personal use. If a provider or sync
+            endpoint changes its terms, that provider&apos;s terms apply to the
+            data you send it.
+          </p>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }

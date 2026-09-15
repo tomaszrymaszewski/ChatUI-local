@@ -275,7 +275,8 @@ async function streamAgentWithReasoning(
  * Invoke an agent with a structured response format while streaming reasoning
  * tokens to the UI. Returns the full result including structuredResponse.
  */
-async function invokeStructuredWithReasoning(
+/** Exported for tests. */
+export async function invokeStructuredWithReasoning(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   agent: any,
   input: Record<string, unknown>,
@@ -289,6 +290,14 @@ async function invokeStructuredWithReasoning(
   for await (const msg of stream.messages) {
     for await (const token of msg.reasoning) {
       emit({ type: "reasoning", text: token, id: reasoningId, label: reasoningLabel });
+    }
+    try {
+      // Structured calls are billed like any other model call — one event
+      // per message feeds the session's context-usage widget.
+      const usage = usageOfMessage(await msg.output);
+      if (usage) emit({ type: "usage", usage });
+    } catch {
+      // no final message (e.g. aborted mid-stream)
     }
   }
   try {

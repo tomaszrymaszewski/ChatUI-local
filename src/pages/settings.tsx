@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useTheme } from "next-themes";
 import { toast } from "sonner";
 import {
@@ -56,9 +56,9 @@ import {
   exportChatUiBackup,
   exportOpenAiConversations,
   exportAnthropicConversations,
-  importData,
   type ImportResult,
 } from "@/lib/data-transfer";
+import { ImportPanel } from "@/components/import-panel";
 import { getProviderMeta } from "@/lib/provider-meta";
 import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync, getContextOverride, setContextOverride, getModelContextWindowSync, getModelDisplayNameSync, getModelCostSync, formatModelPrices, getProviderCatalogName } from "@/lib/model-capabilities";
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
@@ -106,6 +106,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
   const [sweeping, setSweeping] = useState(false);
   const [proxyStatus, setProxyStatus] = useState<HeadroomStatus | null>(null);
   const [showExportDialog, setShowExportDialog] = useState(false);
+  const [showImportDialog, setShowImportDialog] = useState(false);
 
   const handleContextCompressionToggle = async (on: boolean) => {
     updateSettings({ contextCompression: on });
@@ -150,8 +151,6 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
       refreshKnowledgeStats();
     }
   };
-
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const allModels = providers.flatMap((p) =>
     p.models.map((m) => ({ ...m, providerId: p.id, providerName: p.name, builtinKey: p.builtinKey }))
@@ -286,31 +285,21 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
     }
   };
 
-  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    try {
-      const text = await file.text();
-      const result: ImportResult = importData(text);
-      if (result.kind === "chatui") {
-        toast.success("Data imported. Reloading...");
-        setTimeout(() => window.location.reload(), 1000);
+  const handleImported = (result: ImportResult) => {
+    setShowImportDialog(false);
+    if (result.kind === "chatui") {
+      toast.success("Data imported. Reloading...");
+      setTimeout(() => window.location.reload(), 1000);
+    } else {
+      const label = result.kind === "openai" ? "ChatGPT" : "Claude";
+      if (result.sessions === 0) {
+        toast.info(`All conversations from this ${label} export were already imported`);
       } else {
-        const label = result.kind === "openai" ? "ChatGPT" : "Claude";
-        if (result.sessions === 0) {
-          toast.info(`All conversations from this ${label} export were already imported`);
-        } else {
-          toast.success(
-            `Imported ${result.sessions} conversation${result.sessions !== 1 ? "s" : ""} (${result.messages} messages) from a ${label} export`
-          );
-        }
+        toast.success(
+          `Imported ${result.sessions} conversation${result.sessions !== 1 ? "s" : ""} (${result.messages} messages) from a ${label} export`
+        );
       }
-    } catch (err) {
-      toast.error(
-        err instanceof Error ? err.message : "Failed to import data"
-      );
     }
-    e.target.value = "";
   };
 
   const themeOptions: Array<{ value: "light" | "dark" | "system"; label: string }> = [
@@ -561,17 +550,10 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                     <Download className="size-4" />
                     Export…
                   </Button>
-                  <Button variant="outline" onClick={() => fileInputRef.current?.click()}>
+                  <Button variant="outline" onClick={() => setShowImportDialog(true)}>
                     <Upload className="size-4" />
                     Import…
                   </Button>
-                  <input
-                    ref={fileInputRef}
-                    type="file"
-                    accept="application/json,.json"
-                    className="hidden"
-                    onChange={handleImport}
-                  />
                 </div>
               </div>
             </div>
@@ -1191,6 +1173,23 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
               </div>
             ))}
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Import Dialog */}
+      <Dialog
+        open={showImportDialog}
+        onOpenChange={(o) => !o && setShowImportDialog(false)}
+      >
+        <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-xl">
+          <DialogHeader>
+            <DialogTitle>Import your conversations</DialogTitle>
+            <DialogDescription>
+              Bring chats in from ChatGPT, Claude, or another device. Vendor
+              exports arrive as a .zip — import it directly, no need to unzip.
+            </DialogDescription>
+          </DialogHeader>
+          <ImportPanel onImported={handleImported} />
         </DialogContent>
       </Dialog>
 

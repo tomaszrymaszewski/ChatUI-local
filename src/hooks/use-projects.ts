@@ -5,6 +5,9 @@ import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store
 
 const STORAGE_KEY = "chatui:projects";
 
+/** Fired whenever projects change (local edits and cloud-sync pulls). */
+export const PROJECTS_EVENT = "chatui:projects-changed";
+
 interface StoredProject {
   id: string;
   name: string;
@@ -43,6 +46,7 @@ function saveProjects(projects: StoredProject[]) {
       })),
     ),
   );
+  window.dispatchEvent(new Event(PROJECTS_EVENT));
 }
 
 export function useProjects() {
@@ -53,6 +57,10 @@ export function useProjects() {
   useEffect(() => {
     setProjects(loadProjects());
     setLoading(false);
+    // Cloud-sync pulls refresh the list without a remount.
+    const sync = () => setProjects(loadProjects());
+    window.addEventListener(PROJECTS_EVENT, sync);
+    return () => window.removeEventListener(PROJECTS_EVENT, sync);
   }, []);
 
   // Rehydrate image previews (blob URLs) from the persistent file store —

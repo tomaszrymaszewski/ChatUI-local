@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Toaster } from "@/components/ui/sonner";
 import { ChatView } from "@/components/ChatView";
 import { OnboardingWizard } from "@/components/onboarding/onboarding-wizard";
+import { SyncBootstrap } from "@/components/sync-bootstrap";
 import { isOnboardingDone } from "@/lib/onboarding";
 import { loadUserSettings } from "@/hooks/use-user-settings";
 import { headroomStart } from "@/lib/headroom-client";
@@ -20,6 +21,7 @@ function App() {
 
   return (
     <>
+      <SyncBootstrap />
       {onboarded ? (
         <ChatView />
       ) : (

@@ -1,22 +1,26 @@
 import { useState } from "react";
-import { ShieldCheck, Wallet, Sparkles, ArrowRight } from "lucide-react";
+import { ShieldCheck, Wallet, Sparkles, ArrowRight, ArrowLeft } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { StepHeader, StepFooter } from "@/components/onboarding/step-chrome";
+import { useAuth } from "@/hooks/use-auth";
 
 export function WelcomeStep({
   initialName,
   onNext,
+  onBack,
   headerBox,
   footerBox,
 }: {
   initialName: string;
   onNext: (name: string) => void;
+  onBack?: () => void;
   headerBox: HTMLElement | null;
   footerBox: HTMLElement | null;
 }) {
   const [name, setName] = useState(initialName);
+  const { user } = useAuth();
 
   return (
     <div className="flex flex-col gap-8">
@@ -27,7 +31,9 @@ export function WelcomeStep({
           <ShieldCheck className="size-5" />
           <span className="text-sm font-medium">Private by design</span>
           <span className="text-xs leading-relaxed text-muted-foreground">
-            Your chats, keys, and settings stay on this device. Nothing is stored on some server.
+            {user
+              ? "Your chats sync to your private account — only you can read them, and a copy always stays on this device."
+              : "Your chats, keys, and settings stay on this device. Nothing is stored on some server."}
           </span>
         </div>
         <div className="flex flex-col gap-2 rounded-xl border p-4">
@@ -60,7 +66,15 @@ export function WelcomeStep({
       </div>
 
       <StepFooter target={footerBox}>
-        <div className="flex w-full items-center justify-end">
+        <div className="flex w-full items-center justify-between">
+          {onBack ? (
+            <Button variant="ghost" onClick={onBack}>
+              <ArrowLeft />
+              Back
+            </Button>
+          ) : (
+            <span />
+          )}
           <Button onClick={() => onNext(name.trim())}>
             Get started
             <ArrowRight />
