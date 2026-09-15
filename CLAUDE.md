@@ -110,10 +110,15 @@ sync on top of the local store — anonymous mode works fully offline and is unc
   `TAURI_SIGNING_PRIVATE_KEY` env var (set in CI secrets, not committed). The release
   workflow is `.github/workflows/release.yml` (tauri-action on `v*` tag push).
 - **Accounts + cloud sync** (`src/lib/supabase.ts`, `src/hooks/use-auth.ts`,
-  `src/lib/sync.ts`, `supabase/schema.sql`): email/password auth; every tracked
-  `chatui:*` key mirrors verbatim to one `user_data` row per (user, key). Sync is
-  per-key last-write-wins with tombstones, except sessions/message stores which
-  union-merge by record id (`mergeRecordLists`, `planSync` — pure, unit-tested).
+  `src/lib/sync.ts`, `src/lib/sync-crypto.ts`, `supabase/schema.sql`): email/password
+  auth; every tracked `chatui:*` key mirrors to one `user_data` row per (user, key) as
+  an end-to-end encrypted AES-256-GCM envelope — the server only ever holds ciphertext.
+  The device key lives in local-only `chatui:sync:key` (never synced; new devices join via
+  the recovery code in Account → Data, and undecryptable rows are skipped fail-closed until
+  then). Sync is per-key last-write-wins with tombstones, except sessions/message stores
+  which union-merge by record id (`mergeRecordLists`, `planSync` — pure, unit-tested);
+  ambiguous states fail closed toward local (blank cloud rows never overwrite populated
+  data; deletes travel as tombstones — `deleteProvider` drops the key when the list empties).
   Hooks must re-read storage in mutations and dispatch `*-changed` events so pulls
   can't be clobbered or go stale. Successful syncs also write JSON backups to
   `<base>/backups/` via the existing `write_text_file` command. Never put the

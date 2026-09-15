@@ -164,7 +164,9 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
   ) => {
     try {
       if (editingProvider) {
-        await updateProvider(editingProvider.id, name, baseUrl, apiKey, [], builtinKey);
+        // Models are managed separately (model form below) — omitting them
+        // preserves the provider's existing model list.
+        await updateProvider(editingProvider.id, name, baseUrl, apiKey, undefined, builtinKey);
         toast.success("Provider updated");
       } else {
         await createProvider(name, baseUrl, apiKey, [], builtinKey);

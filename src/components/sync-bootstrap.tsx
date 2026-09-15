@@ -39,6 +39,13 @@ export function SyncBootstrap() {
           );
           return;
         }
+        if (result.undecryptable.length > 0) {
+          const n = result.undecryptable.length;
+          toast.warning(
+            `Connected, but ${n} synced ${n === 1 ? "item" : "items"} couldn't be decrypted on this device. Enter your sync recovery code in Settings → Account → Data.`,
+          );
+          return;
+        }
         const parts: string[] = [];
         if (result.pulled > 0) parts.push(`${result.pulled} downloaded`);
         if (result.pushed > 0) parts.push(`${result.pushed} uploaded`);

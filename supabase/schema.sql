@@ -3,16 +3,20 @@
 -- Run once in the Supabase SQL editor (Dashboard → SQL → New query).
 --
 -- Design: the app stays local-first — every piece of user data lives in
--- localStorage under a `chatui:*` key and is mirrored verbatim to one row
--- here per (user, key). Sync is per-key last-write-wins with tombstones
--- (`deleted`), so devices merge instead of clobbering each other. Sessions
--- and message stores additionally union-merge by record id client-side.
+-- localStorage under a `chatui:*` key and is mirrored to one row here per
+-- (user, key) as an end-to-end encrypted envelope (see the `value` comment).
+-- Sync is per-key last-write-wins with tombstones (`deleted`), so devices
+-- merge instead of clobbering each other. Sessions and message stores
+-- additionally union-merge by record id client-side.
 
 create table if not exists public.user_data (
   user_id uuid not null references auth.users (id) on delete cascade,
   key text not null,
-  -- The raw localStorage string, stored verbatim (never re-serialized, so
-  -- sync is byte-faithful and unknown future keys survive round-trips).
+  -- The localStorage string for this key, end-to-end encrypted on the device
+  -- (an AES-256-GCM JSON envelope — see src/lib/sync-crypto.ts). The database
+  -- only ever holds opaque ciphertext: provider keys, chats, and settings are
+  -- unreadable here. Rows written before encryption shipped are legacy
+  -- plaintext and get re-pushed encrypted on the next sync.
   value text not null default '',
   updated_at timestamptz not null default now(),
   -- Tombstone: true when the key was deleted on a device. Pulls delete the

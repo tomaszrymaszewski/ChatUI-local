@@ -73,7 +73,7 @@ export async function updateProvider(
   name: string,
   baseUrl: string,
   apiKey: string,
-  models: ProviderModel[],
+  models?: ProviderModel[],
   builtinKey?: string,
 ): Promise<void> {
   const providers = loadProviders();
@@ -84,15 +84,25 @@ export async function updateProvider(
     name,
     baseUrl,
     apiKey: apiKey || providers[idx].apiKey,
-    models,
+    // Omitted models are preserved: editing a provider's name/URL/key must
+    // never wipe its model list (models are managed via the model form).
+    models: models ?? providers[idx].models,
     builtinKey: builtinKey ?? providers[idx].builtinKey,
   };
   saveProviders(providers);
 }
 
 export async function deleteProvider(providerId: string): Promise<void> {
-  const providers = loadProviders();
-  saveProviders(providers.filter((p) => p.id !== providerId));
+  const providers = loadProviders().filter((p) => p.id !== providerId);
+  if (providers.length === 0) {
+    // Drop the key instead of storing `[]` so cloud sync propagates an
+    // explicit delete (tombstone) — blank rows never overwrite populated data
+    // on other devices (see sync.ts).
+    localStorage.removeItem(STORAGE_KEY);
+    window.dispatchEvent(new Event(PROVIDERS_EVENT));
+    return;
+  }
+  saveProviders(providers);
 }
 
 export async function getProviderApiKey(

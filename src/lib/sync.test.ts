@@ -11,6 +11,7 @@ import {
   type SyncBackend,
   type SyncMeta,
 } from "./sync";
+import { decryptFromSync, encryptForSync, importSyncRecoveryCode, isSyncEnvelope } from "./sync-crypto";
 
 // The vitest environment is node — stub storage and window like a browser.
 const storage = new Map<string, string>();
@@ -54,6 +55,7 @@ describe("isSyncedKey", () => {
       "chatui:providers",
       "chatui:settings",
       "chatui:agents",
+      "chatui:avatar-salts",
       "chatui:projects",
       "chatui:schedules",
       "chatui:workflows",
@@ -63,17 +65,26 @@ describe("isSyncedKey", () => {
       "chatui:skills:custom",
       "chatui:learn-mode",
       "chatui:tavily-key",
+      "chatui:council-models",
+      "chatui:update-settings",
+      "chatui:skills:registry-url",
+      "chatui:knowledge:sweeps",
+      "chatui:knowledge:captions",
+      "chatui:widgets-hidden-chat",
+      "chatui:widgets-hidden",
     ]) {
       expect(isSyncedKey(k)).toBe(true);
     }
     for (const k of [
       "chatui:onboarding",
       "chatui:sync:meta",
+      "chatui:sync:key",
       "chatui:messages:recency",
       "chatui:mcp:migrated",
+      "chatui:agents:paths-remapped",
       "chatui:modelsdev-cache",
-      "chatui:avatar-salts",
-      "chatui:widgets-hidden-chat",
+      "chatui:skills:registry",
+      "chatui:skills:auto-install-skipped",
       "unrelated",
     ]) {
       expect(isSyncedKey(k)).toBe(false);
@@ -191,6 +202,51 @@ describe("planSync", () => {
     expect(plan.toLocal).toEqual([]);
   });
 
+  it("never pulls a blank remote value over populated local data", () => {
+    // A newer but blank cloud row (e.g. a stale `[]` for providers) with
+    // untouched-looking local data: local still wins — a blank row is never
+    // authoritative. Explicit deletes travel as tombstones instead.
+    const localVal = '[{"id":"p1","apiKey":"sk-x"}]';
+    for (const blank of ["[]", "{}", "null", ""]) {
+      const plan = planSync(
+        new Map([["chatui:providers", localVal]]),
+        [row("chatui:providers", blank, "2026-09-15T11:00:00Z")],
+        metaFor({ "chatui:providers": { hash: hashValue(localVal), syncedAt: "2026-09-15T10:00:00Z" } }),
+        NOW,
+      );
+      expect(plan.toLocal).toEqual([]);
+      expect(plan.deleteLocal).toEqual([]);
+      expect(plan.toRemote).toEqual([{ key: "chatui:providers", value: localVal, deleted: false }]);
+    }
+  });
+
+  it("still pulls remote data when the local copy is blank", () => {
+    // The guard only protects populated local data — a blank local copy is
+    // hydrated from the cloud as usual.
+    const remoteVal = '[{"id":"p1"}]';
+    const plan = planSync(
+      new Map([["chatui:providers", "[]"]]),
+      [row("chatui:providers", remoteVal, "2026-09-15T11:00:00Z")],
+      metaFor({ "chatui:providers": { hash: hashValue("[]"), syncedAt: "2026-09-15T10:00:00Z" } }),
+      NOW,
+    );
+    expect(plan.toLocal).toEqual([{ key: "chatui:providers", value: remoteVal }]);
+    expect(plan.toRemote).toEqual([]);
+  });
+
+  it("keeps local when neither side moved but values differ", () => {
+    // Stale meta (syncedAt ahead of the row) with divergent values: the live
+    // local data wins instead of being silently replaced.
+    const plan = planSync(
+      new Map([["chatui:settings", '{"a":2}']]),
+      [row("chatui:settings", '{"a":1}', "2026-09-15T10:00:00Z")],
+      metaFor({ "chatui:settings": { hash: hashValue('{"a":2}'), syncedAt: "2026-09-15T11:00:00Z" } }),
+      NOW,
+    );
+    expect(plan.toLocal).toEqual([]);
+    expect(plan.toRemote).toEqual([{ key: "chatui:settings", value: '{"a":2}', deleted: false }]);
+  });
+
   it("propagates deletions as tombstones and honors remote deletes", () => {
     // Locally deleted, delete newer than the row → push tombstone.
     const tomb = planSync(
@@ -302,6 +358,21 @@ describe("syncNow with a fake backend", () => {
     expect(seen).toContain("chatui:projects-changed");
   });
 
+  it("pulls agent avatar salts and notifies agent lists", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal("window", {
+      dispatchEvent: (e: Event) => {
+        seen.push(e.type);
+        return true;
+      },
+    });
+    const backend = fakeBackend([row("chatui:avatar-salts", '{"a1":2}', "2026-09-15T11:00:00Z")]);
+    const result = await syncNow(backend);
+    expect(result.pulled).toBe(1);
+    expect(storage.get("chatui:avatar-salts")).toBe('{"a1":2}');
+    expect(seen).toContain("chatui:agents-changed");
+  });
+
   it("merges sessions on first link instead of picking a side", async () => {
     storage.set(
       "chatui:sessions",
@@ -334,7 +405,7 @@ describe("syncNow with a fake backend", () => {
     expect(meta["chatui:projects"]).toBeDefined();
   });
 
-  it("pushDirty upserts only changed keys plus tombstones", async () => {
+  it("pushDirty upserts only changed keys plus tombstones, encrypted", async () => {
     storage.set("chatui:settings", '{"a":2}');
     storage.set(
       "chatui:sync:meta",
@@ -348,9 +419,67 @@ describe("syncNow with a fake backend", () => {
     const backend = fakeBackend([]);
     const result = await pushDirty(backend);
     expect(result).toEqual({ pushed: 2 });
-    expect(backend.pushed).toEqual([
-      { key: "chatui:settings", value: '{"a":2}', deleted: false },
-      { key: "chatui:projects", value: "", deleted: true },
+    expect(backend.pushed.map((p) => [p.key, p.deleted])).toEqual([
+      ["chatui:settings", false],
+      ["chatui:projects", true],
     ]);
+    // Values upload encrypted; tombstones stay empty.
+    expect(isSyncEnvelope(backend.pushed[0].value)).toBe(true);
+    expect(await decryptFromSync(backend.pushed[0].value)).toBe('{"a":2}');
+    expect(backend.pushed[1].value).toBe("");
+  });
+
+  it("encrypts pushed values and decrypts pulled ones", async () => {
+    storage.set("chatui:providers", '[{"id":"p1","apiKey":"sk-secret"}]');
+    const backend = fakeBackend([]);
+    const result = await syncNow(backend);
+    expect(result.error).toBeUndefined();
+    expect(result.pushed).toBe(1);
+    const uploaded = backend.pushed[0];
+    expect(uploaded.key).toBe("chatui:providers");
+    expect(isSyncEnvelope(uploaded.value)).toBe(true);
+    expect(uploaded.value).not.toContain("sk-secret");
+    expect(await decryptFromSync(uploaded.value)).toBe('[{"id":"p1","apiKey":"sk-secret"}]');
+
+    // Pulling that same row back lands as plaintext.
+    storage.delete("chatui:providers");
+    storage.delete("chatui:sync:meta");
+    const pull = await syncNow(fakeBackend([row("chatui:providers", uploaded.value, "2026-09-15T11:00:00Z")]));
+    expect(pull.error).toBeUndefined();
+    expect(pull.pulled).toBe(1);
+    expect(pull.undecryptable).toEqual([]);
+    expect(storage.get("chatui:providers")).toBe('[{"id":"p1","apiKey":"sk-secret"}]');
+  });
+
+  it("skips undecryptable rows without touching either side", async () => {
+    const envelope = await encryptForSync('{"a":1}'); // sealed under key A…
+    await importSyncRecoveryCode( // …but this device now holds key B.
+      Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(32))).toString("base64"),
+    );
+    storage.set("chatui:settings", '{"local":true}');
+    storage.set("chatui:projects", "[]");
+    const backend = fakeBackend([
+      row("chatui:settings", envelope, "2026-09-15T11:00:00Z"),
+      row("chatui:projects", "[]", "2026-09-15T11:00:00Z"), // legacy plaintext, agrees
+    ]);
+    const result = await syncNow(backend);
+    expect(result.error).toBeUndefined();
+    expect(result.undecryptable).toEqual(["chatui:settings"]);
+    expect(storage.get("chatui:settings")).toBe('{"local":true}'); // local kept
+    // The undecryptable key is never pushed either (that would destroy the
+    // other device's copy); only the legacy plaintext upgrade goes up.
+    expect(backend.pushed.map((p) => p.key)).toEqual(["chatui:projects"]);
+    expect(isSyncEnvelope(backend.pushed[0].value)).toBe(true);
+  });
+
+  it("re-pushes legacy plaintext rows encrypted once they agree", async () => {
+    storage.set("chatui:settings", '{"a":1}');
+    const backend = fakeBackend([row("chatui:settings", '{"a":1}', "2026-09-15T11:00:00Z")]);
+    const result = await syncNow(backend);
+    expect(result.error).toBeUndefined();
+    expect(result.pushed).toBe(1);
+    expect(result.pulled).toBe(0);
+    expect(isSyncEnvelope(backend.pushed[0].value)).toBe(true);
+    expect(await decryptFromSync(backend.pushed[0].value)).toBe('{"a":1}');
   });
 });

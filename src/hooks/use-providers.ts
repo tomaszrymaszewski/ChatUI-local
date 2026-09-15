@@ -53,7 +53,7 @@ export function useProviders() {
       name: string,
       baseUrl: string,
       apiKey: string,
-      models: ProviderModel[],
+      models?: ProviderModel[],
       builtinKey?: string,
     ) => {
       await updateProviderRPC(providerId, name, baseUrl, apiKey, models, builtinKey);

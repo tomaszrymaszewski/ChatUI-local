@@ -1,5 +1,82 @@
-import { describe, it, expect } from "vitest";
-import { capTitleWords, instantChatTitle } from "@/lib/llm";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  PROVIDERS_EVENT,
+  capTitleWords,
+  createProvider,
+  deleteProvider,
+  fetchProviders,
+  getProviderApiKey,
+  instantChatTitle,
+  updateProvider,
+} from "./llm";
+
+const storage = new Map<string, string>();
+const seen: string[] = [];
+
+beforeEach(() => {
+  storage.clear();
+  seen.length = 0;
+  vi.stubGlobal("localStorage", {
+    getItem: (k: string) => storage.get(k) ?? null,
+    setItem: (k: string, v: string) => void storage.set(k, v),
+    removeItem: (k: string) => void storage.delete(k),
+    key: (i: number) => [...storage.keys()][i] ?? null,
+    get length() {
+      return storage.size;
+    },
+  });
+  vi.stubGlobal("window", {
+    dispatchEvent: (e: Event) => {
+      seen.push(e.type);
+      return true;
+    },
+  });
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+describe("provider CRUD", () => {
+  it("editing a provider without models preserves the model list and key", async () => {
+    await createProvider("P", "https://x", "sk-x", [{ id: "m1", name: "model-1" }]);
+    const [before] = await fetchProviders();
+    // Blank key + omitted models: a name/URL touch-up.
+    await updateProvider(before.id, "P2", "https://y", "", undefined);
+    const [after] = await fetchProviders();
+    expect(after.name).toBe("P2");
+    expect(after.baseUrl).toBe("https://y");
+    expect(after.models).toEqual([{ id: "m1", name: "model-1" }]);
+    expect(await getProviderApiKey(before.id)).toBe("sk-x");
+  });
+
+  it("passing models still replaces the list", async () => {
+    await createProvider("P", "https://x", "sk-x", [{ id: "m1", name: "model-1" }]);
+    const [before] = await fetchProviders();
+    await updateProvider(before.id, "P", "https://x", "", [{ id: "m2", name: "model-2" }]);
+    const [after] = await fetchProviders();
+    expect(after.models).toEqual([{ id: "m2", name: "model-2" }]);
+  });
+
+  it("deleting the last provider drops the key so sync propagates a tombstone", async () => {
+    await createProvider("P", "https://x", "sk-x", []);
+    const [p] = await fetchProviders();
+    await deleteProvider(p.id);
+    expect(storage.has("chatui:providers")).toBe(false);
+    expect(await fetchProviders()).toEqual([]);
+    expect(seen).toContain(PROVIDERS_EVENT);
+  });
+
+  it("deleting one of several providers keeps the rest", async () => {
+    await createProvider("A", "https://a", "sk-a", []);
+    await createProvider("B", "https://b", "sk-b", []);
+    const [a] = await fetchProviders();
+    await deleteProvider(a.id);
+    const rest = await fetchProviders();
+    expect(rest.map((p) => p.name)).toEqual(["B"]);
+    expect(storage.has("chatui:providers")).toBe(true);
+  });
+});
 
 describe("capTitleWords", () => {
   it("keeps a short title unchanged (minus trailing punctuation)", () => {

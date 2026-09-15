@@ -1,17 +1,20 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getSupabase } from "@/lib/supabase";
+import { decryptFromSync, encryptForSync, isSyncEnvelope } from "@/lib/sync-crypto";
 import { chatUiBaseDir } from "@/lib/agent/sandbox";
 import { isTauri } from "@/lib/platform";
 import { exportChatUiBackup } from "@/lib/data-transfer";
 
 // Cloud sync: local-first mirroring of localStorage to Supabase.
 //
-// Every tracked `chatui:*` key is mirrored verbatim to one row in the
-// `user_data` table (see supabase/schema.sql). The local copy is always the
-// live one — the app works fully offline and anonymous; the cloud copy only
-// exists while signed in. Sync is per-key last-write-wins with tombstones,
-// except sessions and message stores, which union-merge by record id so chats
-// from two devices combine instead of clobbering each other.
+// Every tracked `chatui:*` key is mirrored to one row in the `user_data`
+// table (see supabase/schema.sql) as an end-to-end encrypted envelope
+// (AES-256-GCM, see sync-crypto.ts) — the server only ever sees ciphertext,
+// never keys, chats, or settings. The local copy is always the live one —
+// the app works fully offline and anonymous; the cloud copy only exists while
+// signed in. Sync is per-key last-write-wins with tombstones, except sessions
+// and message stores, which union-merge by record id so chats from two
+// devices combine instead of clobbering each other.
 //
 // Timestamps mix device time (local writes) and server time (row updated_at),
 // so LWW across devices assumes roughly-correct clocks; ties go to the local
@@ -25,6 +28,7 @@ const SYNCED_PREFIXES = [
   "chatui:providers",
   "chatui:settings",
   "chatui:agents",
+  "chatui:avatar-salts", // per-agent avatar salts — part of the agents' data
   "chatui:projects",
   "chatui:schedules",
   "chatui:workflows",
@@ -40,14 +44,21 @@ const SYNCED_PREFIXES = [
   "chatui:context-overrides",
   "chatui:vision-overrides",
   "chatui:tavily-key",
+  "chatui:council-models",
+  "chatui:update-settings",
+  "chatui:skills:registry-url",
+  "chatui:knowledge",
+  "chatui:widgets-hidden",
 ];
 
 // Local-only bookkeeping that must never travel, even though the prefixes
 // above would otherwise catch some of it.
 const SYNC_EXCLUDED = new Set([
   "chatui:sync:meta", // this file's own bookkeeping (also matches no prefix)
+  "chatui:sync:key", // the E2E device key — uploading it would defeat encryption
   "chatui:messages:recency", // quota-eviction index, meaningless elsewhere
   "chatui:mcp:migrated", // one-time migration flag
+  "chatui:agents:paths-remapped", // one-time migration flag
 ]);
 
 export function isSyncedKey(key: string): boolean {
@@ -59,6 +70,15 @@ export function isSyncedKey(key: string): boolean {
 // tracked key syncs wholesale (last-write-wins).
 function isDeepMergeKey(key: string): boolean {
   return key === "chatui:sessions" || key.startsWith("chatui:messages:");
+}
+
+/**
+ * "Blank" stored values: an empty string or an empty JSON literal. Feeds the
+ * no-wipe guard in planSync — a blank cloud row never overwrites live data.
+ */
+function isEmptyValue(value: string): boolean {
+  const t = value.trim();
+  return t === "" || t === "[]" || t === "{}" || t === "null";
 }
 
 // ─── Hash + meta ───────────────────────────────────────────────────────────
@@ -238,7 +258,11 @@ export interface SyncPlan {
  * - deep-merge keys (sessions, messages:*): union by record id, always —
  *   chats from both sides survive every sync, not just the first.
  * - other keys: per-key last-write-wins; unknown local timestamps and exact
- *   ties go to the local device (the active user's data wins).
+ *   ties go to the local device (the active user's data wins). Ambiguous
+ *   states fail closed toward local too: when neither side moved yet the
+ *   values differ (stale meta), and whenever the remote value is blank but
+ *   the local one isn't, the local value is pushed — a blank cloud row can
+ *   never wipe providers or settings on connect.
  * - deletions travel as tombstones in both directions.
  */
 export function planSync(
@@ -331,6 +355,14 @@ export function planSync(
         setMeta(key, { hash: localHash, syncedAt: row.updated_at, localChangedAt: "", remoteDeleted: false });
         continue;
       }
+      // No-wipe guard: a blank remote value never overwrites populated local
+      // data. Explicit deletes travel as tombstones, so a blank row is
+      // suspicious rather than authoritative — push the live local value.
+      if (isEmptyValue(row.value) && !isEmptyValue(localVal)) {
+        plan.toRemote.push({ key, value: localVal, deleted: false });
+        setMeta(key, { hash: localHash, syncedAt: now, localChangedAt: changedAt(key, m), remoteDeleted: false });
+        continue;
+      }
       if (!m) {
         plan.toRemote.push({ key, value: localVal, deleted: false }); // first link: local wins
         setMeta(key, { hash: localHash, syncedAt: now, localChangedAt: changedAt(key, m), remoteDeleted: false });
@@ -353,9 +385,10 @@ export function planSync(
           setMeta(key, { hash: hashValue(row.value), syncedAt: row.updated_at, localChangedAt: "", remoteDeleted: false });
         }
       } else {
-        // Neither side moved yet values differ (reverted row?) — converge remote-ward.
-        plan.toLocal.push({ key, value: row.value });
-        setMeta(key, { hash: hashValue(row.value), syncedAt: row.updated_at, localChangedAt: "", remoteDeleted: false });
+        // Neither side moved yet values differ (stale meta or a reverted
+        // row?) — the live local data wins; it is never silently replaced.
+        plan.toRemote.push({ key, value: localVal, deleted: false });
+        setMeta(key, { hash: localHash, syncedAt: now, localChangedAt: changedAt(key, m), remoteDeleted: false });
       }
       continue;
     }
@@ -415,6 +448,8 @@ function eventForKey(key: string): string | null {
   if (key === "chatui:providers") return "chatui:providers-changed";
   if (key === "chatui:settings") return "chatui:settings-changed";
   if (key === "chatui:agents") return "chatui:agents-changed";
+  // Avatars render wherever agents render, so salt pulls re-render those lists.
+  if (key === "chatui:avatar-salts") return "chatui:agents-changed";
   if (key === "chatui:projects") return "chatui:projects-changed";
   if (key === "chatui:schedules") return "chatui:schedules-changed";
   if (key === "chatui:workflows") return "chatui:workflows-changed";
@@ -443,26 +478,69 @@ export interface SyncResult {
   deletedLocal: number;
   /** Deep-merged session/message keys (both sides contributed). */
   merged: string[];
+  /** Keys skipped because this device's sync key couldn't decrypt them. */
+  undecryptable: string[];
 }
 
 /**
  * Full sync: pull everything, reconcile, apply locally, push the remainder.
  * Runs on sign-in (initial merge), on focus, and every minute while signed in.
+ * Cloud values are decrypted before planning and encrypted before upload —
+ * planning, hashes, and merges all operate on plaintext on both sides.
  * Never throws — failures resolve as { error } so callers can toast and retry.
  */
 export async function syncNow(
   backend: SyncBackend,
   localChangedAt: Map<string, string> = new Map(),
 ): Promise<SyncResult & { error?: string }> {
-  const empty: SyncResult = { pushed: 0, pulled: 0, deletedLocal: 0, merged: [] };
+  const empty: SyncResult = { pushed: 0, pulled: 0, deletedLocal: 0, merged: [], undecryptable: [] };
   let rows: RemoteRow[];
   try {
     rows = await backend.fetchRows();
   } catch (err) {
     return { ...empty, error: err instanceof Error ? err.message : "Sync failed" };
   }
+  // Decrypt pass: legacy plaintext rows (written before encryption shipped)
+  // flow through and get re-pushed encrypted below; rows this device can't
+  // open are dropped from BOTH sides so neither the cloud copy nor the local
+  // copy is clobbered by a key this device doesn't hold.
+  const remote: RemoteRow[] = [];
+  const undecryptable: string[] = [];
+  const legacy = new Set<string>();
+  for (const row of rows) {
+    if (row.deleted || !isSyncedKey(row.key) || !isSyncEnvelope(row.value)) {
+      if (!row.deleted && isSyncedKey(row.key)) legacy.add(row.key);
+      remote.push(row);
+      continue;
+    }
+    try {
+      remote.push({ ...row, value: await decryptFromSync(row.value) });
+    } catch {
+      undecryptable.push(row.key);
+    }
+  }
+  const local = readLocal();
+  for (const key of undecryptable) local.delete(key);
   const now = new Date().toISOString();
-  const plan = planSync(readLocal(), rows, loadMeta(), now, localChangedAt);
+  const plan = planSync(local, remote, loadMeta(), now, localChangedAt);
+
+  // Upgrade legacy plaintext rows: where local and remote already agree, push
+  // the same value back so the cloud copy becomes an encrypted envelope.
+  if (legacy.size > 0) {
+    const remoteByKey = new Map(remote.map((r) => [r.key, r]));
+    const decided = new Set([
+      ...plan.toRemote.map((t) => t.key),
+      ...plan.toLocal.map((t) => t.key),
+      ...plan.deleteLocal,
+    ]);
+    for (const key of legacy) {
+      const localVal = local.get(key);
+      const row = remoteByKey.get(key);
+      if (localVal === undefined || !row || row.deleted || localVal !== row.value) continue;
+      if (decided.has(key)) continue;
+      plan.toRemote.push({ key, value: localVal, deleted: false });
+    }
+  }
 
   for (const { key, value } of plan.toLocal) {
     try {
@@ -483,7 +561,11 @@ export async function syncNow(
   const pushed = plan.toRemote;
   if (pushed.length > 0) {
     try {
-      const authoritative = await backend.upsertRows(pushed);
+      const encrypted: Array<{ key: string; value: string; deleted: boolean }> = [];
+      for (const t of pushed) {
+        encrypted.push(t.deleted ? t : { ...t, value: await encryptForSync(t.value) });
+      }
+      const authoritative = await backend.upsertRows(encrypted);
       const serverTime = new Map(authoritative.map((r) => [r.key, r.updated_at]));
       for (const { key } of pushed) {
         const at = serverTime.get(key);
@@ -500,6 +582,7 @@ export async function syncNow(
         pulled: plan.toLocal.length,
         deletedLocal: plan.deleteLocal.length,
         merged: [],
+        undecryptable,
         error: err instanceof Error ? err.message : "Sync failed",
       };
     }
@@ -507,7 +590,7 @@ export async function syncNow(
   saveMeta(plan.meta);
   dispatchForKeys([...plan.toLocal.map((t) => t.key), ...plan.deleteLocal]);
 
-  const remoteKeys = new Set(rows.map((r) => r.key));
+  const remoteKeys = new Set(remote.map((r) => r.key));
   const merged = plan.toRemote
     .filter((t) => isDeepMergeKey(t.key) && remoteKeys.has(t.key))
     .map((t) => t.key);
@@ -517,12 +600,14 @@ export async function syncNow(
     pulled: plan.toLocal.length,
     deletedLocal: plan.deleteLocal.length,
     merged,
+    undecryptable,
   };
 }
 
 /**
  * Push-only fast path for the debounced "local changed" trigger: no fetch,
  * just upsert locally-dirty keys (and tombstones for locally-deleted ones).
+ * Values are encrypted before upload, like the full sync.
  */
 export async function pushDirty(
   backend: SyncBackend,
@@ -544,7 +629,11 @@ export async function pushDirty(
   }
   if (dirty.length === 0) return { pushed: 0 };
   try {
-    const authoritative = await backend.upsertRows(dirty);
+    const encrypted: Array<{ key: string; value: string; deleted: boolean }> = [];
+    for (const d of dirty) {
+      encrypted.push(d.deleted ? d : { ...d, value: await encryptForSync(d.value) });
+    }
+    const authoritative = await backend.upsertRows(encrypted);
     const serverTime = new Map(authoritative.map((r) => [r.key, r.updated_at]));
     const now = new Date().toISOString();
     for (const { key, value, deleted } of dirty) {
@@ -659,7 +748,7 @@ export function startSyncManager(
           const { error } = await pushDirty(backend, dirtySince);
           if (!stopped) {
             if (!error) dirtySince.clear();
-            opts?.onSync?.({ pushed: 0, pulled: 0, deletedLocal: 0, merged: [], error });
+            opts?.onSync?.({ pushed: 0, pulled: 0, deletedLocal: 0, merged: [], undecryptable: [], error });
           }
         } finally {
           syncing = false;

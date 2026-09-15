@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import {
   Bot,
+  Copy,
   Database,
   Eye,
   EyeOff,
   GalleryVerticalEnd,
+  KeyRound,
   Loader2,
   LogOut,
   MessageCircle,
@@ -33,6 +35,7 @@ import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/use-auth";
 import { avatarColorStyle, getAccountProfile, profileInitials } from "@/lib/account-profile";
 import { getSupabase } from "@/lib/supabase";
+import { exportSyncRecoveryCode, importSyncRecoveryCode } from "@/lib/sync-crypto";
 
 /** Flat vector scene: an AI chat exchange with model chips. */
 function ChatArt() {
@@ -861,6 +864,103 @@ interface StoredRow {
   origin: "This device" | "Cloud";
 }
 
+function SyncEncryptionCard() {
+  const [code, setCode] = useState<string | null>(null);
+  const [revealing, setRevealing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [importing, setImporting] = useState(false);
+
+  const reveal = async () => {
+    setRevealing(true);
+    try {
+      setCode(await exportSyncRecoveryCode());
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't load the recovery code");
+    } finally {
+      setRevealing(false);
+    }
+  };
+
+  const copy = async () => {
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      toast.success("Recovery code copied");
+    } catch {
+      toast.error("Couldn't copy — select the code manually");
+    }
+  };
+
+  const importCode = async () => {
+    if (!draft.trim()) return;
+    setImporting(true);
+    try {
+      await importSyncRecoveryCode(draft);
+      setDraft("");
+      setCode(null);
+      toast.success("Recovery code saved — syncing your cloud data");
+      // The sync manager re-syncs on window focus; nudge it now so the newly
+      // readable rows pull immediately instead of at the next interval.
+      window.dispatchEvent(new Event("focus"));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't save the recovery code");
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2 rounded-xl border p-3">
+      <span className="flex items-center gap-2 text-sm font-medium">
+        <ShieldCheck className="size-4" />
+        Sync encryption
+      </span>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        Everything synced to your account — providers, keys, settings, chats — is end-to-end
+        encrypted on this device. Nobody without your recovery code can read it, not even the
+        server&apos;s admins. Enter the code below on a new device to read your cloud data there.
+      </p>
+      {code ? (
+        <div className="flex items-center gap-2">
+          <code className="min-w-0 flex-1 truncate rounded-md bg-muted px-2 py-1.5 font-mono text-xs">
+            {code}
+          </code>
+          <Button variant="outline" size="sm" onClick={() => void copy()}>
+            <Copy />
+            Copy
+          </Button>
+        </div>
+      ) : (
+        <div>
+          <Button variant="outline" size="sm" onClick={() => void reveal()} disabled={revealing}>
+            {revealing ? <Loader2 className="animate-spin" /> : <KeyRound />}
+            Show this device&apos;s recovery code
+          </Button>
+        </div>
+      )}
+      <div className="grid gap-2">
+        <Label htmlFor="recovery-import">Use another device&apos;s code on this device</Label>
+        <div className="flex items-center gap-2">
+          <Input
+            id="recovery-import"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="Paste recovery code"
+            className="font-mono text-xs"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && draft.trim() && !importing) void importCode();
+            }}
+          />
+          <Button variant="outline" size="sm" onClick={() => void importCode()} disabled={!draft.trim() || importing}>
+            {importing && <Loader2 className="animate-spin" />}
+            Save
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DataTab() {
   const [rows, setRows] = useState<StoredRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -913,6 +1013,7 @@ function DataTab() {
 
   return (
     <div className="flex flex-col gap-3">
+      <SyncEncryptionCard />
       <div className="flex items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground">
           {rows === null
@@ -950,8 +1051,8 @@ function DataTab() {
         )}
       </div>
       <p className="text-xs leading-relaxed text-muted-foreground">
-        Each row is one localStorage key mirrored verbatim to your account&apos;s database. A backup
-        copy always stays on this device.
+        Each row is one localStorage key mirrored to your account&apos;s database as an encrypted
+        envelope only your devices can open. A backup copy always stays on this device.
       </p>
     </div>
   );

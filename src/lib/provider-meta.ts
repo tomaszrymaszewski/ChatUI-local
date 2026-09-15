@@ -63,7 +63,7 @@ export const PROVIDER_META: ProviderMeta[] = [
     name: "Fireworks",
     tagline: "Fast, affordable inference for top open models. Zero data retention (private).",
     logoKey: "fireworks",
-    keyHelpUrl: "https://fireworks.ai/account/api-keys",
+    keyHelpUrl: "https://app.fireworks.ai/settings/users/api-keys",
     tutorial: [
       "Create an account at fireworks.ai",
       "Open your profile → API Keys",
