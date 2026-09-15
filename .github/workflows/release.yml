@@ -37,6 +37,19 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # Fail loudly instead of shipping a build without account credentials —
+      # an empty VITE_SUPABASE_URL silently produces an "accounts aren't
+      # configured" app. GitHub passes missing secrets as empty strings.
+      - name: Verify Supabase secrets are set
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+        run: |
+          missing=0
+          [ -z "$VITE_SUPABASE_URL" ] && { echo "::error::Repository secret VITE_SUPABASE_URL is not set (Settings → Secrets and variables → Actions)"; missing=1; }
+          [ -z "$VITE_SUPABASE_ANON_KEY" ] && { echo "::error::Repository secret VITE_SUPABASE_ANON_KEY is not set (Settings → Secrets and variables → Actions)"; missing=1; }
+          exit $missing
+
       # Only expose Apple signing env vars when the secrets actually exist.
       # tauri-cli attempts a keychain import whenever APPLE_CERTIFICATE is set,
       # and GitHub passes missing secrets as empty strings — which breaks
