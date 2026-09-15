@@ -41,6 +41,7 @@ jobs:
       # an empty VITE_SUPABASE_URL silently produces an "accounts aren't
       # configured" app. GitHub passes missing secrets as empty strings.
       - name: Verify Supabase secrets are set
+        shell: bash
         env:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
