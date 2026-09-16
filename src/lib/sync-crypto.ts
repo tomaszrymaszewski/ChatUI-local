@@ -13,6 +13,8 @@
 import { trySetItem } from "./storage-pressure";
 
 const SYNC_KEY_STORAGE = "chatui:sync:key";
+/** Local-only flag (excluded from sync): the user confirmed saving the code. */
+const SYNC_CODE_ACK = "chatui:sync:code-acknowledged";
 
 const ENVELOPE_VERSION = 1;
 const ENVELOPE_ALG = "A256GCM";
@@ -183,6 +185,45 @@ export async function exportSyncRecoveryCode(): Promise<string> {
   return created.replace(/(.{4})/g, "$1 ").trim();
 }
 
+/** Whether the user confirmed saving this device's recovery code. */
+export function isRecoveryCodeAcknowledged(): boolean {
+  try {
+    return localStorage.getItem(SYNC_CODE_ACK) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Persist the "I've saved it" confirmation. Never throws. */
+export function acknowledgeRecoveryCode(): void {
+  trySetItem(SYNC_CODE_ACK, "1");
+}
+
+/**
+ * Whether a sync result should pop the "save your recovery code" dialog.
+ * Structural param (not SyncResult) so this module stays importable from
+ * sync.ts without a cycle.
+ *
+ * Three suppressions, all load-bearing:
+ * - push-only results never fetched, so their empty undecryptable list proves
+ *   nothing — prompting on them would bless a key the cloud can't open.
+ * - errors leave the key state unknown.
+ * - any undecryptable row means this device holds the WRONG key: the banner
+ *   (enter the other device's code) owns that case, and prompting to save
+ *   this key could orphan the cloud rows if the user applies it backwards.
+ */
+export function shouldPromptRecoveryCodeSave(result: {
+  pushOnly?: boolean;
+  error?: string;
+  undecryptable: readonly string[];
+}): boolean {
+  if (result.pushOnly || result.error || result.undecryptable.length > 0) {
+    return false;
+  }
+  if (!hasSyncKey()) return false;
+  return !isRecoveryCodeAcknowledged();
+}
+
 /** Adopt another device's key from its recovery code (whitespace ignored). */
 export async function importSyncRecoveryCode(code: string): Promise<void> {
   const compact = code.replace(/\s+/g, "");
@@ -200,4 +241,7 @@ export async function importSyncRecoveryCode(code: string): Promise<void> {
   }
   cachedRaw = null;
   cachedKey = null;
+  // Pasting a code proves the user holds it — no "save your code" prompt.
+  // Best-effort: if this write fails the prompt just shows the (correct) code again.
+  trySetItem(SYNC_CODE_ACK, "1");
 }

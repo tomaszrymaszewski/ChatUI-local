@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  acknowledgeRecoveryCode,
   decryptFromSync,
   encryptForSync,
   exportSyncRecoveryCode,
   hasSyncKey,
   importSyncRecoveryCode,
+  isRecoveryCodeAcknowledged,
   isSyncEnvelope,
+  shouldPromptRecoveryCodeSave,
 } from "./sync-crypto";
 
 const storage = new Map<string, string>();
@@ -115,5 +118,47 @@ describe("sync-crypto", () => {
     await expect(
       importSyncRecoveryCode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="),
     ).rejects.toThrow(/device storage is full/i);
+  });
+});
+
+describe("recovery-code save prompt", () => {
+  it("importing a code acks it (pasting proves the user holds it)", async () => {
+    expect(isRecoveryCodeAcknowledged()).toBe(false);
+    await importSyncRecoveryCode("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    expect(isRecoveryCodeAcknowledged()).toBe(true);
+  });
+
+  it("rejects malformed codes without acking", async () => {
+    await expect(importSyncRecoveryCode("hello")).rejects.toThrow(/recovery code/);
+    expect(isRecoveryCodeAcknowledged()).toBe(false);
+  });
+
+  it("exporting alone does not ack; explicit confirmation does", async () => {
+    await exportSyncRecoveryCode();
+    expect(isRecoveryCodeAcknowledged()).toBe(false);
+    acknowledgeRecoveryCode();
+    expect(isRecoveryCodeAcknowledged()).toBe(true);
+  });
+
+  it("prompts only on clean full syncs with an unacked key", async () => {
+    await encryptForSync("x"); // generate a key
+    const clean = { undecryptable: [] as string[] };
+    expect(shouldPromptRecoveryCodeSave(clean)).toBe(true);
+    // Push-only results never fetched: their empty list proves nothing.
+    expect(shouldPromptRecoveryCodeSave({ ...clean, pushOnly: true })).toBe(false);
+    // Errors leave the key state unknown.
+    expect(shouldPromptRecoveryCodeSave({ ...clean, error: "boom" })).toBe(false);
+    // Undecryptable rows mean this device holds the WRONG key — the
+    // enter-the-code banner owns that case, never the save prompt.
+    expect(
+      shouldPromptRecoveryCodeSave({ undecryptable: ["chatui:settings"] }),
+    ).toBe(false);
+    acknowledgeRecoveryCode();
+    expect(shouldPromptRecoveryCodeSave(clean)).toBe(false);
+  });
+
+  it("never prompts before a key exists", () => {
+    expect(hasSyncKey()).toBe(false);
+    expect(shouldPromptRecoveryCodeSave({ undecryptable: [] })).toBe(false);
   });
 });

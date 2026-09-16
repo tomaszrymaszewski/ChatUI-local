@@ -6,6 +6,8 @@ import {
   mergeRecordLists,
   planSync,
   pushDirty,
+  setStorageHookSuspended,
+  startSyncManager,
   syncNow,
   type RemoteRow,
   type SyncBackend,
@@ -82,6 +84,7 @@ describe("isSyncedKey", () => {
       "chatui:messages:recency",
       "chatui:mcp:migrated",
       "chatui:agents:paths-remapped",
+      "chatui:sync:code-acknowledged",
       "chatui:modelsdev-cache",
       "chatui:skills:registry",
       "chatui:skills:auto-install-skipped",
@@ -481,5 +484,96 @@ describe("syncNow with a fake backend", () => {
     expect(result.pulled).toBe(0);
     expect(isSyncEnvelope(backend.pushed[0].value)).toBe(true);
     expect(await decryptFromSync(backend.pushed[0].value)).toBe('{"a":1}');
+  });
+});
+
+describe("storage hook suspension (local reset)", () => {
+  it("schedules no pushes while suspended, and resumes after", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", {
+      dispatchEvent: () => true,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    });
+    const pushed: Array<{ key: string; value: string; deleted: boolean }> = [];
+    const backend: SyncBackend = {
+      fetchRows: async () => [],
+      upsertRows: async (upserts) => {
+        pushed.push(...upserts);
+        return upserts.map((u, i) => row(u.key, u.value, `2026-09-15T12:00:0${i}Z`, u.deleted));
+      },
+    };
+    const stop = startSyncManager(backend);
+    try {
+      await vi.advanceTimersByTimeAsync(0); // let the initial full sync settle
+      expect(pushed).toEqual([]);
+      // Suspended writes (the reset wipe) schedule nothing…
+      setStorageHookSuspended(true);
+      localStorage.setItem("chatui:settings", '{"a":1}');
+      storage.set("chatui:projects", "[]");
+      localStorage.removeItem("chatui:projects");
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(pushed).toEqual([]);
+      // …and live writes schedule again once resumed.
+      setStorageHookSuspended(false);
+      localStorage.setItem("chatui:settings", '{"a":2}');
+      await vi.advanceTimersByTimeAsync(10_000);
+      // Fake timers don't pump Node's crypto threadpool (the push encrypts),
+      // so yield real loop turns until it lands — bounded, fails on a hang.
+      for (let i = 0; i < 500 && pushed.length === 0; i++) {
+        await new Promise<void>((resolve) => {
+          const channel = new MessageChannel();
+          channel.port1.onmessage = () => resolve();
+          channel.port2.postMessage(null);
+        });
+      }
+      expect(pushed.map((p) => [p.key, p.deleted])).toEqual([["chatui:settings", false]]);
+    } finally {
+      setStorageHookSuspended(false);
+      stop();
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("onSync result marking", () => {
+  it("marks push-only results so UI can tell them from full syncs", async () => {
+    // Fresh module instance: the storage hook installs once per instance,
+    // and the suspension suite above already claimed the shared one.
+    vi.resetModules();
+    const fresh = await import("./sync");
+    vi.useFakeTimers();
+    vi.stubGlobal("window", {
+      dispatchEvent: () => true,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    });
+    const seen: Array<{ pushOnly?: boolean }> = [];
+    const backend: SyncBackend = {
+      fetchRows: async () => [],
+      upsertRows: async (upserts) =>
+        upserts.map((u, i) => row(u.key, u.value, `2026-09-15T12:00:0${i}Z`, u.deleted)),
+    };
+    const stop = fresh.startSyncManager(backend, { onSync: (r) => void seen.push(r) });
+    try {
+      await vi.advanceTimersByTimeAsync(0); // initial full sync settles
+      localStorage.setItem("chatui:settings", '{"a":1}');
+      await vi.advanceTimersByTimeAsync(10_000); // debounced push fires
+      // Fake timers don't pump Node's crypto threadpool (the push encrypts),
+      // so yield real loop turns until it lands — bounded, fails on a hang.
+      for (let i = 0; i < 500 && seen.length < 2; i++) {
+        await new Promise<void>((resolve) => {
+          const channel = new MessageChannel();
+          channel.port1.onmessage = () => resolve();
+          channel.port2.postMessage(null);
+        });
+      }
+      expect(seen.length).toBeGreaterThanOrEqual(2);
+      expect(seen[0].pushOnly).toBeUndefined();
+      expect(seen.some((r) => r.pushOnly === true)).toBe(true);
+    } finally {
+      stop();
+      vi.useRealTimers();
+    }
   });
 });

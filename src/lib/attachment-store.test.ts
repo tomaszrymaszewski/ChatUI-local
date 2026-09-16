@@ -5,6 +5,7 @@ import {
   getFileText,
   setFileText,
   deleteFileBlob,
+  clearAttachmentStore,
   isFileStorePersistent,
 } from "@/lib/attachment-store";
 
@@ -46,6 +47,14 @@ describe("attachment-store", () => {
   it("returns null/empty for unknown ids", async () => {
     expect(await getFileBlob("missing")).toBeNull();
     expect(await getFileText("missing")).toBe("");
+  });
+
+  it("clears everything", async () => {
+    await putFileBlob("a1", new Blob(["x"]));
+    await putFileBlob("a2", new Blob(["y"]));
+    await clearAttachmentStore();
+    expect(await getFileBlob("a1")).toBeNull();
+    expect(await getFileBlob("a2")).toBeNull();
   });
 
   it("deletes stored files safely", async () => {

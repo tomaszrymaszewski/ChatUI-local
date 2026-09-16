@@ -54,10 +54,11 @@ export interface StructuredInputRequest {
 }
 
 export interface SuggestionRequest {
+  // agent_mode is a legacy alias for kind=mode target="task".
   kind: "skill" | "connector" | "mode" | "agent_mode" | "agent_config";
   /**
-   * Skill name, connector id, mode name (council/learn/research), "task" for
-   * the switch-to-agent-mode suggestion, or the agent id for agent_config.
+   * Skill name, connector id, mode name (council/learn/research/task), or the
+   * agent id for agent_config.
    */
   target: string;
   /** Short headline shown on the card. */

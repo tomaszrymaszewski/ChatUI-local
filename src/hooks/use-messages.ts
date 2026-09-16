@@ -4,6 +4,7 @@ import type { ActivityItem, ReasoningStream, SharedFile } from "@/lib/agent/type
 import type { Artifact } from "@/lib/artifacts";
 import { deleteFileBlob } from "@/lib/attachment-store";
 import { evictRebuildableCaches } from "@/lib/storage-pressure";
+import { listBigKeys, readBigKey, removeBigKey, writeBigKey } from "@/lib/idb-store";
 
 function storageKey(sessionId: string) {
   return `chatui:messages:${sessionId}`;
@@ -12,9 +13,17 @@ function storageKey(sessionId: string) {
 const MESSAGES_EVENT = "chatui:messages-changed";
 
 /** Read a session's stored messages (any session, not just the active one). */
+/**
+ * Delete a session's message store (session deletion in use-sessions). Marks
+ * the key dirty (default) so the delete propagates to the cloud as a tombstone.
+ */
+export function deleteSessionMessageStore(sessionId: string): void {
+  removeBigKey(storageKey(sessionId));
+}
+
 export function loadMessages(sessionId: string): Message[] {
   try {
-    const raw = localStorage.getItem(storageKey(sessionId));
+    const raw = readBigKey(storageKey(sessionId));
     if (!raw) return [];
     const data = JSON.parse(raw) as Array<{
       id: string;
@@ -118,33 +127,24 @@ function touchRecency(sessionId: string): void {
 }
 
 function messageStoreKeys(exceptSessionId: string): string[] {
-  const keys: string[] = [];
-  try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const key = localStorage.key(i);
-      if (key && key.startsWith("chatui:messages:") && key !== storageKey(exceptSessionId) && key !== RECENCY_KEY) {
-        keys.push(key);
-      }
-    }
-  } catch {
-    // listing failed — nothing to evict
-  }
-  return keys;
+  return listBigKeys("chatui:messages:").filter(
+    (key) => key !== storageKey(exceptSessionId) && key !== RECENCY_KEY,
+  );
 }
 
 /**
- * Persist a session's messages without ever throwing: localStorage is a
- * single ~5MB store shared by every chat, so once old chats fill it even a
- * brand-new chat's first save throws QuotaExceededError and the crash
- * boundary takes down the app. On quota pressure the least-recently-written
- * sessions are evicted (oldest first) until the write fits; when even the
+ * Persist a session's messages without ever throwing. On the IndexedDB
+ * backend there is effectively no quota; on the localStorage backend (~5MB
+ * shared by every chat) a full store throws QuotaExceededError, so on quota
+ * pressure the least-recently-written sessions are evicted (oldest first)
+ * until the write fits — evictions stay local and never sync. When even the
  * current session alone does not fit, it stays in memory for this run.
  */
 function saveMessages(sessionId: string, messages: Message[]) {
   const key = storageKey(sessionId);
   const payload = serializeMessages(messages);
   try {
-    localStorage.setItem(key, payload);
+    writeBigKey(key, payload);
     touchRecency(sessionId);
     return;
   } catch {
@@ -152,7 +152,7 @@ function saveMessages(sessionId: string, messages: Message[]) {
     // then fall through to message eviction below.
     evictRebuildableCaches();
     try {
-      localStorage.setItem(key, payload);
+      writeBigKey(key, payload);
       touchRecency(sessionId);
       return;
     } catch {
@@ -168,12 +168,12 @@ function saveMessages(sessionId: string, messages: Message[]) {
     );
     for (const other of others) {
       try {
-        localStorage.removeItem(other);
+        removeBigKey(other, { dirty: false });
       } catch {
         continue;
       }
       try {
-        localStorage.setItem(key, payload);
+        writeBigKey(key, payload);
         touchRecency(sessionId);
         console.warn(`[chatui] storage full — evicted ${other} to save the current chat`);
         return;

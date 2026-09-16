@@ -40,7 +40,6 @@ export function NavChats({
   onSelect,
   onDelete,
   onRename,
-  onSwitchToAgent,
   projects = [],
   label = "Recents",
   runningIds,
@@ -50,7 +49,6 @@ export function NavChats({
   onSelect: (id: string) => void
   onDelete: (id: string) => void
   onRename?: (id: string, title: string) => void
-  onSwitchToAgent?: (id: string) => void
   projects?: Project[]
   label?: string
   runningIds?: Set<string>
@@ -126,12 +124,6 @@ export function NavChats({
                     <DropdownMenuItem onClick={() => handleStartRename(session.id, session.title)}>
                       <Pencil className="text-muted-foreground" />
                       <span>Rename</span>
-                    </DropdownMenuItem>
-                  )}
-                  {onSwitchToAgent && !session.movedToAgent && (
-                    <DropdownMenuItem onClick={() => onSwitchToAgent(session.id)}>
-                      <Bot className="text-muted-foreground" />
-                      <span>Switch to Agent Mode</span>
                     </DropdownMenuItem>
                   )}
                   <DropdownMenuSeparator />

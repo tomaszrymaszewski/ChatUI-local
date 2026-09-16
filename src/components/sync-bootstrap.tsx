@@ -1,19 +1,27 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
 import { createSupabaseBackend, startSyncManager } from "@/lib/sync";
+import { shouldPromptRecoveryCodeSave } from "@/lib/sync-crypto";
+import { SaveRecoveryCodeDialog } from "@/components/save-recovery-code-dialog";
 
 /**
  * Owns the cloud-sync lifecycle for the whole app (onboarding + main UI):
  * starts the sync manager on sign-in, stops it on sign-out, and toasts the
  * outcome of the initial merge. Background syncs stay silent — the initial
  * result is the one the user asked for by connecting.
+ *
+ * Also pops the "save your recovery code" dialog after a clean full sync
+ * while this device's key is unconfirmed (at most once per launch; the ack
+ * persists, Later snoozes to next launch).
  */
 export function SyncBootstrap() {
   const { user, configured } = useAuth();
+  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const stopRef = useRef<(() => void) | null>(null);
   const toastedForRef = useRef<string | null>(null);
   const lastUserRef = useRef<string | null>(null);
+  const promptedRef = useRef(false);
 
   useEffect(() => {
     if (lastUserRef.current !== (user?.id ?? null)) {
@@ -23,12 +31,20 @@ export function SyncBootstrap() {
     if (!configured || !user) {
       stopRef.current?.();
       stopRef.current = null;
+      setSaveDialogOpen(false);
       return;
     }
     const userId = user.id;
     const backend = createSupabaseBackend();
     stopRef.current = startSyncManager(backend, {
       onSync: (result) => {
+        // Evaluated on every sync (not just the first): the key may only be
+        // generated later, on the first background push. Push-only results
+        // are skipped inside the predicate — they never fetched.
+        if (shouldPromptRecoveryCodeSave(result) && !promptedRef.current) {
+          promptedRef.current = true;
+          setSaveDialogOpen(true);
+        }
         if (toastedForRef.current === userId) return;
         // The manager's first callback is the initial pull-merge-push (its
         // debounced pushes only fire on later local writes).
@@ -70,5 +86,5 @@ export function SyncBootstrap() {
     };
   }, [user, configured]);
 
-  return null;
+  return <SaveRecoveryCodeDialog open={saveDialogOpen} onOpenChange={setSaveDialogOpen} />;
 }

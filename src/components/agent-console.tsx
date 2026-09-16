@@ -736,7 +736,7 @@ export function AgentConsole({
                                       {session.title || "untitled"}
                                     </span>
                                     <span className="shrink-0 rounded-full border px-1.5 py-px text-[9px] text-muted-foreground">
-                                      {session.type === "agent" ? "Task" : "Chat"}
+                                      {session.type === "agent" || session.chatMode === "task" ? "Task" : "Chat"}
                                     </span>
                                     <span className="shrink-0 text-[10px] text-muted-foreground">
                                       {new Date(session.updatedAt).toLocaleDateString([], {

@@ -1,11 +1,11 @@
 import { useState } from "react";
 import {
   ArrowUp,
-  Bot,
   SquarePen,
   Sparkles,
   Plug,
   GraduationCap,
+  ListTodo,
   Microscope,
   UsersRound,
   Check,
@@ -37,15 +37,13 @@ export function SuggestionCard({
   onInstallSkill,
   onOpenConnectors,
   onEnableMode,
-  onSwitchToAgent,
   onApplyAgentConfig,
 }: {
   suggestion: SuggestionRequest;
   onDismiss: () => void;
   onInstallSkill: (name: string) => Promise<void>;
   onOpenConnectors: () => void;
-  onEnableMode: (mode: "council" | "learn" | "research") => void;
-  onSwitchToAgent?: () => void;
+  onEnableMode: (mode: "council" | "learn" | "research" | "task") => void;
   onApplyAgentConfig?: (agentId: string, patch: AgentConfigPatch) => void;
 }) {
   const [installing, setInstalling] = useState(false);
@@ -91,13 +89,15 @@ export function SuggestionCard({
     ) : suggestion.kind === "connector" ? (
       <Plug className="size-4" />
     ) : suggestion.kind === "agent_mode" ? (
-      <Bot className="size-4" />
+      <ListTodo className="size-4" />
     ) : suggestion.kind === "agent_config" ? (
       <Settings2 className="size-4" />
     ) : suggestion.target === "learn" ? (
       <GraduationCap className="size-4" />
     ) : suggestion.target === "research" ? (
       <Microscope className="size-4" />
+    ) : suggestion.target === "task" ? (
+      <ListTodo className="size-4" />
     ) : (
       <UsersRound className="size-4" />
     );
@@ -244,13 +244,13 @@ export function SuggestionCard({
   };
 
   const handleEnableMode = () => {
-    onEnableMode(suggestion.target as "council" | "learn" | "research");
-    onDismiss();
-  };
-
-  const handleSwitchToAgent = () => {
-    if (!onSwitchToAgent) return;
-    onSwitchToAgent();
+    // kind=agent_mode is the legacy alias for task mode (its target was
+    // always "task"); enable Task mode directly instead of trusting it.
+    onEnableMode(
+      suggestion.kind === "agent_mode"
+        ? "task"
+        : (suggestion.target as "council" | "learn" | "research" | "task"),
+    );
     onDismiss();
   };
 
@@ -331,9 +331,9 @@ export function SuggestionCard({
           </Button>
         )}
         {suggestion.kind === "agent_mode" && (
-          <Button size="sm" onClick={handleSwitchToAgent} disabled={!onSwitchToAgent}>
-            <Bot />
-            Switch to Agent Mode
+          <Button size="sm" onClick={handleEnableMode}>
+            <ListTodo />
+            Turn on Task mode
           </Button>
         )}
         {suggestion.kind === "agent_config" && !applied && (

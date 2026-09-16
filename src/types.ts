@@ -66,7 +66,8 @@ export type SessionChatMode =
   | "temporary"
   | "learn"
   | "research"
-  | "council";
+  | "council"
+  | "task";
 
 /**
  * Reasoning effort sent as reasoning_effort on chat-completions requests for
@@ -85,14 +86,15 @@ export interface ChatSession {
   chatMode?: SessionChatMode;
   /** Reasoning effort persisted per chat — used for the session's runs. */
   reasoningEffort?: ReasoningEffort;
-  /** The saved agent this session belongs to (type "agent" only; undefined = standalone task). */
+  /** The saved agent this session belongs to (type "agent" only; undefined = agent-builder setup chat — standalone tasks are type "chat" with chatMode "task"). */
   agentId?: string;
   /** True while this session is an agent-builder setup interview. */
   isSetup?: boolean;
   /**
-   * True for sessions moved from the Chat tab to the Agents tab via
-   * "Switch to Agent Mode". type becomes "agent"; the chat sidebar keeps
-   * listing them grayed out with a redirect notice.
+   * Legacy: true for sessions moved from the Chat tab to the Agents tab back
+   * when unassigned tasks lived there. type is "agent"; the chat sidebar
+   * keeps listing them grayed out with a redirect notice. Nothing sets this
+   * anymore — unassigned tasks are chat-tab task-mode sessions now.
    */
   movedToAgent?: boolean;
 }

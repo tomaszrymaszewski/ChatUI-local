@@ -57,6 +57,19 @@ describe("detectModeTrigger", () => {
     expect(detectModeTrigger("researcher found something")).toBeNull();
   });
 
+  // ── task → task ──────────────────────────────────────────────────────
+  it("detects 'task' as task", () => {
+    expect(detectModeTrigger("task reorganize my downloads")).toBe("task");
+  });
+
+  it("detects 'Task' case-insensitively", () => {
+    expect(detectModeTrigger("Task clean up the desktop")).toBe("task");
+  });
+
+  it("does NOT trigger on 'tasks' (word boundary)", () => {
+    expect(detectModeTrigger("tasks for today")).toBeNull();
+  });
+
   // ── no trigger ───────────────────────────────────────────────────────
   it("returns null for empty string", () => {
     expect(detectModeTrigger("")).toBeNull();

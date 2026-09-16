@@ -5,8 +5,10 @@ Persistent instructions for AI coding agents on this repo. Keep changes tightly 
 ## What this repo is
 
 A local-first desktop chat app: **Tauri 2 (Rust shell) + React 19 + TypeScript + Vite 7
-+ Tailwind + shadcn/ui**, no router. All persistence is localStorage (chats, sessions,
-agents, projects, schedules, provider keys) plus files under the OS app-data dir
++ Tailwind + shadcn/ui**, no router. All persistence is local-first: chats + sessions
+live in IndexedDB (`chatui-store`, via a sync in-memory mirror in `src/lib/idb-store.ts`
+— localStorage's ~5MB WebKit cap couldn't hold them), everything else in localStorage
+(agents, projects, schedules, provider keys), plus files under the OS app-data dir
 `~/Library/Application Support/com.tomaszrymaszewski.chatui/` (managed by the Rust
 side). **Never use `~/Documents`** — that base was removed; a one-time startup
 migration (`migrate_legacy_chat_ui_dir` in `src-tauri/src/lib.rs`, runs in `setup()`)
@@ -65,6 +67,14 @@ sync on top of the local store — anonymous mode works fully offline and is unc
 - **Artifacts are derived, not stored.** `extractArtifacts()` re-parses message content
   on every render; edits in the panel live in the module-level override store in
   `src/lib/artifacts.ts`, keyed by the original artifact.
+- **Big keys bypass localStorage** (`src/lib/idb-store.ts`): `chatui:sessions` and
+  `chatui:messages:*` persist in IndexedDB behind a sync mirror (ordered write-behind;
+  tests/SSR without IndexedDB transparently use localStorage). Touch them only via
+  `readBigKey`/`writeBigKey`/`removeBigKey`/`listBigKeys` — never raw localStorage.
+  Boot preloads + sweeps stragglers in `main.tsx`; mirror writes mark sync-dirty via a
+  listener sync.ts registers (sync's own applies pass `dirty:false`); quota evictions
+  never sync. Local reset (Account → Data) suspends the storage hook during the wipe
+  so cleared keys can't upload tombstones, then reloads into a fresh-link pull.
 - **Custom Tauri commands need no capabilities entries** (mirrors `http_fetch`).
   Command return values serialize as-is — use `#[serde(rename_all = "camelCase")]`
   (see `HttpFetchResponse`, `PythonRunResult` and their unit tests).

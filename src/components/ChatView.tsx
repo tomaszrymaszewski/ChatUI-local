@@ -29,6 +29,7 @@ import {
   SquareTerminal,
   Globe,
   GraduationCap,
+  Workflow,
   Loader2,
   Menu,
   UsersRound,
@@ -235,7 +236,7 @@ type PendingFile = MessageAttachment & { file?: File };
  * from it (isTemporary below), so all existing temporary-message logic keeps
  * working untouched.
  */
-type ChatMode = "none" | "temporary" | "learn" | "research" | "council";
+type ChatMode = "none" | "temporary" | "learn" | "research" | "council" | "task";
 
 const WELCOME_PROMPTS = [
   "What do you want to know?",
@@ -276,7 +277,7 @@ const WIDGETS_RESERVED_PX = 312;
 
 export function ChatView() {
   const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
-  const { sessions, allSessions, createSession, deleteSession, updateSession, moveToAgentTab } =
+  const { sessions, allSessions, createSession, deleteSession, updateSession, moveToChatTab } =
     useSessions(activeTab);
   const { projects, createProject, updateProject, deleteProject, addProjectFile, deleteProjectFile, addProjectImage, deleteProjectImage, refetch: refetchProjects } =
     useProjects();
@@ -574,10 +575,10 @@ export function ChatView() {
   );
 
   /**
-   * Agent-mode run context for a session in the Agents tab: standalone tasks
-   * run as full task-manager agents; saved-agent sessions run sandboxed on
-   * the agent's own prompt/skills/connectors, restricted to its workspace +
-   * user-granted folders/projects; setup chats run the builder.
+   * Agent-style run context: saved-agent sessions run sandboxed on the
+   * agent's own prompt/skills/connectors, restricted to its workspace +
+   * user-granted folders/projects; setup chats run the builder; no agent
+   * (chat-tab Task mode) runs the full task-manager agent.
    *
    * Async because resolving the sandbox touches the filesystem (workspace).
    */
@@ -1122,8 +1123,10 @@ export function ChatView() {
     const text = (overrideText ?? inputText).trim();
     if ((!text && files.length === 0) || agent?.isRunning) return;
 
-    // Agent-mode runs (tasks, saved agents, builder setup) never run the
-    // research/council pipelines and never see the chat-tab modes.
+    // Agent-style runs — agent-tab sessions plus chat-tab Task mode — run
+    // isolated from universal memory and never run the research/council
+    // pipelines. Task mode reuses the standalone task context, so a task runs
+    // the same as it did on the Agents tab.
     const arc = isAgentTab
       ? await agentRunContext({
           agentId:
@@ -1134,7 +1137,9 @@ export function ChatView() {
             ? !!overrides.setup
             : pendingSetup || activeSession?.isSetup === true,
         })
-      : null;
+      : chatMode === "task"
+        ? await agentRunContext({})
+        : null;
     // Saved agents may pin their own model; otherwise the composer's model.
     const runModelName = arc?.model ?? selectedModel;
     const provider = runModelName ? findProviderForModel(runModelName) : null;
@@ -1502,7 +1507,9 @@ export function ChatView() {
           agentId: activeSession?.agentId,
           isSetup: activeSession?.isSetup === true,
         })
-      : null;
+      : chatMode === "task"
+        ? await agentRunContext({})
+        : null;
     const runModelName = arc?.model ?? selectedModel;
     const provider = runModelName ? findProviderForModel(runModelName) : null;
     if (!provider) {
@@ -1614,7 +1621,9 @@ export function ChatView() {
           agentId: activeSession?.agentId,
           isSetup: activeSession?.isSetup === true,
         })
-      : null;
+      : chatMode === "task"
+        ? await agentRunContext({})
+        : null;
     const runModelName = arc?.model ?? selectedModel;
     const provider = runModelName ? findProviderForModel(runModelName) : null;
     if (!provider) {
@@ -1832,34 +1841,58 @@ export function ChatView() {
   // ── Agents tab navigation ───────────────────────────────────────────────
 
   /**
-   * Move a chat-tab session to the Agents tab as a task. The message store is
-   * keyed by session id, so the entire conversation carries over; the session
-   * keeps appearing in the chat sidebar grayed out with a redirect notice.
+   * Assign an agent-tab session to an agent — or unassign it ("Remove from
+   * agent"), which moves the session to the Chat tab as a task-mode chat:
+   * the Agents tab only holds sessions with an agent assigned. The user
+   * follows a moved session to its new home.
    */
-  const switchToAgentMode = async (id: string) => {
-    const target = sessions.find((s) => s.id === id);
-    if (!target || target.type !== "chat" || target.movedToAgent) return;
-    if (runningIds.has(id)) {
-      toast.error("Wait for the current run to finish before switching.");
+  const handleMoveSessionToAgent = async (sessionId: string, agentId: string | null) => {
+    if (agentId) {
+      await updateSession(sessionId, { agent_id: agentId });
       return;
     }
-    await moveToAgentTab(id);
-    if (activeSessionId === id) {
-      // The moved session becomes the agent tab's active session; the chat
-      // tab drops it. Chat modes never apply on the agent tab.
-      setActiveSessionByTab((prev) => ({ ...prev, chat: null, agent: id }));
-      setChatMode("none");
-      autoModeRef.current = "none";
-    } else {
-      setActiveSessionByTab((prev) => ({ ...prev, agent: id }));
+    const target = sessions.find((s) => s.id === sessionId);
+    if (!target || target.type !== "agent" || !target.agentId) return;
+    if (runningIds.has(sessionId)) {
+      toast.error("Wait for the current run to finish before moving it.");
+      return;
     }
+    await moveToChatTab(sessionId);
+    setActiveSessionByTab((prev) => ({
+      chat: sessionId,
+      agent: prev.agent === sessionId ? null : prev.agent,
+    }));
+    setPendingAgentId(null);
+    setPendingSetup(false);
+    setActiveAgentConsoleId(null);
+    setActiveTab("chat");
+    setAgentConsoleFocus("session");
+    applySessionChatMode(sessionId);
+    setView("chat");
+    toast.success("Moved to Chats as a task");
+  };
+
+  /**
+   * Dashboard "New Task": unassigned tasks live on the Chat tab now, so this
+   * arms a fresh task-mode chat there — Task mode on, typed text carried
+   * over — instead of sending. The user reviews and sends from the chat tab.
+   */
+  const startChatTask = (text: string) => {
+    if (activeSessionId) {
+      deleteTemporaryMessages(activeSessionId);
+    }
+    setActiveSessionByTab((prev) => ({ ...prev, chat: null }));
+    setActiveProjectId(null);
     setPendingProjectId(null);
     setPendingAgentId(null);
     setPendingSetup(false);
-    setActiveTab("agent");
+    setActiveAgentConsoleId(null);
+    setActiveTab("chat");
     setAgentConsoleFocus("session");
+    setChatMode("task");
+    autoModeRef.current = "none";
+    setInputText(text);
     setView("chat");
-    toast.success("Conversation moved to the Agents tab");
   };
 
   /** Open a moved session from the chat-tab redirect notice. */
@@ -2216,6 +2249,13 @@ export function ChatView() {
         <UsersRound />,
         "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
       )}
+      {modeToggle(
+        "task",
+        "Agentic",
+        "Agentic mode - plan and execute hands-on work with terminal, coding agents, and file deliverables",
+        <Workflow />,
+        "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
+      )}
     </>
   );
 
@@ -2523,7 +2563,7 @@ export function ChatView() {
         onNewChat={handleNewChat}
         onDeleteChat={handleDeleteSession}
         onRenameChat={(id, title) => updateSession(id, { title })}
-        onMoveSessionToAgent={(id, agentId) => updateSession(id, { agent_id: agentId })}
+        onMoveSessionToAgent={handleMoveSessionToAgent}
         onSettings={openSettings}
         onSettingsTabChange={setSettingsTab}
         onExitSettings={() => setView("chat")}
@@ -2532,7 +2572,6 @@ export function ChatView() {
         onComingSoon={comingSoon}
         onTabChange={switchTab}
         onOpenDashboard={handleOpenDashboard}
-        onSwitchToAgent={switchToAgentMode}
         agents={agents}
         onOpenAgentConsole={handleOpenAgentConsole}
         onStartAgentSession={handleStartAgentSession}
@@ -3232,11 +3271,6 @@ export function ChatView() {
                         autoModeRef.current = "none";
                         if (activeSessionId) updateSession(activeSessionId, { chat_mode: mode });
                       }}
-                      onSwitchToAgent={
-                        !isAgentTab && activeSessionId
-                          ? () => void switchToAgentMode(activeSessionId)
-                          : undefined
-                      }
                       onApplyAgentConfig={handleApplyAgentConfig}
                     />
                  ) : (
@@ -3337,12 +3371,6 @@ export function ChatView() {
                           Add files
                           <DropdownMenuShortcut>⌘U</DropdownMenuShortcut>
                         </DropdownMenuItem>
-                        {!isAgentTab && activeSession && !activeSession.movedToAgent && (
-                          <DropdownMenuItem onClick={() => void switchToAgentMode(activeSession.id)}>
-                            <Bot />
-                            Switch to Agent Mode
-                          </DropdownMenuItem>
-                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                     {currentProjectName && (
@@ -3784,6 +3812,12 @@ export function ChatView() {
              onOpenAgentConsole={handleOpenAgentConsole}
              onSelectSession={selectSession}
               onSend={(mode: DashboardComposeMode, agentId, text) => {
+                // Unassigned tasks live on the Chat tab — "New Task" arms a
+                // task-mode chat there instead of sending from the dashboard.
+                if (mode === "task") {
+                  startChatTask(text);
+                  return;
+                }
                 void handleSend(text, {
                   agentId: mode === "session" ? agentId : undefined,
                   setup: mode === "agent",
@@ -3829,11 +3863,6 @@ export function ChatView() {
                       autoModeRef.current = "none";
                       if (activeSessionId) updateSession(activeSessionId, { chat_mode: mode });
                     }}
-                    onSwitchToAgent={
-                      !isAgentTab && activeSessionId
-                        ? () => void switchToAgentMode(activeSessionId)
-                        : undefined
-                    }
                     onApplyAgentConfig={handleApplyAgentConfig}
                   />
               ) : (
@@ -4168,8 +4197,17 @@ export function ChatView() {
       autoModeRef.current = "none";
     }
 
-    const mode: AgentMode =
-      chatMode === "research" ? "research" : chatMode === "council" ? "council" : "chat";
+    // Task mode runs the standalone task context, isolated from universal
+    // memory like any agent-style run (see handleSend).
+    const arc = chatMode === "task" ? await agentRunContext({}) : null;
+
+    const mode: AgentMode = arc
+      ? arc.mode
+      : chatMode === "research"
+        ? "research"
+        : chatMode === "council"
+          ? "council"
+          : "chat";
 
     try {
       const newSession = createSession(instantChatTitle(text), activeProject?.id);
@@ -4181,8 +4219,8 @@ export function ChatView() {
 
       updateSession(newSession.id, { chat_mode: chatMode });
 
-      const memoryContext = settings.autoMemory ? await buildMemoryContext(activeProject?.id ?? null, text) : "";
-      const learnContext = chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
+      const memoryContext = !arc && settings.autoMemory ? await buildMemoryContext(activeProject?.id ?? null, text) : "";
+      const learnContext = !arc && chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
 
       // The project's uploads (persisted files/images) are part of the context
       // of every conversation in it — this one included.
@@ -4208,13 +4246,15 @@ export function ChatView() {
 
       // currentProjectInstructions is derived from the session's project,
       // which doesn't exist yet on this first message — use the open project.
-      const effectiveInstructions = [
-        activeProject?.instructions,
-        projectFilesText,
-        learnContext,
-        memoryContext,
-      ]
-        .filter(Boolean).join("\n\n") || undefined;
+      const effectiveInstructions = arc
+        ? [arc.instructions, projectFilesText].filter(Boolean).join("\n\n") || undefined
+        : [
+            activeProject?.instructions,
+            projectFilesText,
+            learnContext,
+            memoryContext,
+          ]
+            .filter(Boolean).join("\n\n") || undefined;
 
       const ctrl = getAgentController(newSession.id);
 
@@ -4266,6 +4306,7 @@ export function ChatView() {
           mode,
           webFetchEnabled,
           projectDir: currentProjectDirectory,
+          taskProfile: arc?.taskProfile,
           availableModels: allModels.map((m) => ({ name: m.name, providerId: m.providerId, displayName: m.displayName })),
           providers,
         });
@@ -4300,7 +4341,7 @@ export function ChatView() {
           .catch(() => {});
         }
 
-        if (settings.autoMemory && !isTemporary && result.content) {
+        if (!arc && settings.autoMemory && !isTemporary && result.content) {
           void extractAndSaveMemory(provider, selectedModel, text, result.content, "global", loadMemory("global"), newSession.id).catch(() => {});
           if (activeProject?.id) {
             void extractAndSaveMemory(provider, selectedModel, text, result.content, activeProject.id, loadMemory(activeProject.id), newSession.id).catch(() => {});

@@ -138,3 +138,21 @@ export async function deleteFileBlob(id: string): Promise<void> {
 export function isFileStorePersistent(): boolean {
   return typeof indexedDB !== "undefined";
 }
+
+/** Remove every stored file (used by local-data reset). Never throws. */
+export async function clearAttachmentStore(): Promise<void> {
+  memoryStore.clear();
+  const db = await openDb();
+  if (!db) return;
+  try {
+    const tx = db.transaction(STORE, "readwrite");
+    tx.objectStore(STORE).clear();
+    await new Promise<void>((resolve) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    });
+  } catch {
+    // ignore
+  }
+}

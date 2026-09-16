@@ -1,28 +1,45 @@
 import { useEffect, useState, useCallback } from "react";
 import type { ChatSession, ReasoningEffort, SessionChatMode } from "@/types";
-import { trySetItem } from "@/lib/storage-pressure";
+import { readBigKey, writeBigKey } from "@/lib/idb-store";
+import { deleteSessionMessageStore } from "./use-messages";
 
 const STORAGE_KEY = "chatui:sessions";
 const SESSIONS_EVENT = "chatui:sessions-changed";
 
+export interface StoredSession {
+  id: string;
+  title: string;
+  updatedAt: string;
+  projectId?: string;
+  type: "chat" | "agent";
+  isTemporary?: boolean;
+  chatMode?: SessionChatMode;
+  reasoningEffort?: ReasoningEffort;
+  agentId?: string;
+  isSetup?: boolean;
+  movedToAgent?: boolean;
+}
+
+/**
+ * Standalone tasks used to live on the Agents tab as agent sessions with no
+ * agent assigned; they are chat-tab sessions with chatMode "task" now. The
+ * rewrite is data-driven (no flag) so it also heals downgrade/re-upgrade and
+ * pre-move cloud rows: every load maps the old shape to the new one, and the
+ * next persist writes it back. Idempotent — migrated records pass through.
+ */
+export function migrateSessionRecord(s: StoredSession): StoredSession {
+  if (s.type === "agent" && !s.agentId && !s.isSetup) {
+    return { ...s, type: "chat", chatMode: "task", movedToAgent: undefined };
+  }
+  return s;
+}
+
 function loadSessions(): ChatSession[] {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = readBigKey(STORAGE_KEY);
     if (!raw) return [];
-    const data = JSON.parse(raw) as Array<{
-      id: string;
-      title: string;
-      updatedAt: string;
-      projectId?: string;
-      type: "chat" | "agent";
-      isTemporary?: boolean;
-      chatMode?: SessionChatMode;
-      reasoningEffort?: ReasoningEffort;
-      agentId?: string;
-      isSetup?: boolean;
-      movedToAgent?: boolean;
-    }>;
-    return data.map((s) => ({
+    const data = JSON.parse(raw) as StoredSession[];
+    return data.map((s) => migrateSessionRecord(s)).map((s) => ({
       id: s.id,
       title: s.title,
       updatedAt: new Date(s.updatedAt),
@@ -48,7 +65,7 @@ function loadSessions(): ChatSession[] {
  */
 function saveSessions(sessions: ChatSession[]) {
   try {
-    trySetItem(
+    writeBigKey(
       STORAGE_KEY,
       JSON.stringify(
         sessions.map((s) => ({
@@ -78,9 +95,10 @@ export function subscribeToSessionChanges(fn: () => void): () => void {
 }
 
 /**
- * Create an agent-mode session straight from storage — used by headless runs
+ * Create a session straight from storage — used by headless runs
  * (scheduler/workflows) which have no React tree. Fires the change event so
- * open sidebars pick the session up.
+ * open sidebars pick the session up. Runs with no agent assigned land on the
+ * Chat tab as task-mode chats; only agent-assigned runs get agent sessions.
  */
 export function createAgentSessionHeadless(
   title: string,
@@ -90,8 +108,9 @@ export function createAgentSessionHeadless(
     id: crypto.randomUUID(),
     title,
     updatedAt: new Date(),
-    type: "agent",
+    type: agentId ? "agent" : "chat",
     isTemporary: false,
+    chatMode: agentId ? undefined : "task",
     agentId,
   };
   saveSessions([session, ...loadSessions()]);
@@ -172,6 +191,9 @@ export function useSessions(type: "chat" | "agent") {
   const deleteSession = useCallback(
     async (id: string) => {
       persistSessions((prev) => prev.filter((s) => s.id !== id));
+      // Drop the message store too — older versions left it behind and the
+      // orphans accumulated forever.
+      deleteSessionMessageStore(id);
     },
     [persistSessions],
   );
@@ -217,17 +239,25 @@ export function useSessions(type: "chat" | "agent") {
   );
 
   /**
-   * Move a chat session to the Agents tab (type "agent" + movedToAgent flag).
-   * The messages store is keyed by session id, so the conversation carries
-   * over untouched. Called from the chat tab; the agent tab picks the session
-   * up from storage when it becomes active.
+   * Move an agent session to the Chat tab as a task-mode chat (type "chat" +
+   * chatMode "task", assignment cleared). The messages store is keyed by
+   * session id, so the conversation carries over untouched. Called from the
+   * agent tab ("Remove from agent"); the chat tab picks the session up from
+   * storage when it becomes active.
    */
-  const moveToAgentTab = useCallback(
+  const moveToChatTab = useCallback(
     async (id: string) => {
       persistSessions((prev) =>
         prev.map((s) =>
           s.id === id
-            ? { ...s, type: "agent", movedToAgent: true, updatedAt: new Date() }
+            ? {
+                ...s,
+                type: "chat",
+                agentId: undefined,
+                movedToAgent: undefined,
+                chatMode: "task",
+                updatedAt: new Date(),
+              }
             : s,
         ),
       );
@@ -247,7 +277,7 @@ export function useSessions(type: "chat" | "agent") {
     ));
   }, [type]);
 
-  return { sessions, allSessions, loading, createSession, deleteSession, updateSession, moveToAgentTab, refetch };
+  return { sessions, allSessions, loading, createSession, deleteSession, updateSession, moveToChatTab, refetch };
 }
 
 /**

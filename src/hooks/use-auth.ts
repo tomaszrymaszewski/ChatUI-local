@@ -3,6 +3,8 @@ import type { User } from "@supabase/supabase-js";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { getSupabase, isSupabaseConfigured, resetSupabaseClient } from "@/lib/supabase";
+import { clearBigStores } from "@/lib/idb-store";
+import { clearAttachmentStore } from "@/lib/attachment-store";
 import { OAUTH_REDIRECT_TO, parseOAuthCallback } from "@/lib/oauth-callback";
 import { isTauri } from "@/lib/platform";
 
@@ -172,6 +174,9 @@ export function useAuth() {
         if (key && /^chatui/.test(key)) doomed.push(key);
       }
       for (const key of doomed) localStorage.removeItem(key);
+      // Big keys + attachment blobs live outside localStorage.
+      await clearBigStores();
+      await clearAttachmentStore();
     } catch {
       // Storage unreadable — nothing more we can do locally.
     }

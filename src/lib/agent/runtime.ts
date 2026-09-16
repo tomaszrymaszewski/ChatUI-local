@@ -194,11 +194,11 @@ Skills and connectors — proactive discovery:
 - Never suggest something that is already installed or connected (the search results show status).
 - After calling suggest, continue your reply naturally — the card is shown to the user automatically.
 
-Agent mode — handing off hands-on work:
-- When the conversation clearly turns into a task the Agents tab handles better — running terminal
+Task mode — handing off hands-on work:
+- When the conversation clearly turns into hands-on work — running terminal
   commands, editing local files, multi-step local execution, or producing a deliverable that needs
-  tools the chat doesn't have — call suggest with kind=agent_mode and target="task". The card moves
-  this conversation to the Agents tab with its full history. Only suggest this once per
+  tools the chat doesn't have — call suggest with kind=mode and target="task". The card turns on
+  Task mode for this conversation with its full history. Only suggest this once per
   conversation, and never when you can already complete the request yourself.
 `.trim();
 

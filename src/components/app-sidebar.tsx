@@ -164,7 +164,6 @@ export function AppSidebar({
   onComingSoon,
   onTabChange,
   onOpenDashboard,
-  onSwitchToAgent,
   agents = [],
   onOpenAgentConsole,
   onStartAgentSession,
@@ -207,7 +206,6 @@ export function AppSidebar({
   onComingSoon?: (feature: string) => void
   onTabChange?: (tab: "chat" | "agent") => void
   onOpenDashboard?: () => void
-  onSwitchToAgent?: (id: string) => void
   agents?: AgentDefinition[]
   onOpenAgentConsole?: (agentId: string) => void
   onStartAgentSession?: (agentId: string) => void
@@ -490,7 +488,6 @@ export function AppSidebar({
               onSelect={onSelectSession}
               onDelete={onDeleteChat}
               onRename={onRenameChat}
-              onSwitchToAgent={onSwitchToAgent}
               projects={projects}
               label="Recent"
               runningIds={runningIds}

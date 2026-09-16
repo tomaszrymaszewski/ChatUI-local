@@ -1,6 +1,7 @@
 import { unzipSync, strFromU8 } from "fflate";
 import type { Message } from "@/types";
 import { setItemOrThrowFriendly } from "./storage-pressure";
+import { isBigKey, listBigKeys, readBigKey, removeBigKey, writeBigKey } from "./idb-store";
 
 // Data export/import: full AI Studio backups (a snapshot of every chatui* localStorage
 // key — chats, agents, projects, providers, settings, schedules, workflows,
@@ -27,7 +28,7 @@ interface PortableSession {
 
 function readJson<T>(key: string, fallback: T): T {
   try {
-    const raw = localStorage.getItem(key);
+    const raw = isBigKey(key) ? readBigKey(key) : localStorage.getItem(key);
     if (!raw) return fallback;
     return JSON.parse(raw) as T;
   } catch {
@@ -116,6 +117,14 @@ export function exportChatUiBackup(): string {
       if (value !== null) data[key] = value;
     }
   }
+  // Big keys live in the IDB mirror — read them last so the mirror wins over
+  // any localStorage straggler.
+  for (const prefix of ["chatui:sessions", "chatui:messages:"]) {
+    for (const key of listBigKeys(prefix)) {
+      const value = readBigKey(key);
+      if (value !== null) data[key] = value;
+    }
+  }
   return JSON.stringify({ __chatui_export__: true, version: 3, data }, null, 2);
 }
 
@@ -126,7 +135,10 @@ function restoreChatUiBackup(parsed: { data?: unknown }): void {
   }
   for (const [key, value] of Object.entries(data as Record<string, string | null>)) {
     if (value === null) {
-      localStorage.removeItem(key);
+      if (isBigKey(key)) removeBigKey(key);
+      else localStorage.removeItem(key);
+    } else if (isBigKey(key)) {
+      writeBigKey(key, value);
     } else {
       setItemOrThrowFriendly(key, value);
     }
@@ -367,7 +379,7 @@ function mergeImportedSessions(
   for (const s of newSessions) {
     if (!ids.has(s.id)) stored.push(s);
   }
-  setItemOrThrowFriendly(SESSIONS_KEY, JSON.stringify(stored));
+  writeBigKey(SESSIONS_KEY, JSON.stringify(stored));
   window.dispatchEvent(new Event(SESSIONS_EVENT));
   window.dispatchEvent(new Event(MESSAGES_EVENT));
 }
@@ -398,7 +410,7 @@ function persistImportedThread(
     parent_id: i === 0 ? null : finalIds[i - 1],
     is_temporary: false,
   }));
-  setItemOrThrowFriendly(`${MESSAGES_KEY_PREFIX}${sessionId}`, JSON.stringify(records));
+  writeBigKey(`${MESSAGES_KEY_PREFIX}${sessionId}`, JSON.stringify(records));
   return records[records.length - 1].timestamp;
 }
 

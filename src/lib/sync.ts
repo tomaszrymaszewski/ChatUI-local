@@ -2,6 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { getSupabase } from "@/lib/supabase";
 import { decryptFromSync, encryptForSync, isSyncEnvelope } from "@/lib/sync-crypto";
 import { trySetItem } from "./storage-pressure";
+import {
+  isBigKey,
+  listBigKeys,
+  readBigKey,
+  removeBigKey,
+  setBigStoreDirtyListener,
+  writeBigKey,
+} from "./idb-store";
 import { chatUiBaseDir } from "@/lib/agent/sandbox";
 import { isTauri } from "@/lib/platform";
 import { exportChatUiBackup } from "@/lib/data-transfer";
@@ -60,6 +68,7 @@ const SYNC_EXCLUDED = new Set([
   "chatui:messages:recency", // quota-eviction index, meaningless elsewhere
   "chatui:mcp:migrated", // one-time migration flag
   "chatui:agents:paths-remapped", // one-time migration flag
+  "chatui:sync:code-acknowledged", // one-time "saved the code" flag
 ]);
 
 export function isSyncedKey(key: string): boolean {
@@ -141,7 +150,26 @@ function readLocal(): Map<string, string> {
   } catch {
     // Storage unreadable — sync with whatever was collected.
   }
+  // Big keys (sessions, message stores) live in the IDB mirror — read them
+  // last so the mirror wins over any localStorage straggler.
+  for (const prefix of ["chatui:sessions", "chatui:messages:"]) {
+    for (const key of listBigKeys(prefix)) {
+      if (!isSyncedKey(key)) continue;
+      const value = readBigKey(key);
+      if (value !== null) out.set(key, value);
+    }
+  }
   return out;
+}
+
+/** Sync-apply one big key. Never throws — false keeps today's stale-key path. */
+function tryWriteBigKey(key: string, value: string): boolean {
+  try {
+    writeBigKey(key, value, { dirty: false });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Deep merge (sessions + message stores) ────────────────────────────────
@@ -543,14 +571,16 @@ export async function syncNow(
 
   for (const { key, value } of plan.toLocal) {
     // trySetItem evicts rebuildable caches under quota pressure first.
-    if (!trySetItem(key, value)) {
+    const ok = isBigKey(key) ? tryWriteBigKey(key, value) : trySetItem(key, value);
+    if (!ok) {
       // Quota pressure — the key stays stale locally; meta still advances so
       // we don't flap. The next successful write re-syncs by hash.
     }
   }
   for (const key of plan.deleteLocal) {
     try {
-      localStorage.removeItem(key);
+      if (isBigKey(key)) removeBigKey(key, { dirty: false });
+      else localStorage.removeItem(key);
     } catch {
       // Ignore; same reasoning as above.
     }
@@ -686,6 +716,29 @@ let storageHookInstalled = false;
 const dirtySince = new Map<string, string>();
 /** The live manager's push scheduler (replaced on every start/stop). */
 let currentSchedulePush: (() => void) | null = null;
+/**
+ * Suspended during local-data reset wipes: cleared keys must pass through to
+ * raw storage WITHOUT dirty-marking or scheduling pushes, or the wipe would
+ * upload tombstones and delete the cloud copy too.
+ */
+let hookSuspended = false;
+
+/** Suspend/resume sync dirty-tracking (see hookSuspended). */
+export function setStorageHookSuspended(suspended: boolean): void {
+  hookSuspended = suspended;
+}
+
+/**
+ * Mark a key locally-dirty from anywhere — the storage hook below and the
+ * IDB mirror, which the hook can't see. Honors suspension (local reset).
+ */
+export function markSyncedKeyDirty(key: string): void {
+  if (hookSuspended || !isSyncedKey(key)) return;
+  dirtySince.set(key, new Date().toISOString());
+  currentSchedulePush?.();
+}
+
+setBigStoreDirtyListener(markSyncedKeyDirty);
 
 function installStorageHook(): void {
   if (storageHookInstalled) return;
@@ -694,17 +747,11 @@ function installStorageHook(): void {
   const rawRemove = localStorage.removeItem.bind(localStorage);
   localStorage.setItem = (key: string, value: string) => {
     rawSet(key, value);
-    if (isSyncedKey(key)) {
-      dirtySince.set(key, new Date().toISOString());
-      currentSchedulePush?.();
-    }
+    markSyncedKeyDirty(key);
   };
   localStorage.removeItem = (key: string) => {
     rawRemove(key);
-    if (isSyncedKey(key)) {
-      dirtySince.set(key, new Date().toISOString());
-      currentSchedulePush?.();
-    }
+    markSyncedKeyDirty(key);
   };
 }
 
@@ -716,7 +763,7 @@ function installStorageHook(): void {
  */
 export function startSyncManager(
   backend: SyncBackend,
-  opts?: { onSync?: (result: SyncResult & { error?: string }) => void },
+  opts?: { onSync?: (result: SyncResult & { error?: string; pushOnly?: boolean }) => void },
 ): () => void {
   let stopped = false;
   let pushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -746,7 +793,9 @@ export function startSyncManager(
           const { error } = await pushDirty(backend, dirtySince);
           if (!stopped) {
             if (!error) dirtySince.clear();
-            opts?.onSync?.({ pushed: 0, pulled: 0, deletedLocal: 0, merged: [], undecryptable: [], error });
+            // pushOnly: no fetch ran, so the empty undecryptable list proves
+            // nothing — UI must not treat it as a clean bill of key health.
+            opts?.onSync?.({ pushed: 0, pulled: 0, deletedLocal: 0, merged: [], undecryptable: [], error, pushOnly: true });
           }
         } finally {
           syncing = false;

@@ -52,8 +52,9 @@ function formatBytes(bytes: number) {
 /**
  * The Agents tab's default view — a small mission control: every saved agent
  * with its recent tasks, and a composer pinned to the bottom that starts a
- * task, a new-agent setup, or a session with a picked agent (defaults to the
- * most recent one).
+ * new-agent setup, a session with a picked agent (defaults to the most
+ * recent one), or a standalone task — which hands off to the Chat tab, where
+ * unassigned tasks live as task-mode chats.
  */
 export function AgentDashboard({
   agents,

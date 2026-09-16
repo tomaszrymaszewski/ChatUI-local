@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { appendMessageHeadless, loadMessages } from "./use-messages";
+import { appendMessageHeadless, deleteSessionMessageStore, loadMessages } from "./use-messages";
+import { setBigStoreDirtyListener } from "@/lib/idb-store";
 import type { Message } from "@/types";
 
 // The vitest environment is node — stub storage and window like a browser.
@@ -91,5 +92,25 @@ describe("quota-safe message persistence", () => {
     appendMessageHeadless("s-current", makeMsg("m1"));
     quotaBytes = 0; // nothing else fits, not even after evicting everything
     expect(() => appendMessageHeadless("s-current", makeMsg("m2"))).not.toThrow();
+  });
+});
+
+describe("deleteSessionMessageStore", () => {
+  it("removes the store and marks it dirty so the delete syncs", () => {
+    appendMessageHeadless("s-gone", makeMsg("m1"));
+    expect(storage.has("chatui:messages:s-gone")).toBe(true);
+    const seen: string[] = [];
+    setBigStoreDirtyListener((key) => void seen.push(key));
+    try {
+      deleteSessionMessageStore("s-gone");
+    } finally {
+      setBigStoreDirtyListener(null);
+    }
+    expect(storage.has("chatui:messages:s-gone")).toBe(false);
+    expect(seen).toEqual(["chatui:messages:s-gone"]);
+  });
+
+  it("is a no-op for a missing store", () => {
+    expect(() => deleteSessionMessageStore("nope")).not.toThrow();
   });
 });

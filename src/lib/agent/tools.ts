@@ -46,6 +46,7 @@ import {
   saveWorkflow,
 } from "@/lib/workflows";
 import { webSearch } from "@/lib/agent/web-search";
+import { readBigKey } from "@/lib/idb-store";
 import {
   listInstalledSkills,
   installBundledSkill,
@@ -747,16 +748,18 @@ export function buildAgentTools(
           "Show the user an actionable suggestion card in place of the text composer. " +
           "Use after search_skills or search_connectors finds something useful that isn't " +
           "installed/connected yet, when the user's request would benefit from a mode " +
-          "(research, discuss, learn), when the conversation has become a hands-on task " +
-          "(running commands, editing files, multi-step local work) that the Agents tab " +
-          "should take over (kind=agent_mode), or when a change to YOUR OWN agent settings " +
+          "(research, discuss, learn, task — use 'task' when the conversation has become " +
+          "hands-on work with terminal commands, file edits, or multi-step local execution), " +
+          "or when a change to YOUR OWN agent settings " +
           "would help (kind=agent_config with an agent_patch — the user gets a one-click " +
-          "Apply card). The card has a button to install/connect/enable/switch/apply and a " +
+          "Apply card). The card has a button to install/connect/enable/apply and a " +
           "dismiss option. Call this instead of just mentioning the suggestion in prose.",
         schema: z.object({
+          // kind=agent_mode is a legacy alias for kind=mode target="task"
+          // (kept so in-flight suggestions still render); never emit it.
           kind: z.enum(["skill", "connector", "mode", "agent_mode", "agent_config"]),
           target: z.string().describe(
-            "For skill: the skill name (e.g. 'docx'). For connector: the catalog id (e.g. 'zapier'). For mode: 'research', 'council', or 'learn'. For agent_mode: 'task'. For agent_config: your own agent id from the configuration section of your prompt.",
+            "For skill: the skill name (e.g. 'docx'). For connector: the catalog id (e.g. 'zapier'). For mode: 'research', 'council', 'learn', or 'task'. For agent_config: your own agent id from the configuration section of your prompt.",
           ),
           title: z.string().describe("Short headline for the card, e.g. 'Install Word Documents skill'."),
           reason: z.string().describe("1-2 sentences explaining why this is being suggested."),
@@ -1261,7 +1264,7 @@ export function buildAgentTools(
             }
             let sessions: StoredSession[] = [];
             try {
-              sessions = JSON.parse(localStorage.getItem("chatui:sessions") ?? "[]");
+              sessions = JSON.parse(readBigKey("chatui:sessions") ?? "[]");
             } catch {
               return "Could not read the chat history.";
             }
@@ -1277,7 +1280,7 @@ export function buildAgentTools(
               let messages: Array<{ role?: string; content?: string }> = [];
               try {
                 messages = JSON.parse(
-                  localStorage.getItem(`chatui:messages:${session_id}`) ?? "[]",
+                  readBigKey(`chatui:messages:${session_id}`) ?? "[]",
                 );
               } catch {
                 return `Could not read the messages of "${session.title}".`;
@@ -1302,7 +1305,7 @@ export function buildAgentTools(
               let snippet = "";
               let raw: string | null = null;
               try {
-                raw = localStorage.getItem(`chatui:messages:${session.id}`);
+                raw = readBigKey(`chatui:messages:${session.id}`);
               } catch {
                 raw = null;
               }

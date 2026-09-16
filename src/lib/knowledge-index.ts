@@ -28,6 +28,7 @@ import { getConnectorToolInfo, type RemoteToolSummary } from "@/lib/mcp-discover
 import { loadAgentDefinitions } from "@/lib/agents";
 import { fetchProviders, type ChatCompletionMessage } from "@/lib/llm";
 import { getModelCapabilities } from "@/lib/model-capabilities";
+import { isBigKey, readBigKey } from "@/lib/idb-store";
 
 export type KnowledgeSourceType =
   | "chat"
@@ -232,7 +233,7 @@ export function diffSourceDocs(
 
 function readJson<T>(key: string, fallback: T): T {
   try {
-    const raw = localStorage.getItem(key);
+    const raw = isBigKey(key) ? readBigKey(key) : localStorage.getItem(key);
     return raw ? (JSON.parse(raw) as T) : fallback;
   } catch {
     return fallback;

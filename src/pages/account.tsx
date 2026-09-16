@@ -11,6 +11,7 @@ import {
   LogOut,
   MessageCircle,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
   Trash2,
   UserRound,
@@ -36,6 +37,10 @@ import { useAuth } from "@/hooks/use-auth";
 import { avatarColorStyle, getAccountProfile, profileInitials } from "@/lib/account-profile";
 import { getSupabase } from "@/lib/supabase";
 import { exportSyncRecoveryCode, importSyncRecoveryCode } from "@/lib/sync-crypto";
+import { setStorageHookSuspended } from "@/lib/sync";
+import { clearAttachmentStore } from "@/lib/attachment-store";
+import { clearBigStores, listBigKeys, readBigKey } from "@/lib/idb-store";
+import { markOnboardingDone } from "@/lib/onboarding";
 
 /** Flat vector scene: an AI chat exchange with model chips. */
 function ChatArt() {
@@ -961,6 +966,162 @@ function SyncEncryptionCard() {
   );
 }
 
+function ResetLocalDataDialog({
+  open,
+  onOpenChange,
+  onReset,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  onReset: () => Promise<void>;
+}) {
+  const [confirm, setConfirm] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [code, setCode] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setConfirm("");
+      setBusy(false);
+      void exportSyncRecoveryCode()
+        .then(setCode)
+        .catch(() => setCode(null));
+    }
+  }, [open ]);
+
+  const canReset = !busy && confirm.trim().toLowerCase() === "reset";
+
+  const copy = async () => {
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      toast.success("Recovery code copied");
+    } catch {
+      toast.error("Couldn't copy — select the code manually");
+    }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <RotateCcw className="size-5" />
+            Reset this device&apos;s local data?
+          </DialogTitle>
+          <DialogDescription>
+            This clears chats, providers, settings, and caches stored on this device only — your
+            cloud data is untouched. The app reloads afterwards and re-downloads everything from
+            your account. You stay signed in. Tip: export a backup first (Settings → Export) —
+            anything that never synced can&apos;t be re-downloaded.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-2">
+          <Label>Save your recovery code first (needed if any cloud data is encrypted)</Label>
+          {code ? (
+            <div className="flex items-center gap-2">
+              <code className="min-w-0 flex-1 truncate rounded-md bg-muted px-2 py-1.5 font-mono text-xs">
+                {code}
+              </code>
+              <Button variant="outline" size="sm" onClick={() => void copy()}>
+                <Copy />
+                Copy
+              </Button>
+            </div>
+          ) : (
+            <p className="text-xs text-muted-foreground">Loading recovery code…</p>
+          )}
+        </div>
+        <div className="grid gap-2">
+          <Label htmlFor="reset-confirm">Type RESET to confirm</Label>
+          <Input
+            id="reset-confirm"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+            placeholder="RESET"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && canReset) {
+                setBusy(true);
+                void onReset().finally(() => setBusy(false));
+              }
+            }}
+          />
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={busy}>
+            Cancel
+          </Button>
+          <Button
+            variant="destructive"
+            disabled={!canReset}
+            onClick={() => {
+              setBusy(true);
+              void onReset().finally(() => setBusy(false));
+            }}
+          >
+            {busy && <Loader2 className="animate-spin" />}
+            Reset and reload
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function LocalResetCard() {
+  const [resetOpen, setResetOpen] = useState(false);
+
+  const doReset = async () => {
+    // Suspend the sync storage hook FIRST: cleared keys must not schedule
+    // tombstone pushes that would wipe the cloud copy too. Reloading resets
+    // module state, so the hook is live again on next launch (with no meta,
+    // the first sync pulls everything instead of pushing deletes).
+    setStorageHookSuspended(true);
+    try {
+      const doomed: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const key = localStorage.key(i);
+        if (key && /^chatui/.test(key)) doomed.push(key);
+      }
+      for (const key of doomed) {
+        try {
+          localStorage.removeItem(key);
+        } catch {
+          // Keep going — a partial wipe still recovers via cloud pull.
+        }
+      }
+      try {
+        markOnboardingDone(); // don't reshow the wizard after a reset
+      } catch {
+        // Harmless — the wizard reshows instead.
+      }
+      await clearAttachmentStore();
+      await clearBigStores();
+    } finally {
+      window.location.reload();
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-2 rounded-xl border p-3">
+      <span className="flex items-center gap-2 text-sm font-medium">
+        <RotateCcw className="size-4" />
+        Reset local data
+      </span>
+      <p className="text-xs leading-relaxed text-muted-foreground">
+        Clears everything stored on this device and re-downloads it from your account. Use this
+        when local data seems stuck or corrupted — your cloud data is never touched.
+      </p>
+      <div>
+        <Button variant="outline" size="sm" onClick={() => setResetOpen(true)}>
+          Reset local data…
+        </Button>
+      </div>
+      <ResetLocalDataDialog open={resetOpen} onOpenChange={setResetOpen} onReset={doReset} />
+    </div>
+  );
+}
+
 function DataTab() {
   const [rows, setRows] = useState<StoredRow[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -981,6 +1142,16 @@ function DataTab() {
           updatedAt: "",
           origin: "This device",
         });
+      }
+      // Big keys live in the IDB mirror — include them so the meter and the
+      // per-key list stay truthful after the localStorage migration.
+      for (const prefix of ["chatui:sessions", "chatui:messages:"]) {
+        for (const key of listBigKeys(prefix)) {
+          if (seen.has(key)) continue;
+          const value = readBigKey(key) ?? "";
+          localBytes += value.length;
+          seen.set(key, { key, bytes: value.length, updatedAt: "", origin: "This device" });
+        }
       }
     } catch {
       // Storage unreadable — fall through to the cloud rows.
@@ -1016,6 +1187,7 @@ function DataTab() {
   return (
     <div className="flex flex-col gap-3">
       <SyncEncryptionCard />
+      <LocalResetCard />
       {rows !== null && localTotal > 4_000_000 && (
         <p className="text-xs leading-relaxed text-amber-600 dark:text-amber-500">
           Device storage is nearly full (localStorage caps at ~5 MB) — if sync or saving starts
