@@ -15,6 +15,7 @@ import { embed, embedQuery, cosineSimilarity } from "@/lib/embeddings";
 import { searchKnowledgeIndex } from "@/lib/knowledge-index";
 import { getModelCapabilities } from "@/lib/model-capabilities";
 import { getFileBlob, getFileText, setFileText } from "@/lib/attachment-store";
+import { writeBinaryFile } from "@/lib/deliverables";
 
 interface Attachable {
   name: string;
@@ -26,6 +27,23 @@ export interface PreparedAttachmentContext {
   content: string | ContentPart[];
   blocked: boolean;
   warning?: string;
+}
+
+export interface PrepareAttachmentOptions {
+  /**
+   * Agent runs with disk access: non-image attachments are copied under this
+   * directory and expressed as file paths the agent may read (its sandbox
+   * covers the deliverables folder), instead of inlining their text — the
+   * agent reads what it needs itself. Images are still embedded (vision).
+   * Unset (plain chat runs) or unwritable files fall back to inline text.
+   */
+  filePathsDir?: string;
+}
+
+/** Filesystem-safe name for a materialized attachment: id-prefixed, no separators. */
+function attachmentDiskName(att: { id?: string; name: string }): string {
+  const safe = att.name.replace(/[/\\:]/g, "-").trim() || "file";
+  return `${att.id ?? Math.random().toString(36).slice(2)}-${safe}`;
 }
 
 const INLINE_THRESHOLD = 6000;
@@ -83,6 +101,7 @@ export async function prepareAttachmentContext(
   provider: Provider,
   modelName: string,
   modelLabel?: string,
+  opts?: PrepareAttachmentOptions,
 ): Promise<PreparedAttachmentContext> {
   const rawImages = files.filter((f) => isImageFile(f) && f.file);
   const documents = files.filter((f) => !isImageFile(f) && f.file);
@@ -108,7 +127,21 @@ export async function prepareAttachmentContext(
   const scannedImages: Array<{ name: string; url: string }> = [];
 
   let docContext = "";
+  const pathNotes: string[] = [];
   for (const doc of documents) {
+    // Agent runs with disk access: the file lands in the run's deliverables
+    // folder and is expressed as a path the agent reads itself — its content
+    // is never inlined, so oversized documents cost nothing up front.
+    if (opts?.filePathsDir && doc.file) {
+      const dest = `${opts.filePathsDir}/attachments/${attachmentDiskName(doc)}`;
+      if (await writeBinaryFile(dest, doc.file)) {
+        pathNotes.push(
+          `[Attached file: ${doc.name} (${doc.type || "file"}) — saved on this Mac at: ${dest}. ` +
+            "You have access to this path — read it with read_local_file or your code/shell tools.]",
+        );
+        continue;
+      }
+    }
     const text = await extractFileText(doc.file!);
     if (!text) {
       if (isPdfFile(doc)) {
@@ -126,6 +159,9 @@ export async function prepareAttachmentContext(
       continue;
     }
     docContext += await documentTextContext(doc.name, text, userText);
+  }
+  if (pathNotes.length > 0) {
+    docContext += `\n\n${pathNotes.join("\n\n")}`;
   }
 
   if (scannedImages.length > 0) {

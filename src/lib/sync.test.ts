@@ -9,11 +9,11 @@ import {
   setStorageHookSuspended,
   startSyncManager,
   syncNow,
+  syncRows,
   type RemoteRow,
   type SyncBackend,
   type SyncMeta,
 } from "./sync";
-import { decryptFromSync, encryptForSync, importSyncRecoveryCode, isSyncEnvelope } from "./sync-crypto";
 
 // The vitest environment is node — stub storage and window like a browser.
 const storage = new Map<string, string>();
@@ -313,6 +313,54 @@ describe("planSync", () => {
     expect(plan.toRemote[0].value).toBe(plan.toLocal[0].value);
   });
 
+  it("deep-merges agents so agents from both sides survive", () => {
+    const agent = (id: string, stamp: string) =>
+      JSON.stringify([{ id, name: id, createdAt: stamp, updatedAt: stamp }]);
+    const plan = planSync(
+      new Map([["chatui:agents", agent("a", "2026-09-15T12:00:00Z")]]),
+      [row("chatui:agents", agent("b", "2026-09-15T11:00:00Z"), "2026-09-15T11:00:00Z")],
+      {},
+      NOW,
+    );
+    expect(plan.toLocal).toHaveLength(1);
+    expect(plan.toRemote).toHaveLength(1);
+    const merged = JSON.parse(plan.toLocal[0].value) as Array<{ id: string }>;
+    expect(merged.map((s) => s.id).sort()).toEqual(["a", "b"]);
+    expect(plan.toRemote[0].value).toBe(plan.toLocal[0].value);
+  });
+
+  it("orders same-id agents by updatedAt, falling back to createdAt", () => {
+    const agent = (name: string, createdAt: string, updatedAt?: string) =>
+      JSON.stringify([{ id: "a", name, createdAt, ...(updatedAt ? { updatedAt } : {}) }]);
+    // A newer remote edit wins locally.
+    const newer = planSync(
+      new Map([["chatui:agents", agent("Old", "2026-09-15T10:00:00Z", "2026-09-15T10:00:00Z")]]),
+      [row("chatui:agents", agent("New", "2026-09-15T10:00:00Z", "2026-09-15T11:00:00Z"), "2026-09-15T11:00:00Z")],
+      {},
+      NOW,
+    );
+    expect(newer.toRemote).toEqual([]);
+    expect(JSON.parse(newer.toLocal[0].value)[0].name).toBe("New");
+    // Legacy records without updatedAt still order by createdAt.
+    const legacy = planSync(
+      new Map([["chatui:agents", agent("Local", "2026-09-15T12:00:00Z")]]),
+      [row("chatui:agents", agent("Remote", "2026-09-15T11:00:00Z"), "2026-09-15T11:00:00Z")],
+      {},
+      NOW,
+    );
+    expect(legacy.toLocal).toEqual([]);
+    expect(JSON.parse(legacy.toRemote[0].value)[0].name).toBe("Local");
+    // Exact ties keep the local copy.
+    const tie = planSync(
+      new Map([["chatui:agents", agent("Local", "2026-09-15T10:00:00Z", "2026-09-15T10:00:00Z")]]),
+      [row("chatui:agents", agent("Remote", "2026-09-15T10:00:00Z", "2026-09-15T10:00:00Z"), "2026-09-15T11:00:00Z")],
+      {},
+      NOW,
+    );
+    expect(tie.toLocal).toEqual([]);
+    expect(JSON.parse(tie.toRemote[0].value)[0].name).toBe("Local");
+  });
+
   it("drops meta for keys that left the sync scope", () => {
     const plan = planSync(new Map(), [], { "chatui:onboarding": { hash: "x", syncedAt: "", localChangedAt: "", remoteDeleted: false } }, NOW);
     expect(plan.meta).toEqual({});
@@ -320,11 +368,20 @@ describe("planSync", () => {
 });
 
 describe("syncNow with a fake backend", () => {
-  function fakeBackend(rows: RemoteRow[], opts?: { failPush?: boolean }): SyncBackend & { pushed: Array<{ key: string; value: string; deleted: boolean }> } {
+  function fakeBackend(rows: RemoteRow[], opts?: { failPush?: boolean }): SyncBackend & {
+    pushed: Array<{ key: string; value: string; deleted: boolean }>;
+    fetched: string[];
+  } {
     const pushed: Array<{ key: string; value: string; deleted: boolean }> = [];
+    const fetched: string[] = [];
     return {
       pushed,
-      fetchRows: async () => rows,
+      fetched,
+      fetchManifest: async () => rows.map(({ key, updated_at, deleted }) => ({ key, updated_at, deleted })),
+      fetchRows: async (keys) => {
+        fetched.push(...keys);
+        return rows.filter((r) => keys.includes(r.key));
+      },
       upsertRows: async (upserts) => {
         if (opts?.failPush) throw new Error("offline");
         pushed.push(...upserts);
@@ -395,6 +452,27 @@ describe("syncNow with a fake backend", () => {
     expect(stored.map((s) => s.id).sort()).toEqual(["a", "b"]);
   });
 
+  it("merges agents on first link instead of picking a side", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal("window", {
+      dispatchEvent: (e: Event) => {
+        seen.push(e.type);
+        return true;
+      },
+    });
+    const agent = (id: string, stamp: string) => ({ id, name: id, createdAt: stamp, updatedAt: stamp });
+    storage.set("chatui:agents", JSON.stringify([agent("a", "2026-09-15T12:00:00Z")]));
+    const backend = fakeBackend([
+      row("chatui:agents", JSON.stringify([agent("b", "2026-09-15T11:00:00Z")]), "2026-09-15T11:00:00Z"),
+    ]);
+    const result = await syncNow(backend);
+    expect(result.error).toBeUndefined();
+    expect(result.merged).toEqual(["chatui:agents"]);
+    const stored = JSON.parse(storage.get("chatui:agents") ?? "[]") as Array<{ id: string }>;
+    expect(stored.map((s) => s.id).sort()).toEqual(["a", "b"]);
+    expect(seen).toContain("chatui:agents-changed");
+  });
+
   it("keeps local applies but reports push failures for retry", async () => {
     storage.set("chatui:settings", '{"a":2}');
     const backend = fakeBackend([row("chatui:projects", "[]", "2026-09-15T11:00:00Z")], { failPush: true });
@@ -408,7 +486,7 @@ describe("syncNow with a fake backend", () => {
     expect(meta["chatui:projects"]).toBeDefined();
   });
 
-  it("pushDirty upserts only changed keys plus tombstones, encrypted", async () => {
+  it("pushDirty upserts only changed keys plus tombstones", async () => {
     storage.set("chatui:settings", '{"a":2}');
     storage.set(
       "chatui:sync:meta",
@@ -426,13 +504,12 @@ describe("syncNow with a fake backend", () => {
       ["chatui:settings", false],
       ["chatui:projects", true],
     ]);
-    // Values upload encrypted; tombstones stay empty.
-    expect(isSyncEnvelope(backend.pushed[0].value)).toBe(true);
-    expect(await decryptFromSync(backend.pushed[0].value)).toBe('{"a":2}');
+    // Values upload as plaintext; tombstones stay empty.
+    expect(backend.pushed[0].value).toBe('{"a":2}');
     expect(backend.pushed[1].value).toBe("");
   });
 
-  it("encrypts pushed values and decrypts pulled ones", async () => {
+  it("pushes and pulls plaintext values", async () => {
     storage.set("chatui:providers", '[{"id":"p1","apiKey":"sk-secret"}]');
     const backend = fakeBackend([]);
     const result = await syncNow(backend);
@@ -440,25 +517,20 @@ describe("syncNow with a fake backend", () => {
     expect(result.pushed).toBe(1);
     const uploaded = backend.pushed[0];
     expect(uploaded.key).toBe("chatui:providers");
-    expect(isSyncEnvelope(uploaded.value)).toBe(true);
-    expect(uploaded.value).not.toContain("sk-secret");
-    expect(await decryptFromSync(uploaded.value)).toBe('[{"id":"p1","apiKey":"sk-secret"}]');
+    expect(uploaded.value).toBe('[{"id":"p1","apiKey":"sk-secret"}]');
 
-    // Pulling that same row back lands as plaintext.
+    // Pulling that same row back lands as-is.
     storage.delete("chatui:providers");
     storage.delete("chatui:sync:meta");
     const pull = await syncNow(fakeBackend([row("chatui:providers", uploaded.value, "2026-09-15T11:00:00Z")]));
     expect(pull.error).toBeUndefined();
     expect(pull.pulled).toBe(1);
-    expect(pull.undecryptable).toEqual([]);
     expect(storage.get("chatui:providers")).toBe('[{"id":"p1","apiKey":"sk-secret"}]');
   });
 
-  it("skips undecryptable rows without touching either side", async () => {
-    const envelope = await encryptForSync('{"a":1}'); // sealed under key A…
-    await importSyncRecoveryCode( // …but this device now holds key B.
-      Buffer.from(globalThis.crypto.getRandomValues(new Uint8Array(32))).toString("base64"),
-    );
+  it("ignores legacy encrypted rows, keeping local data and pushing it back", async () => {
+    // An envelope sealed by the old end-to-end encrypted sync — unreadable now.
+    const envelope = JSON.stringify({ v: 1, alg: "A256GCM", iv: "AAAAAAAAAAAAAAAA", ct: "AAAA" });
     storage.set("chatui:settings", '{"local":true}');
     storage.set("chatui:projects", "[]");
     const backend = fakeBackend([
@@ -467,23 +539,94 @@ describe("syncNow with a fake backend", () => {
     ]);
     const result = await syncNow(backend);
     expect(result.error).toBeUndefined();
-    expect(result.undecryptable).toEqual(["chatui:settings"]);
-    expect(storage.get("chatui:settings")).toBe('{"local":true}'); // local kept
-    // The undecryptable key is never pushed either (that would destroy the
-    // other device's copy); only the legacy plaintext upgrade goes up.
-    expect(backend.pushed.map((p) => p.key)).toEqual(["chatui:projects"]);
-    expect(isSyncEnvelope(backend.pushed[0].value)).toBe(true);
+    expect(result.legacyEncrypted).toEqual(["chatui:settings"]);
+    // The ciphertext never lands locally…
+    expect(storage.get("chatui:settings")).toBe('{"local":true}');
+    // …and this device's plaintext overwrites the envelope in the cloud.
+    // The agreeing legacy plaintext row needs no push.
+    expect(backend.pushed.map((p) => [p.key, p.value])).toEqual([
+      ["chatui:settings", '{"local":true}'],
+    ]);
+    const meta = JSON.parse(storage.get("chatui:sync:meta") ?? "{}") as SyncMeta;
+    expect(meta["chatui:settings"].syncedAt).toBe("2026-09-15T12:00:00Z");
   });
 
-  it("re-pushes legacy plaintext rows encrypted once they agree", async () => {
-    storage.set("chatui:settings", '{"a":1}');
-    const backend = fakeBackend([row("chatui:settings", '{"a":1}', "2026-09-15T11:00:00Z")]);
+  it("leaves legacy encrypted rows alone when local has no data for the key", async () => {
+    const envelope = JSON.stringify({ v: 1, alg: "A256GCM", iv: "AAAAAAAAAAAAAAAA", ct: "AAAA" });
+    storage.set("chatui:settings", '{"local":true}');
+    const backend = fakeBackend([row("chatui:agents", envelope, "2026-09-15T11:00:00Z")]);
     const result = await syncNow(backend);
     expect(result.error).toBeUndefined();
-    expect(result.pushed).toBe(1);
+    expect(result.legacyEncrypted).toEqual(["chatui:agents"]);
+    // Nothing pullable and nothing local to overwrite with — no tombstone
+    // either (that would destroy the data on devices that still hold it).
+    expect(backend.pushed.map((p) => p.key)).toEqual(["chatui:settings"]);
+    expect(localStorage.getItem("chatui:agents")).toBeNull();
+  });
+
+  it("pushes tombstones for locally-deleted keys on full sync (restart case)", async () => {
+    // Meta from a previous session; the key was deleted locally while the
+    // debounced push never landed. The unmoved row is still fetched so
+    // planSync can honor the delete (localChangedAt newer → tombstone wins).
+    storage.set(
+      "chatui:sync:meta",
+      JSON.stringify(
+        metaFor({
+          "chatui:projects": {
+            hash: hashValue("[]"),
+            syncedAt: "2026-09-15T10:00:00Z",
+            localChangedAt: "2026-09-15T11:00:00Z",
+          },
+        }),
+      ),
+    );
+    const backend = fakeBackend([row("chatui:projects", "[]", "2026-09-15T10:00:00Z")]);
+    const result = await syncNow(backend);
+    expect(result.error).toBeUndefined();
+    expect(backend.fetched).toEqual(["chatui:projects"]);
+    expect(backend.pushed).toEqual([{ key: "chatui:projects", value: "", deleted: true }]);
+  });
+
+  it("fetches values only for rows that moved since the last reconcile", async () => {
+    // First sync pushes local and records meta against the server timestamp.
+    storage.set("chatui:settings", '{"a":1}');
+    const first = fakeBackend([]);
+    await syncNow(first);
+    expect(first.pushed).toHaveLength(1);
+    // Second sync against the pushed row at its server timestamp: manifest
+    // only — no value fetch, no re-push (unchanged data costs nothing).
+    const second = fakeBackend([row("chatui:settings", '{"a":1}', "2026-09-15T12:00:00Z")]);
+    const result = await syncNow(second);
+    expect(result.error).toBeUndefined();
+    expect(second.fetched).toEqual([]);
+    expect(second.pushed).toEqual([]);
+    expect(result.pushed).toBe(0);
     expect(result.pulled).toBe(0);
-    expect(isSyncEnvelope(backend.pushed[0].value)).toBe(true);
-    expect(await decryptFromSync(backend.pushed[0].value)).toBe('{"a":1}');
+  });
+
+  it("syncRows applies realtime rows, deep-merging like a full sync", async () => {
+    const agent = (id: string, stamp: string) => ({ id, name: id, createdAt: stamp, updatedAt: stamp });
+    storage.set("chatui:agents", JSON.stringify([agent("a", "2026-09-15T12:00:00Z")]));
+    const backend = fakeBackend([]);
+    const result = await syncRows(backend, [
+      row("chatui:agents", JSON.stringify([agent("b", "2026-09-15T11:00:00Z")]), "2026-09-15T11:00:00Z"),
+    ]);
+    expect(result.error).toBeUndefined();
+    expect(result.merged).toEqual(["chatui:agents"]);
+    const stored = JSON.parse(storage.get("chatui:agents") ?? "[]") as Array<{ id: string }>;
+    expect(stored.map((s) => s.id).sort()).toEqual(["a", "b"]);
+    // The union is pushed back so the other device learns this side's records.
+    expect(backend.pushed.map((p) => p.key)).toEqual(["chatui:agents"]);
+  });
+
+  it("syncRows skips legacy encrypted rows", async () => {
+    const envelope = JSON.stringify({ v: 1, alg: "A256GCM", iv: "AAAAAAAAAAAAAAAA", ct: "AAAA" });
+    storage.set("chatui:settings", '{"local":true}');
+    const backend = fakeBackend([]);
+    const result = await syncRows(backend, [row("chatui:settings", envelope, "2026-09-15T11:00:00Z")]);
+    expect(result.legacyEncrypted).toEqual([]);
+    expect(storage.get("chatui:settings")).toBe('{"local":true}');
+    expect(backend.pushed).toEqual([]);
   });
 });
 
@@ -497,6 +640,7 @@ describe("storage hook suspension (local reset)", () => {
     });
     const pushed: Array<{ key: string; value: string; deleted: boolean }> = [];
     const backend: SyncBackend = {
+      fetchManifest: async () => [],
       fetchRows: async () => [],
       upsertRows: async (upserts) => {
         pushed.push(...upserts);
@@ -518,8 +662,7 @@ describe("storage hook suspension (local reset)", () => {
       setStorageHookSuspended(false);
       localStorage.setItem("chatui:settings", '{"a":2}');
       await vi.advanceTimersByTimeAsync(10_000);
-      // Fake timers don't pump Node's crypto threadpool (the push encrypts),
-      // so yield real loop turns until it lands — bounded, fails on a hang.
+      // Yield extra loop turns so the async push settles before asserting.
       for (let i = 0; i < 500 && pushed.length === 0; i++) {
         await new Promise<void>((resolve) => {
           const channel = new MessageChannel();
@@ -550,6 +693,7 @@ describe("onSync result marking", () => {
     });
     const seen: Array<{ pushOnly?: boolean }> = [];
     const backend: SyncBackend = {
+      fetchManifest: async () => [],
       fetchRows: async () => [],
       upsertRows: async (upserts) =>
         upserts.map((u, i) => row(u.key, u.value, `2026-09-15T12:00:0${i}Z`, u.deleted)),
@@ -559,8 +703,7 @@ describe("onSync result marking", () => {
       await vi.advanceTimersByTimeAsync(0); // initial full sync settles
       localStorage.setItem("chatui:settings", '{"a":1}');
       await vi.advanceTimersByTimeAsync(10_000); // debounced push fires
-      // Fake timers don't pump Node's crypto threadpool (the push encrypts),
-      // so yield real loop turns until it lands — bounded, fails on a hang.
+      // Yield extra loop turns so the async push settles before asserting.
       for (let i = 0; i < 500 && seen.length < 2; i++) {
         await new Promise<void>((resolve) => {
           const channel = new MessageChannel();

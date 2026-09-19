@@ -558,6 +558,283 @@ export async function generateChatTitle(
   return title.slice(0, 50);
 }
 
+export interface FollowUpTranscriptEntry {
+  role: string;
+  content: string;
+}
+
+/** Recent exchanges folded into the follow-up prompt (capped in size). */
+const FOLLOWUP_TAKE_MESSAGES = 8;
+const FOLLOWUP_TAKE_CHARS = 400;
+
+/**
+ * Prompt asking for the user's most natural next message in this exact
+ * conversation. Pure (tested) — the network call lives in
+ * generateFollowUpSuggestion.
+ */
+export function buildFollowUpPrompt(
+  transcript: FollowUpTranscriptEntry[],
+  sessionTitle?: string,
+): { system: string; user: string } {
+  const system =
+    "You suggest what the user should say next. Output ONLY one short follow-up message " +
+    "(one sentence, under 20 words) written in the user's voice, continuing THIS conversation's " +
+    "exact topic — names, places, code, and decisions mentioned. No quotes, no explanation, " +
+    "no prefix. If nothing natural follows, output exactly NOTHING.";
+  const lines = transcript
+    .filter((m) => m.content.trim())
+    .slice(-FOLLOWUP_TAKE_MESSAGES)
+    .map(
+      (m) =>
+        `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content.trim().slice(0, FOLLOWUP_TAKE_CHARS)}`,
+    );
+  const user = [
+    sessionTitle?.trim() ? `Chat title: ${sessionTitle.trim().slice(0, 80)}` : "",
+    "Conversation:",
+    ...lines,
+  ]
+    .filter((l) => l !== "")
+    .join("\n");
+  return { system, user };
+}
+
+const FOLLOWUP_LEAK_PHRASES = [
+  "as an ai",
+  "as a language model",
+  "follow-up",
+  "follow up suggestion",
+  "here is",
+  "here's a",
+  "i'm sorry",
+  "i cannot",
+  "nothing",
+];
+
+/**
+ * Clean raw model output into ghost text: first line only, no quotes or
+ * speaker labels, capped. Returns "" when the model declined or leaked.
+ */
+export function cleanFollowUpSuggestion(raw: string, maxChars = 140): string {
+  const firstLine = raw.split("\n")[0]?.trim() ?? "";
+  const unquoted = firstLine.replace(/^["'“”]+|["'“”]+$/g, "").trim();
+  const unlabeled = unquoted
+    .replace(/^(user|you|suggestion|follow-?up)\s*:\s*/i, "")
+    .trim();
+  const single = unlabeled.replace(/\s+/g, " ").trim();
+  if (!single) return "";
+  const lower = single.toLowerCase();
+  if (FOLLOWUP_LEAK_PHRASES.some((p) => lower.includes(p))) return "";
+  return single.slice(0, maxChars).trim();
+}
+
+/**
+ * Prompt asking for tappable answers to the assistant's clarifying question.
+ * Pure (tested) — the network call lives in generateQuestionOptions.
+ */
+export function buildQuestionOptionsPrompt(
+  question: string,
+  transcript: FollowUpTranscriptEntry[],
+): { system: string; user: string } {
+  const system =
+    "The assistant just asked the user a clarifying question. Suggest 1-3 short likely " +
+    "answers (each under 8 words) written in the user's voice, specific to THIS conversation. " +
+    "Output ONLY a JSON array of strings, e.g. [\"Tomorrow morning\", \"Next week\"]. " +
+    "If no natural answers exist, output exactly [].";
+  const lines = transcript
+    .filter((m) => m.content.trim())
+    .slice(-FOLLOWUP_TAKE_MESSAGES)
+    .map(
+      (m) =>
+        `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content.trim().slice(0, FOLLOWUP_TAKE_CHARS)}`,
+    );
+  return {
+    system,
+    user: [...lines, `Question: ${question.trim().slice(0, 800)}`].join("\n"),
+  };
+}
+
+const OPTION_LEAK_PHRASES = [
+  "as an ai",
+  "as a language model",
+  "here is",
+  "here are",
+  "i'm sorry",
+  "i cannot",
+  "it depends",
+];
+
+/**
+ * Parse model output into 1-3 answer options: a JSON array when present,
+ * otherwise one-per-line fallback (bullets, numbering, and quotes stripped).
+ * Empty when nothing usable came back.
+ */
+export function parseQuestionOptions(raw: string, maxOptions = 3): string[] {
+  const text = raw.trim();
+  if (!text) return [];
+  const cleanOne = (s: string): string =>
+    s
+      .trim()
+      .replace(/^(?:[-*•]|\d+[.)])\s+/, "")
+      .replace(/^["'“”]+|["'“”.,;!]+$/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  const viable = (s: string): boolean => {
+    if (!s || s.length > 80) return false;
+    const lower = s.toLowerCase();
+    return !OPTION_LEAK_PHRASES.some((p) => lower.includes(p));
+  };
+  // Prefer an embedded JSON array.
+  const start = text.indexOf("[");
+  const end = text.lastIndexOf("]");
+  if (start !== -1 && end > start) {
+    try {
+      const parsed: unknown = JSON.parse(text.slice(start, end + 1));
+      if (Array.isArray(parsed)) {
+        const out: string[] = [];
+        for (const item of parsed) {
+          if (typeof item !== "string") continue;
+          const c = cleanOne(item);
+          if (viable(c) && !out.includes(c)) out.push(c);
+          if (out.length >= maxOptions) break;
+        }
+        if (out.length > 0) return out;
+      }
+    } catch {
+      // fall through to line parsing
+    }
+  }
+  const out: string[] = [];
+  for (const line of text.split("\n")) {
+    // Skip fences and leftover brackets from a failed JSON parse.
+    if (/^[\s[\]`]+$/.test(line)) continue;
+    const c = cleanOne(line);
+    if (viable(c) && !out.includes(c)) out.push(c);
+    if (out.length >= maxOptions) break;
+  }
+  return out;
+}
+
+/**
+ * Ask the model for tappable answers to the assistant's clarifying question.
+ * Returns [] on any failure — callers simply show no chips.
+ */
+export async function generateQuestionOptions(
+  provider: Provider,
+  model: string,
+  question: string,
+  transcript: FollowUpTranscriptEntry[],
+): Promise<string[]> {
+  let apiKey: string;
+  try {
+    apiKey = await getProviderApiKey(provider.id);
+  } catch {
+    return [];
+  }
+  const baseUrl = provider.baseUrl.replace(/\/$/, "");
+  const url = `${baseUrl}/chat/completions`;
+  const { system, user } = buildQuestionOptionsPrompt(question, transcript);
+  const baseBody: Record<string, unknown> = {
+    model,
+    stream: false,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+  const tryRequest = async (maxField: string): Promise<Response> => {
+    return fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ ...baseBody, [maxField]: 300 }),
+    });
+  };
+  let response: Response;
+  try {
+    response = await tryRequest("max_completion_tokens");
+    if (!response.ok && response.status === 400) {
+      response = await tryRequest("max_tokens");
+    }
+  } catch {
+    return [];
+  }
+  if (!response.ok) return [];
+  try {
+    const data = await response.json();
+    const raw =
+      data.choices?.[0]?.message?.content?.trim() ||
+      data.choices?.[0]?.message?.reasoning_content?.trim() ||
+      "";
+    return parseQuestionOptions(raw);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Ask the model for the user's most personal next message in this
+ * conversation. Returns "" on any failure (offline, no key, bad output) —
+ * callers fall back to the heuristic suggestion.
+ */
+export async function generateFollowUpSuggestion(
+  provider: Provider,
+  model: string,
+  transcript: FollowUpTranscriptEntry[],
+  sessionTitle?: string,
+): Promise<string> {
+  const { system, user } = buildFollowUpPrompt(transcript, sessionTitle);
+  let apiKey: string;
+  try {
+    apiKey = await getProviderApiKey(provider.id);
+  } catch {
+    return "";
+  }
+  const baseUrl = provider.baseUrl.replace(/\/$/, "");
+  const url = `${baseUrl}/chat/completions`;
+  const baseBody: Record<string, unknown> = {
+    model,
+    stream: false,
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+  };
+  // Same max-tokens dance as titles: newer reasoning models require
+  // max_completion_tokens, older endpoints only know max_tokens.
+  const tryRequest = async (maxField: string): Promise<Response> => {
+    return fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({ ...baseBody, [maxField]: 300 }),
+    });
+  };
+  let response: Response;
+  try {
+    response = await tryRequest("max_completion_tokens");
+    if (!response.ok && response.status === 400) {
+      response = await tryRequest("max_tokens");
+    }
+  } catch {
+    return "";
+  }
+  if (!response.ok) return "";
+  try {
+    const data = await response.json();
+    const raw =
+      data.choices?.[0]?.message?.content?.trim() ||
+      data.choices?.[0]?.message?.reasoning_content?.trim() ||
+      "";
+    return cleanFollowUpSuggestion(raw);
+  } catch {
+    return "";
+  }
+}
+
 // ─── Tavily search API key (optional, stored in localStorage) ──────────────
 
 const TAVILY_KEY_STORAGE = "chatui:tavily-key";

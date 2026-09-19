@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  agentSessionIds,
   createAgentSessionHeadless,
+  deleteStoredSessions,
   getSessionChatMode,
   migrateSessionRecord,
 } from "@/hooks/use-sessions";
+import { readBigKey } from "@/lib/idb-store";
+import type { ChatSession } from "@/types";
 import type { StoredSession } from "@/hooks/use-sessions";
 
 // The vitest environment is node — stub localStorage like the browser would.
@@ -140,5 +144,45 @@ describe("createAgentSessionHeadless", () => {
     expect(s.type).toBe("agent");
     expect(s.chatMode).toBeUndefined();
     expect(s.agentId).toBe("agent-1");
+  });
+});
+
+describe("agent deletion cascade", () => {
+  beforeEach(() => {
+    vi.stubGlobal("window", { dispatchEvent: vi.fn() });
+  });
+
+  const row = (id: string, agentId?: string) => ({
+    id,
+    title: `Chat ${id}`,
+    updatedAt: new Date().toISOString(),
+    type: "agent" as const,
+    ...(agentId ? { agentId } : {}),
+  });
+
+  const storedSessions = (): ChatSession[] =>
+    JSON.parse(storage.get("chatui:sessions") ?? "[]");
+
+  it("collects only the deleted agent's sessions", () => {
+    seedSessions([row("s1", "a1"), row("s2", "a1"), row("s3", "a2"), row("s4")]);
+    const loaded: ChatSession[] = storedSessions() as ChatSession[];
+    expect(agentSessionIds(loaded, "a1")).toEqual(["s1", "s2"]);
+    expect(agentSessionIds(loaded, "nobody")).toEqual([]);
+  });
+
+  it("removes the sessions and their message stores, keeping the rest", () => {
+    seedSessions([row("s1", "a1"), row("s2", "a1"), row("s3", "a2"), row("s4")]);
+    storage.set("chatui:messages:s1", JSON.stringify([{ id: "m1" }]));
+    storage.set("chatui:messages:s3", JSON.stringify([{ id: "m3" }]));
+    deleteStoredSessions(["s1", "s2"]);
+    expect(storedSessions().map((s: { id: string }) => s.id)).toEqual(["s3", "s4"]);
+    expect(readBigKey("chatui:messages:s1")).toBeNull();
+    expect(readBigKey("chatui:messages:s3")).not.toBeNull();
+  });
+
+  it("is a no-op for an empty cascade", () => {
+    seedSessions([row("s1", "a1")]);
+    expect(() => deleteStoredSessions([])).not.toThrow();
+    expect(storedSessions()).toHaveLength(1);
   });
 });

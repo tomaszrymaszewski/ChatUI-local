@@ -466,18 +466,24 @@ export function buildAgentTools(
           "Ask the user to fill a short structured form instead of typing free text. Use when a task " +
           "needs specific parameters (e.g. research topic + depth, code task spec, document outline, " +
           "or a project folder — use a 'directory' field so the user gets a folder picker). " +
-          "The composer transforms into the form; the user can always switch back to free text.",
+          "When a question has a small set of likely answers, ask it as a 'select' field with 1-3 " +
+          "options — the form automatically appends a trailing 'Custom…' choice with a free-text box, " +
+          "so never add your own custom/other option. " +
+          "The composer presents the fields one question at a time; the user can always switch back " +
+          "to free text.",
         schema: z.object({
-          title: z.string().describe("Form title, e.g. 'Deep research setup'."),
+          title: z.string().optional().default("A few questions").describe("Form title, e.g. 'Deep research setup'."),
           description: z.string().optional().describe("One-line explanation of why the form is needed."),
           submit_label: z.string().optional().describe("Submit button label, e.g. 'Start research'."),
           fields: z.array(
             z.object({
               name: z.string(),
               label: z.string(),
-              type: z.enum(["text", "textarea", "number", "select", "checkbox", "directory"]),
+              // Unknown kinds (e.g. "radio") fall back to a text field so one
+              // inventive field can't fail the whole call.
+              type: z.enum(["text", "textarea", "number", "select", "checkbox", "directory"]).catch("text"),
               description: z.string().optional(),
-              options: z.array(z.string()).optional().describe("Choices for select fields."),
+              options: z.array(z.string()).optional().describe("1-3 choices for select fields (a Custom… entry is appended automatically)."),
               required: z.boolean().optional(),
               default: z.union([z.string(), z.number(), z.boolean()]).optional(),
             }),
@@ -1605,7 +1611,7 @@ export function buildAgentTools(
             skills: [],
             connectors: input.connectors ?? [],
             capabilities: {
-              terminal: input.terminal ?? false,
+              terminal: input.terminal ?? true,
               web: input.web ?? true,
               computerUse: false,
             },
@@ -1631,7 +1637,7 @@ export function buildAgentTools(
           name: "create_agent",
           description:
             "Create the new agent from the agreed setup. Call exactly once, after the user confirmed " +
-            "the name, purpose, connectors, and capabilities.",
+            "the name, purpose, and connectors (terminal and web access are always on).",
           schema: z.object({
             name: z.string().describe("Short agent name, e.g. 'Invoice Wrangler'."),
             purpose: z.string().describe("One-line description shown in the sidebar."),
@@ -1639,7 +1645,7 @@ export function buildAgentTools(
               .string()
               .describe("The agent's complete system prompt: identity, how it works, its limits."),
             connectors: z.array(z.string()).optional().describe("Connector catalog ids (e.g. 'zapier') to include."),
-            terminal: z.boolean().optional().describe("Whether it may run shell commands / delegate coding (default false)."),
+            terminal: z.boolean().optional().describe("Whether it may run shell commands / delegate coding (default true)."),
             web: z.boolean().optional().describe("Whether it may search/fetch the web (default true)."),
             model: z.string().nullable().optional().describe("Model name this agent should always run on, or null for the app's default model."),
           }),

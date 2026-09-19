@@ -16,3 +16,23 @@ export async function ensureDeliverablesDir(sessionId: string): Promise<string |
     return undefined;
   }
 }
+
+/**
+ * Write a blob to disk as binary (base64 over the webview bridge). Used to
+ * materialize chat attachments where the agent's file tools can read them.
+ * False when unavailable (browser dev / tests) or the write fails.
+ */
+export async function writeBinaryFile(path: string, blob: Blob): Promise<boolean> {
+  if (!(typeof window !== "undefined" && "__TAURI_INTERNALS__" in window)) return false;
+  try {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) {
+      bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+    }
+    await invoke("write_file_base64", { path, data: btoa(bin) });
+    return true;
+  } catch {
+    return false;
+  }
+}

@@ -61,6 +61,7 @@ import { type Artifact } from "@/lib/artifacts";
 import { downloadSharedFile } from "@/lib/local-file";
 import { checkForUpdate, loadUpdateSettings, isUpdaterAvailable } from "@/lib/updater";
 import { detectModeTrigger } from "@/lib/mode-triggers";
+import { followUpSuggestion } from "@/lib/agent-suggestions";
 import { modelLabel, modelLabelWithCatalog } from "@/lib/model-display";
 import { ProviderLogo } from "@/components/provider-logos";
 import { getProviderMeta } from "@/lib/provider-meta";
@@ -139,11 +140,12 @@ import type {
   MessageAttachment,
   AgentConfigPatch,
   AgentDefinition,
+  Provider,
   ReasoningEffort,
 } from "@/types";
 import { useAuth } from "@/hooks/use-auth";
 import { getAccountProfile } from "@/lib/account-profile";
-import { useSessions, getSessionChatMode } from "@/hooks/use-sessions";
+import { useSessions, getSessionChatMode, agentSessionIds, deleteStoredSessions } from "@/hooks/use-sessions";
 import { useMessages, loadMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
@@ -171,7 +173,7 @@ import {
   type LearnLevel,
   type LearnSubject,
 } from "@/lib/learn-mode";
-import { generateChatTitle, instantChatTitle, type ContentPart } from "@/lib/llm";
+import { generateChatTitle, instantChatTitle, generateFollowUpSuggestion, generateQuestionOptions, type ContentPart, type FollowUpTranscriptEntry } from "@/lib/llm";
 import type { AgentMessage } from "@/lib/agent/runtime";
 import { toHistoryMessage } from "@/lib/agent/history";
 import {
@@ -191,6 +193,7 @@ import {
 import { prepareAttachmentContext, rebuildAttachmentContent, buildProjectFilesContext } from "@/lib/attachment-context";
 import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
+import { ensureDeliverablesDir } from "@/lib/deliverables";
 import { getModelCapabilities, getModelDisplayNameSync } from "@/lib/model-capabilities";
 import { buildMemoryContext, extractAndSaveMemory, loadMemory } from "@/lib/memory";
 
@@ -304,6 +307,78 @@ export function ChatView() {
   // be hidden from the tree while its live streaming bubble is shown instead.
   const inProgressMsgIds = useRef<Map<string, string>>(new Map());
   const [inputText, setInputText] = useState("");
+  const sessionTextareaRef = useRef<HTMLTextAreaElement>(null);
+  // Follow-up ghost text in the session composer: which suggestion was
+  // taken or dismissed (keyed by session + last assistant message so a
+  // fresh exchange brings a fresh ghost).
+  const [dismissedGhostKey, setDismissedGhostKey] = useState<string | null>(null);
+  // LLM-generated ghosts, keyed like above. Filled in the background after
+  // each run; the heuristic below covers the gap (and offline mode).
+  const ghostCache = useRef(new Map<string, string>());
+  const ghostInflight = useRef(new Set<string>());
+  // Tappable answers for the assistant's clarifying questions, same keys.
+  const optionCache = useRef(new Map<string, string[]>());
+  const optionInflight = useRef(new Set<string>());
+  const [, bumpGhost] = useState(0);
+
+  const capCache = <T,>(map: Map<string, T>) => {
+    if (map.size > 30) {
+      const oldest = map.keys().next().value;
+      if (oldest !== undefined) map.delete(oldest);
+    }
+  };
+
+  const requestFollowUpGhost = (
+    sessionId: string,
+    assistantId: string,
+    ghostProvider: Provider,
+    modelName: string,
+    transcript: FollowUpTranscriptEntry[],
+    title?: string,
+  ) => {
+    if (!settings.promptSuggestions) return;
+    const key = `${sessionId}:${assistantId}`;
+    if (ghostCache.current.has(key) || ghostInflight.current.has(key)) return;
+    ghostInflight.current.add(key);
+    void generateFollowUpSuggestion(ghostProvider, modelName, transcript, title)
+      .then((suggestion) => {
+        if (suggestion) {
+          ghostCache.current.set(key, suggestion);
+          capCache(ghostCache.current);
+          bumpGhost((n) => n + 1);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        ghostInflight.current.delete(key);
+      });
+  };
+
+  const requestQuestionOptions = (
+    sessionId: string,
+    assistantId: string,
+    optionsProvider: Provider,
+    modelName: string,
+    question: string,
+    transcript: FollowUpTranscriptEntry[],
+  ) => {
+    if (!settings.promptSuggestions) return;
+    const key = `${sessionId}:${assistantId}`;
+    if (optionCache.current.has(key) || optionInflight.current.has(key)) return;
+    optionInflight.current.add(key);
+    void generateQuestionOptions(optionsProvider, modelName, question, transcript)
+      .then((options) => {
+        if (options.length > 0) {
+          optionCache.current.set(key, options);
+          capCache(optionCache.current);
+          bumpGhost((n) => n + 1);
+        }
+      })
+      .catch(() => {})
+      .finally(() => {
+        optionInflight.current.delete(key);
+      });
+  };
   const [files, setFiles] = useState<PendingFile[]>([]);
   const [draggingFiles, setDraggingFiles] = useState(false);
   // Full-screen drag & drop overlay shown while files hover over the window.
@@ -720,6 +795,36 @@ export function ChatView() {
 
   // Agent-task view = an agent-mode session (task) is open in the main area.
   const agentTaskView = isAgentTab && !!activeSession?.agentId;
+
+  // Follow-up ghost text for the session composer, personalized to the
+  // chat. Null when there is nothing worth suggesting (no reply yet, the
+  // agent just asked a question, suggestions off, or input already typed).
+  const lastAssistantId = [...activePath]
+    .reverse()
+    .find((n) => n.message.role === "assistant")?.message.id;
+  const followUpGhostKey = activeSessionId && lastAssistantId
+    ? `${activeSessionId}:${lastAssistantId}`
+    : null;
+  const followUpGhost = useMemo(
+    () =>
+      followUpSuggestion(
+        activePath.map((n) => ({ role: n.message.role, content: n.message.content })),
+      ),
+    [activePath],
+  );
+  // The LLM ghost wins when it has arrived; the heuristic covers the gap
+  // (and offline mode with no provider key).
+  const llmGhost = followUpGhostKey
+    ? ghostCache.current.get(followUpGhostKey)
+    : undefined;
+  const ghostSuggestion =
+    settings.promptSuggestions &&
+    followUpGhostKey &&
+    dismissedGhostKey !== followUpGhostKey &&
+    inputText === "" &&
+    !agent?.isRunning
+      ? (llmGhost ?? followUpGhost)
+      : null;
 
   // Current todo list for the tasks widget: the live run's todos, else the
   // todo activities of the newest message that has them (persisted state).
@@ -1241,7 +1346,13 @@ export function ChatView() {
       const modelLabelStr = selectedModelLabel
         ? modelLabel(selectedModelLabel)
         : runModelName;
-      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, runModelName, modelLabelStr);
+      // Agent runs (agent tab + task mode) get attachment files materialized
+      // in the run's deliverables folder and expressed as paths the agent can
+      // read; plain chat keeps inlining extracted text (no file tools there).
+      const agentFilesDir = arc?.taskProfile
+        ? await ensureDeliverablesDir(sessionId)
+        : undefined;
+      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, runModelName, modelLabelStr, { filePathsDir: agentFilesDir });
       if (prep.blocked) {
         toast.error(prep.warning ?? "This model doesn't support images.");
         return;
@@ -1441,6 +1552,36 @@ export function ChatView() {
             }
           })
           .catch(() => {});
+      }
+
+      // Next-message ghost + question options: personalized by the model
+      // in the background. Research mode keeps its own flow (no options).
+      if (result.content && sessionId) {
+        const ghostTranscript: FollowUpTranscriptEntry[] = [
+          ...activePath
+            .slice(-6)
+            .map((n) => ({ role: n.message.role, content: n.message.content })),
+          { role: "user", content: text },
+          { role: "assistant", content: result.content },
+        ];
+        requestFollowUpGhost(
+          sessionId,
+          assistantMsg.id,
+          provider,
+          runModelName,
+          ghostTranscript,
+          activeSession?.title,
+        );
+        if (result.content.trim().endsWith("?") && chatMode !== "research") {
+          requestQuestionOptions(
+            sessionId,
+            assistantMsg.id,
+            provider,
+            runModelName,
+            result.content,
+            ghostTranscript,
+          );
+        }
       }
 
       // Auto-extract durable memories (background, best-effort). Agent-mode
@@ -1872,29 +2013,6 @@ export function ChatView() {
     toast.success("Moved to Chats as a task");
   };
 
-  /**
-   * Dashboard "New Task": unassigned tasks live on the Chat tab now, so this
-   * arms a fresh task-mode chat there — Task mode on, typed text carried
-   * over — instead of sending. The user reviews and sends from the chat tab.
-   */
-  const startChatTask = (text: string) => {
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionByTab((prev) => ({ ...prev, chat: null }));
-    setActiveProjectId(null);
-    setPendingProjectId(null);
-    setPendingAgentId(null);
-    setPendingSetup(false);
-    setActiveAgentConsoleId(null);
-    setActiveTab("chat");
-    setAgentConsoleFocus("session");
-    setChatMode("task");
-    autoModeRef.current = "none";
-    setInputText(text);
-    setView("chat");
-  };
-
   /** Open a moved session from the chat-tab redirect notice. */
   const openMovedSession = (id: string) => {
     if (activeSessionId && activeSessionId !== id) {
@@ -2024,6 +2142,18 @@ export function ChatView() {
 
   const handleDeleteAgent = (id: string) => {
     const def = agents.find((a) => a.id === id);
+    // Cascade: every chat/session with this agent is deleted alongside it —
+    // same per-session cleanup as deleting a chat, then one storage drop.
+    const doomedIds = new Set(agentSessionIds(allSessions, id));
+    for (const sid of doomedIds) {
+      for (const m of loadMessages(sid)) {
+        for (const a of m.attachments ?? []) {
+          if (a.storageId) void deleteFileBlob(a.storageId);
+        }
+      }
+      disposeAgentController(sid);
+    }
+    deleteStoredSessions([...doomedIds]);
     // Clean up the agent's knowledge-file blobs and on-disk workspace.
     if (def) {
       for (const att of def.attachments ?? []) {
@@ -2032,9 +2162,17 @@ export function ChatView() {
       void removeAgentWorkspace(id);
     }
     deleteAgent(id);
+    if (activeSessionId && doomedIds.has(activeSessionId)) {
+      setActiveSessionId(null);
+      applySessionChatMode(null);
+    }
     if (agentSettingsId === id) setAgentSettingsId(null);
     if (activeAgentConsoleId === id) setActiveAgentConsoleId(null);
-    toast("Agent deleted (sessions stay as task sessions)");
+    toast(
+      doomedIds.size > 0
+        ? `Agent deleted (${doomedIds.size} session${doomedIds.size === 1 ? "" : "s"} deleted too)`
+        : "Agent deleted",
+    );
   };
 
   /**
@@ -2264,6 +2402,19 @@ export function ChatView() {
     const hasBranches = siblings.length > 1;
     const isEditing = editingMessageId === msg.id;
     const isRaw = showRawOutput.has(msg.id);
+    // Tappable answers for a clarifying question: only under the latest
+    // assistant message, never in research mode (its flow stays as-is).
+    const questionOptions =
+      msg.id === lastAssistantId ? (optionCache.current.get(msg.id) ?? []) : [];
+    const showQuestionOptions =
+      questionOptions.length > 0 &&
+      settings.promptSuggestions &&
+      activeSession?.chatMode !== "research" &&
+      chatMode !== "research" &&
+      !agent?.isRunning &&
+      !agent?.pendingInput &&
+      !(agent?.pendingApprovals.length ?? 0) &&
+      !agent?.pendingSuggestion;
 
     return (
       <MessageScrollerItem
@@ -2470,6 +2621,31 @@ export function ChatView() {
                   </div>
                 );
               })()}
+              {showQuestionOptions && (
+                <div className="mb-1 flex animate-in fade-in flex-wrap gap-1.5 duration-300">
+                  {questionOptions.map((opt) => (
+                    <button
+                      key={opt}
+                      type="button"
+                      onClick={() => {
+                        setInputText(opt);
+                        sessionTextareaRef.current?.focus();
+                      }}
+                      className="rounded-full border bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-foreground/20 hover:text-foreground active:scale-95"
+                    >
+                      {opt}
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => sessionTextareaRef.current?.focus()}
+                    title="Write your own answer in the composer"
+                    className="rounded-full border border-dashed px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground active:scale-95"
+                  >
+                    Custom…
+                  </button>
+                </div>
+              )}
               <MessageFooter className="gap-1.5 [&_button]:size-5 [&_button]:p-0 opacity-0 transition-opacity group-hover/message:opacity-100">
                 {hasBranches && (
                   <div className="flex items-center gap-0.5 text-xs text-muted-foreground">
@@ -3315,17 +3491,44 @@ export function ChatView() {
                     </InputGroupAddon>
                   )}
                   <InputGroupTextarea
+                    ref={sessionTextareaRef}
                     value={inputText}
                     onChange={(e) => setInputText(e.currentTarget.value)}
                     onKeyDown={(e) => {
+                      // Ghost suggestion: Tab accepts it into the box (it
+                      // comes back if the text is deleted), Escape dismisses
+                      // it until the next reply.
+                      if (e.key === "Tab" && ghostSuggestion && !e.shiftKey) {
+                        e.preventDefault();
+                        setInputText(ghostSuggestion);
+                        return;
+                      }
+                      if (e.key === "Escape" && ghostSuggestion) {
+                        e.preventDefault();
+                        setDismissedGhostKey(followUpGhostKey);
+                        return;
+                      }
                       if (settings.sendOnEnter && e.key === "Enter" && !e.shiftKey) {
                         e.preventDefault();
                         handleModeSend();
                       }
                     }}
-                    placeholder={chatComposerPlaceholder}
+                    placeholder={ghostSuggestion ? "" : chatComposerPlaceholder}
                     className="max-h-40 min-h-12"
                   />
+                  {ghostSuggestion && (
+                    <div
+                      aria-hidden
+                      className="pointer-events-none absolute inset-x-0 top-0 flex items-baseline gap-2 overflow-hidden px-3 py-3 text-base md:text-sm"
+                    >
+                      <span className="ghost-wave min-w-0 max-w-[calc(100%-3rem)] truncate">
+                        {ghostSuggestion}
+                      </span>
+                      <kbd className="shrink-0 rounded border border-border bg-muted px-1 py-px text-[10px] leading-tight text-muted-foreground">
+                        Tab →
+                      </kbd>
+                    </div>
+                  )}
                   <InputGroupAddon align="block-end" className="flex-wrap">
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
@@ -3812,12 +4015,6 @@ export function ChatView() {
              onOpenAgentConsole={handleOpenAgentConsole}
              onSelectSession={selectSession}
               onSend={(mode: DashboardComposeMode, agentId, text) => {
-                // Unassigned tasks live on the Chat tab — "New Task" arms a
-                // task-mode chat there instead of sending from the dashboard.
-                if (mode === "task") {
-                  startChatTask(text);
-                  return;
-                }
                 void handleSend(text, {
                   agentId: mode === "session" ? agentId : undefined,
                   setup: mode === "agent",
@@ -3825,6 +4022,8 @@ export function ChatView() {
               }}
               files={files}
               onRemoveFile={removeFile}
+              promptSuggestions={settings.promptSuggestions}
+              agentSuggestions={settings.agentSuggestions}
             />
          ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-4 pb-8">
@@ -4339,6 +4538,30 @@ export function ChatView() {
             }
           })
           .catch(() => {});
+          requestFollowUpGhost(
+            newSession.id,
+            assistantMsg.id,
+            provider,
+            selectedModel,
+            [
+              { role: "user", content: text },
+              { role: "assistant", content: result.content },
+            ],
+            newSession.title,
+          );
+          if (result.content.trim().endsWith("?") && chatMode !== "research") {
+            requestQuestionOptions(
+              newSession.id,
+              assistantMsg.id,
+              provider,
+              selectedModel,
+              result.content,
+              [
+                { role: "user", content: text },
+                { role: "assistant", content: result.content },
+              ],
+            );
+          }
         }
 
         if (!arc && settings.autoMemory && !isTemporary && result.content) {

@@ -131,6 +131,43 @@
   animation: welcome-fade-in 0.8s ease-out 0.3s both;
 }
 
+/*
+ * Ghost suggestion wave: a soft highlight sweeps through the composer ghost
+ * text, then rests — one longer pass every 2 seconds, like the thinking
+ * shimmer. Base sits slightly brighter than placeholder text.
+ */
+@keyframes ghost-wave {
+  0% {
+    background-position: 120% 0;
+  }
+  65% {
+    background-position: -20% 0;
+  }
+  100% {
+    background-position: -20% 0;
+  }
+}
+
+.ghost-wave {
+  background-image: linear-gradient(
+    100deg,
+    color-mix(in oklab, var(--muted-foreground) 70%, var(--foreground)) 42%,
+    var(--foreground) 50%,
+    color-mix(in oklab, var(--muted-foreground) 70%, var(--foreground)) 58%
+  );
+  background-size: 280% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: ghost-wave 2s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ghost-wave {
+    animation: none;
+  }
+}
+
 :root {
   --bg-pattern-color: color-mix(in oklab, var(--foreground) 6%, transparent);
 }

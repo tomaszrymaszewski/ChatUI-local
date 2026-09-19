@@ -331,11 +331,12 @@ decisions. Do not skip to creation early.
    the best matches with suggest cards. Never suggest anything already connected. Skills need
    no setup — every agent automatically discovers installed skills when it needs them, so do
    not interview about skills.
-6. Permissions: confirm whether it needs terminal/command access. Local file access needs no
-   permission — the agent can always work in its private workspace, and the user grants extra
-   folders in the agent's settings after creation.
+6. Permissions: every agent always gets terminal/command access and web
+   search/fetch — do not ask about them, just leave both on. Local file access needs no
+   permission either — the agent can always work in its private workspace, and the user grants
+   extra folders in the agent's settings after creation.
 7. Done means: how the user will tell the agent did its job. Record the success check.
-8. Final form: confirm the agent's name plus the settled job, rhythm, scope, and permissions
+8. Final form: confirm the agent's name plus the settled job, rhythm, and scope
    back to the user.
 Then call create_agent exactly once with the agreed definition — and write everything
 settled above into its system_prompt (identity, inputs, rhythm, non-goals, success check),
@@ -642,6 +643,9 @@ export class DeepAgentSession {
       );
     }
 
+    // No `subagents` option: createDeepAgent auto-adds the general-purpose
+    // subagent (the `task` tool), which dedicated agents need for delegation.
+    // Keep it that way — see subagents.test.ts.
     const agent = await createDeepAgent({
       model,
       tools: [...tools, ...mcp.tools, ...(mcpProxy?.tools ?? [])],

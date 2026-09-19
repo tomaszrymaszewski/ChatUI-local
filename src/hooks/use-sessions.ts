@@ -117,6 +117,28 @@ export function createAgentSessionHeadless(
   return session;
 }
 
+/**
+ * Ids of every stored session belonging to an agent — the cascade set for
+ * agent deletion. Pure (takes the loaded list) so the dialog count and the
+ * deletion agree.
+ */
+export function agentSessionIds(sessions: ChatSession[], agentId: string): string[] {
+  return sessions.filter((s) => s.agentId === agentId).map((s) => s.id);
+}
+
+/**
+ * Delete stored sessions straight from storage, regardless of which tab's
+ * hook calls it (the hook's filtered-state delete would merge other-tab
+ * sessions back). Drops each message store too and fires the change event
+ * so every open list re-reads.
+ */
+export function deleteStoredSessions(ids: string[]): void {
+  if (ids.length === 0) return;
+  const doomed = new Set(ids);
+  saveSessions(loadSessions().filter((s) => !doomed.has(s.id)));
+  for (const id of ids) deleteSessionMessageStore(id);
+}
+
 export function useSessions(type: "chat" | "agent") {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   // The unfiltered list — the Agents tab needs it for cross-tab pickers

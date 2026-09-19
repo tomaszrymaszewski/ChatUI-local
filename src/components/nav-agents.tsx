@@ -24,6 +24,8 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
@@ -112,6 +114,10 @@ export function NavAgents({
   const { isMobile } = useSidebar()
   const [renameTarget, setRenameTarget] = useState<{ id: string; title: string } | null>(null)
   const [renameDraft, setRenameDraft] = useState("")
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null)
+  const deleteSessionCount = deleteTarget
+    ? sessions.filter((s) => s.agentId === deleteTarget.id).length
+    : 0
 
   const agentNameFor = (agentId?: string) =>
     agents.find((a) => a.id === agentId)?.name
@@ -172,7 +178,7 @@ export function NavAgents({
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     variant="destructive"
-                    onClick={() => onDeleteAgent(agent.id)}
+                    onClick={() => setDeleteTarget({ id: agent.id, name: agent.name })}
                   >
                     <Trash2 className="text-muted-foreground" />
                     <span>Delete agent</span>
@@ -319,6 +325,38 @@ export function NavAgents({
               <Button size="sm" disabled={!renameDraft.trim()} onClick={handleCommitRename}>Rename</Button>
             </div>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={!!deleteTarget} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Trash2 className="size-5" />
+              Delete {deleteTarget?.name ?? "agent"}?
+            </DialogTitle>
+            <DialogDescription>
+              This permanently deletes the agent, its workspace and knowledge
+              files
+              {deleteSessionCount > 0
+                ? `, and the ${deleteSessionCount} chat${deleteSessionCount === 1 ? "" : "s"} with it`
+                : " (it has no chats yet)"}
+              . This cannot be undone.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setDeleteTarget(null)}>Cancel</Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              onClick={() => {
+                if (deleteTarget) onDeleteAgent(deleteTarget.id)
+                setDeleteTarget(null)
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
     </>

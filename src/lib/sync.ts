@@ -1,6 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
 import { getSupabase } from "@/lib/supabase";
-import { decryptFromSync, encryptForSync, isSyncEnvelope } from "@/lib/sync-crypto";
 import { trySetItem } from "./storage-pressure";
 import {
   isBigKey,
@@ -17,13 +16,15 @@ import { exportChatUiBackup } from "@/lib/data-transfer";
 // Cloud sync: local-first mirroring of localStorage to Supabase.
 //
 // Every tracked `chatui:*` key is mirrored to one row in the `user_data`
-// table (see supabase/schema.sql) as an end-to-end encrypted envelope
-// (AES-256-GCM, see sync-crypto.ts) — the server only ever sees ciphertext,
-// never keys, chats, or settings. The local copy is always the live one —
-// the app works fully offline and anonymous; the cloud copy only exists while
-// signed in. Sync is per-key last-write-wins with tombstones, except sessions
-// and message stores, which union-merge by record id so chats from two
-// devices combine instead of clobbering each other.
+// table (see supabase/schema.sql), stored as plaintext. The local copy is
+// always the live one — the app works fully offline and anonymous; the cloud
+// copy only exists while signed in. Sync is per-key last-write-wins with
+// tombstones, except sessions, message stores, and agents, which union-merge
+// by record id so chats and agents from two devices combine instead of
+// clobbering each other. (An earlier end-to-end-encrypted variant of this
+// sync broke down whenever devices held different keys — rows were skipped
+// as undecryptable and data silently stopped merging — so values now travel
+// as plaintext; see isLegacyEnvelope for how old encrypted rows are handled.)
 //
 // Timestamps mix device time (local writes) and server time (row updated_at),
 // so LWW across devices assumes roughly-correct clocks; ties go to the local
@@ -64,11 +65,11 @@ const SYNCED_PREFIXES = [
 // above would otherwise catch some of it.
 const SYNC_EXCLUDED = new Set([
   "chatui:sync:meta", // this file's own bookkeeping (also matches no prefix)
-  "chatui:sync:key", // the E2E device key — uploading it would defeat encryption
+  "chatui:sync:key", // legacy E2E device key from the old encrypted sync — local-only, never travels
   "chatui:messages:recency", // quota-eviction index, meaningless elsewhere
   "chatui:mcp:migrated", // one-time migration flag
   "chatui:agents:paths-remapped", // one-time migration flag
-  "chatui:sync:code-acknowledged", // one-time "saved the code" flag
+  "chatui:sync:code-acknowledged", // legacy recovery-code ack flag
 ]);
 
 export function isSyncedKey(key: string): boolean {
@@ -76,10 +77,14 @@ export function isSyncedKey(key: string): boolean {
   return SYNCED_PREFIXES.some((p) => key === p || key.startsWith(p));
 }
 
-// Sessions and message stores deep-merge (union by record id); every other
-// tracked key syncs wholesale (last-write-wins).
+// Sessions, message stores, and agents deep-merge (union by record id);
+// every other tracked key syncs wholesale (last-write-wins).
 function isDeepMergeKey(key: string): boolean {
-  return key === "chatui:sessions" || key.startsWith("chatui:messages:");
+  return (
+    key === "chatui:sessions" ||
+    key === "chatui:agents" ||
+    key.startsWith("chatui:messages:")
+  );
 }
 
 /**
@@ -106,6 +111,22 @@ export function hashValue(s: string): string {
 const META_KEY = "chatui:sync:meta";
 /** Meta hash marker for "key was absent locally at last sync". */
 const MISSING = "";
+
+/**
+ * Rows written by the old end-to-end encrypted sync (AES-256-GCM JSON
+ * envelopes). Encryption has been removed, so these can never be read again —
+ * they are dropped on pull (ciphertext must never land in local storage) and
+ * this device's live plaintext overwrites them on push.
+ */
+function isLegacyEnvelope(value: string): boolean {
+  if (!value.startsWith("{")) return false;
+  try {
+    const p = JSON.parse(value) as Partial<Record<"v" | "alg" | "iv" | "ct", unknown>>;
+    return p.v === 1 && p.alg === "A256GCM" && typeof p.iv === "string" && typeof p.ct === "string";
+  } catch {
+    return false;
+  }
+}
 
 export interface KeyMeta {
   /** hashValue() of the local value at last sync, or "" when absent. */
@@ -177,10 +198,11 @@ function tryWriteBigKey(key: string, value: string): boolean {
 export interface MergeSpec {
   idKey: string;
   timeKey: string;
+  /** Fallback stamp when the primary is missing (legacy agents predate updatedAt). */
+  fallbackTimeKey?: string;
 }
 
-function recordTime(record: Record<string, unknown>, timeKey: string): number {
-  const t = record[timeKey];
+function timeValue(t: unknown): number {
   if (typeof t === "string") {
     const ms = Date.parse(t);
     return Number.isFinite(ms) ? ms : 0;
@@ -189,10 +211,18 @@ function recordTime(record: Record<string, unknown>, timeKey: string): number {
   return 0;
 }
 
+function recordTime(record: Record<string, unknown>, spec: MergeSpec): number {
+  const primary = timeValue(record[spec.timeKey]);
+  if (primary > 0) return primary;
+  if (spec.fallbackTimeKey) return timeValue(record[spec.fallbackTimeKey]);
+  return 0;
+}
+
 /**
  * Union-merge two JSON arrays of records by id, per-record last-write-wins
- * (ties go local). Sessions merge by updatedAt, messages by timestamp, so a
- * chat created on device A and one created on device B both survive linking.
+ * (ties go local). Sessions merge by updatedAt, messages by timestamp,
+ * agents by updatedAt (createdAt fallback for legacy records), so a chat or
+ * agent created on device A and one created on device B both survive linking.
  * Either side being unparseable keeps the local string (fail closed: never
  * delete local data on corrupt input).
  */
@@ -226,7 +256,7 @@ export function mergeRecordLists(localJson: string, remoteJson: string, spec: Me
     seen.add(id);
     const other = remoteById.get(id);
     merged.push(
-      other && recordTime(other, spec.timeKey) > recordTime(rec, spec.timeKey) ? other : rec,
+      other && recordTime(other, spec) > recordTime(rec, spec) ? other : rec,
     );
   }
   for (const r of remote) {
@@ -241,6 +271,9 @@ export function mergeRecordLists(localJson: string, remoteJson: string, spec: Me
 }
 
 function mergeSpecFor(key: string): MergeSpec {
+  if (key === "chatui:agents") {
+    return { idKey: "id", timeKey: "updatedAt", fallbackTimeKey: "createdAt" };
+  }
   return key === "chatui:sessions"
     ? { idKey: "id", timeKey: "updatedAt" }
     : { idKey: "id", timeKey: "timestamp" };
@@ -282,8 +315,9 @@ export interface SyncPlan {
 
 /**
  * Reconcile local state with remote rows. Rules:
- * - deep-merge keys (sessions, messages:*): union by record id, always —
- *   chats from both sides survive every sync, not just the first.
+ * - deep-merge keys (sessions, messages:*, agents): union by record id,
+ *   always — chats and agents from both sides survive every sync, not just
+ *   the first.
  * - other keys: per-key last-write-wins; unknown local timestamps and exact
  *   ties go to the local device (the active user's data wins). Ambiguous
  *   states fail closed toward local too: when neither side moved yet the
@@ -425,21 +459,49 @@ export function planSync(
 
 // ─── Backend (Supabase IO — injected for tests) ────────────────────────────
 
+/** Row bookkeeping without the value — cheap enough to poll every interval. */
+export interface ManifestRow {
+  key: string;
+  updated_at: string;
+  deleted: boolean;
+}
+
 export interface SyncBackend {
-  fetchRows: () => Promise<RemoteRow[]>;
+  /** Every row's bookkeeping (no values) — the per-sync manifest. */
+  fetchManifest: () => Promise<ManifestRow[]>;
+  /** Values for the given keys only — never the whole table. */
+  fetchRows: (keys: string[]) => Promise<RemoteRow[]>;
   /** Upsert rows; returns the authoritative rows (server timestamps). */
   upsertRows: (rows: Array<{ key: string; value: string; deleted: boolean }>) => Promise<RemoteRow[]>;
 }
 
+/** PostgREST `in` filters are part of the URL — keep batches URL-safe. */
+const FETCH_BATCH = 50;
+
 export function createSupabaseBackend(): SyncBackend {
   return {
-    fetchRows: async () => {
+    fetchManifest: async () => {
       const client = getSupabase();
       const { data, error } = await client
         .from("user_data")
-        .select("key,value,updated_at,deleted");
+        .select("key,updated_at,deleted");
       if (error) throw new Error(error.message);
-      return (data ?? []) as RemoteRow[];
+      return (data ?? []) as ManifestRow[];
+    },
+    fetchRows: async (keys) => {
+      if (keys.length === 0) return [];
+      const client = getSupabase();
+      const out: RemoteRow[] = [];
+      for (let i = 0; i < keys.length; i += FETCH_BATCH) {
+        const batch = keys.slice(i, i + FETCH_BATCH);
+        const { data, error } = await client
+          .from("user_data")
+          .select("key,value,updated_at,deleted")
+          .in("key", batch);
+        if (error) throw new Error(error.message);
+        out.push(...((data ?? []) as RemoteRow[]));
+      }
+      return out;
     },
     upsertRows: async (rows) => {
       if (rows.length === 0) return [];
@@ -464,6 +526,68 @@ export function createSupabaseBackend(): SyncBackend {
       if (error) throw new Error(error.message);
       return (data ?? []) as RemoteRow[];
     },
+  };
+}
+
+// ─── Realtime (Supabase postgres_changes) ──────────────────────────────────
+
+/**
+ * Subscribe to realtime `user_data` changes for the signed-in user. Every
+ * changed row arrives WITH its value — applies need no fetch. Returns an
+ * unsubscribe function. Requires the table to be in the supabase_realtime
+ * publication (see supabase/schema.sql); when Realtime is unavailable this
+ * resolves to a no-op unsubscribe and the interval poll stays the fallback.
+ */
+export function createRealtimeSubscription(
+  onRow: (row: RemoteRow) => void,
+): () => void {
+  let closed = false;
+  let channel: { unsubscribe: () => Promise<unknown> } | null = null;
+  void (async () => {
+    let client: ReturnType<typeof getSupabase>;
+    try {
+      client = getSupabase();
+    } catch {
+      return; // not configured — interval poll only
+    }
+    try {
+      const { data } = await client.auth.getSession();
+      const uid = data.session?.user.id;
+      if (!uid || closed) return;
+      channel = client
+        .channel(`user-data-${uid}`)
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "user_data", filter: `user_id=eq.${uid}` },
+          (payload: { eventType: string; new: Record<string, unknown> | null }) => {
+            // Upserts fire INSERT (new row) or UPDATE; deletes travel as
+            // UPDATE tombstones. Plain DELETE events carry no new row.
+            if (payload.eventType === "DELETE") return;
+            const next = payload.new;
+            if (
+              !next ||
+              typeof next.key !== "string" ||
+              typeof next.value !== "string" ||
+              typeof next.updated_at !== "string"
+            ) {
+              return;
+            }
+            onRow({
+              key: next.key,
+              value: next.value,
+              updated_at: next.updated_at,
+              deleted: next.deleted === true,
+            });
+          },
+        )
+        .subscribe();
+    } catch {
+      // Realtime unavailable — interval poll covers it.
+    }
+  })();
+  return () => {
+    closed = true;
+    if (channel) void channel.unsubscribe();
   };
 }
 
@@ -503,71 +627,141 @@ export interface SyncResult {
   pushed: number;
   pulled: number;
   deletedLocal: number;
-  /** Deep-merged session/message keys (both sides contributed). */
+  /** Deep-merged keys (sessions, messages, agents — both sides contributed). */
   merged: string[];
-  /** Keys skipped because this device's sync key couldn't decrypt them. */
-  undecryptable: string[];
+  /** Keys whose cloud rows are still old encrypted envelopes: never pulled;
+   * this device's local data overwrites them on push. */
+  legacyEncrypted: string[];
 }
 
 /**
  * Full sync: pull everything, reconcile, apply locally, push the remainder.
- * Runs on sign-in (initial merge), on focus, and every minute while signed in.
- * Cloud values are decrypted before planning and encrypted before upload —
- * planning, hashes, and merges all operate on plaintext on both sides.
- * Never throws — failures resolve as { error } so callers can toast and retry.
+ * Runs on sign-in (initial merge), on focus, and every few minutes while
+ * signed in (realtime covers instant updates between polls). Egress-frugal:
+ * the poll first fetches a value-less manifest, then downloads values only
+ * for rows that moved since the last reconcile — unchanged data is neither
+ * downloaded nor re-uploaded. Never throws — failures resolve as { error }
+ * so callers can toast and retry.
  */
 export async function syncNow(
   backend: SyncBackend,
   localChangedAt: Map<string, string> = new Map(),
 ): Promise<SyncResult & { error?: string }> {
-  const empty: SyncResult = { pushed: 0, pulled: 0, deletedLocal: 0, merged: [], undecryptable: [] };
-  let rows: RemoteRow[];
+  const empty: SyncResult = { pushed: 0, pulled: 0, deletedLocal: 0, merged: [], legacyEncrypted: [] };
+  let manifest: ManifestRow[];
   try {
-    rows = await backend.fetchRows();
+    manifest = await backend.fetchManifest();
   } catch (err) {
     return { ...empty, error: err instanceof Error ? err.message : "Sync failed" };
   }
-  // Decrypt pass: legacy plaintext rows (written before encryption shipped)
-  // flow through and get re-pushed encrypted below; rows this device can't
-  // open are dropped from BOTH sides so neither the cloud copy nor the local
-  // copy is clobbered by a key this device doesn't hold.
+  const local = readLocal();
+  const meta = loadMeta();
+
+  // Keys whose remote row moved since we last reconciled it (or that we have
+  // never reconciled). Tombstones need no value fetch; everything else does.
+  // Locally-deleted keys with un-acked tombstones count as moved too — their
+  // rows must reach planSync so the delete wins (or the row resurrects).
+  const pendingLocalDeletes = new Set(
+    Object.entries(meta)
+      .filter(([key, m]) => !local.has(key) && m.hash !== MISSING && !m.remoteDeleted && isSyncedKey(key))
+      .map(([key]) => key),
+  );
+  const moved = manifest.filter((r) => {
+    if (!isSyncedKey(r.key)) return false;
+    if (r.deleted) return true;
+    const m = meta[r.key];
+    return !m || cmpTime(r.updated_at, m.syncedAt) > 0 || pendingLocalDeletes.has(r.key);
+  });
+  let valueRows: RemoteRow[];
+  try {
+    valueRows = await backend.fetchRows(moved.filter((r) => !r.deleted).map((r) => r.key));
+  } catch (err) {
+    return { ...empty, error: err instanceof Error ? err.message : "Sync failed" };
+  }
+  const byKey = new Map(valueRows.map((r) => [r.key, r]));
+  // Drop legacy encrypted rows from the pull: the old E2E envelopes are
+  // unreadable, and planning against them would write ciphertext into local
+  // storage. planSync then sees no remote row for those keys and pushes this
+  // device's live plaintext over the envelope (when local data exists).
   const remote: RemoteRow[] = [];
-  const undecryptable: string[] = [];
-  const legacy = new Set<string>();
-  for (const row of rows) {
-    if (row.deleted || !isSyncedKey(row.key) || !isSyncEnvelope(row.value)) {
-      if (!row.deleted && isSyncedKey(row.key)) legacy.add(row.key);
-      remote.push(row);
+  const legacyEncrypted: string[] = [];
+  for (const r of moved) {
+    if (r.deleted) {
+      remote.push({ key: r.key, value: "", updated_at: r.updated_at, deleted: true });
       continue;
     }
-    try {
-      remote.push({ ...row, value: await decryptFromSync(row.value) });
-    } catch {
-      undecryptable.push(row.key);
+    const full = byKey.get(r.key);
+    if (!full) continue; // vanished between manifest and fetch — next round
+    if (isLegacyEnvelope(full.value)) {
+      legacyEncrypted.push(r.key);
+      continue;
     }
+    remote.push(full);
   }
-  const local = readLocal();
-  for (const key of undecryptable) local.delete(key);
-  const now = new Date().toISOString();
-  const plan = planSync(local, remote, loadMeta(), now, localChangedAt);
 
-  // Upgrade legacy plaintext rows: where local and remote already agree, push
-  // the same value back so the cloud copy becomes an encrypted envelope.
-  if (legacy.size > 0) {
-    const remoteByKey = new Map(remote.map((r) => [r.key, r]));
-    const decided = new Set([
-      ...plan.toRemote.map((t) => t.key),
-      ...plan.toLocal.map((t) => t.key),
-      ...plan.deleteLocal,
-    ]);
-    for (const key of legacy) {
-      const localVal = local.get(key);
-      const row = remoteByKey.get(key);
-      if (localVal === undefined || !row || row.deleted || localVal !== row.value) continue;
-      if (decided.has(key)) continue;
-      plan.toRemote.push({ key, value: localVal, deleted: false });
-    }
+  // Plan only over keys that can act: moved remote keys ∪ locally-dirty keys.
+  // Unchanged keys stay out entirely — their values are never downloaded and
+  // never re-uploaded.
+  const include = new Set<string>(remote.map((r) => r.key));
+  for (const [key, val] of local) {
+    const m = meta[key];
+    if (!m || hashValue(val) !== m.hash) include.add(key);
   }
+  for (const [key, m] of Object.entries(meta)) {
+    if (!local.has(key) && (m.hash !== MISSING || m.remoteDeleted)) include.add(key);
+  }
+  const now = new Date().toISOString();
+  return reconcile(backend, remote, local, meta, now, localChangedAt, include, legacyEncrypted);
+}
+
+/**
+ * Apply a batch of realtime rows through the same reconcile path as a full
+ * sync (values ride in the events — no fetch), so merges propagate: device A
+ * merges and pushes the union, device B merges that and pushes back its own
+ * unique records.
+ */
+export async function syncRows(
+  backend: SyncBackend,
+  rows: RemoteRow[],
+  localChangedAt: Map<string, string> = new Map(),
+): Promise<SyncResult & { error?: string }> {
+  const empty: SyncResult = { pushed: 0, pulled: 0, deletedLocal: 0, merged: [], legacyEncrypted: [] };
+  const usable = rows.filter((r) => isSyncedKey(r.key) && !(r.deleted === false && isLegacyEnvelope(r.value)));
+  if (usable.length === 0) return empty;
+  const local = readLocal();
+  const meta = loadMeta();
+  const include = new Set<string>(usable.map((r) => r.key));
+  // Only locally-changed keys join the plan (deletions ride pushDirty) —
+  // concurrent local edits reconcile by LWW instead of being clobbered.
+  for (const [key, val] of local) {
+    const m = meta[key];
+    if (!m || hashValue(val) !== m.hash) include.add(key);
+  }
+  return reconcile(backend, usable, local, meta, new Date().toISOString(), localChangedAt, include, []);
+}
+
+/**
+ * Reconcile the given remote rows against the local subset (remote keys +
+ * locally-dirty keys), apply locally, push the remainder. `include` bounds
+ * the plan: keys outside it keep their meta untouched — that's what makes
+ * unchanged data free.
+ */
+async function reconcile(
+  backend: SyncBackend,
+  remote: RemoteRow[],
+  local: Map<string, string>,
+  meta: SyncMeta,
+  now: string,
+  localChangedAt: Map<string, string>,
+  include: Set<string>,
+  legacyEncrypted: string[],
+): Promise<SyncResult & { error?: string }> {
+  const localSub = new Map([...local].filter(([k]) => include.has(k)));
+  const metaSub: SyncMeta = {};
+  for (const key of include) {
+    if (meta[key]) metaSub[key] = meta[key];
+  }
+  const plan = planSync(localSub, remote, metaSub, now, localChangedAt);
 
   for (const { key, value } of plan.toLocal) {
     // trySetItem evicts rebuildable caches under quota pressure first.
@@ -586,36 +780,39 @@ export async function syncNow(
     }
   }
 
+  // plan.meta only covers the subset — overlay it on the untouched rest.
+  const fullMeta: SyncMeta = { ...meta };
+  for (const key of include) {
+    if (plan.meta[key]) fullMeta[key] = plan.meta[key];
+    else delete fullMeta[key];
+  }
+
   const pushed = plan.toRemote;
   if (pushed.length > 0) {
     try {
-      const encrypted: Array<{ key: string; value: string; deleted: boolean }> = [];
-      for (const t of pushed) {
-        encrypted.push(t.deleted ? t : { ...t, value: await encryptForSync(t.value) });
-      }
-      const authoritative = await backend.upsertRows(encrypted);
+      const authoritative = await backend.upsertRows(pushed);
       const serverTime = new Map(authoritative.map((r) => [r.key, r.updated_at]));
       for (const { key } of pushed) {
         const at = serverTime.get(key);
-        if (at && plan.meta[key]) plan.meta[key].syncedAt = at;
+        if (at && fullMeta[key]) fullMeta[key].syncedAt = at;
       }
     } catch (err) {
       // Local applies above are already valid; report the push failure and
       // keep meta un-advanced for pushed keys so they retry next round.
-      for (const { key } of pushed) delete plan.meta[key];
-      saveMeta(plan.meta);
+      for (const { key } of pushed) delete fullMeta[key];
+      saveMeta(fullMeta);
       dispatchForKeys([...plan.toLocal.map((t) => t.key), ...plan.deleteLocal]);
       return {
         pushed: 0,
         pulled: plan.toLocal.length,
         deletedLocal: plan.deleteLocal.length,
         merged: [],
-        undecryptable,
+        legacyEncrypted,
         error: err instanceof Error ? err.message : "Sync failed",
       };
     }
   }
-  saveMeta(plan.meta);
+  saveMeta(fullMeta);
   dispatchForKeys([...plan.toLocal.map((t) => t.key), ...plan.deleteLocal]);
 
   const remoteKeys = new Set(remote.map((r) => r.key));
@@ -628,14 +825,13 @@ export async function syncNow(
     pulled: plan.toLocal.length,
     deletedLocal: plan.deleteLocal.length,
     merged,
-    undecryptable,
+    legacyEncrypted,
   };
 }
 
 /**
  * Push-only fast path for the debounced "local changed" trigger: no fetch,
  * just upsert locally-dirty keys (and tombstones for locally-deleted ones).
- * Values are encrypted before upload, like the full sync.
  */
 export async function pushDirty(
   backend: SyncBackend,
@@ -657,11 +853,7 @@ export async function pushDirty(
   }
   if (dirty.length === 0) return { pushed: 0 };
   try {
-    const encrypted: Array<{ key: string; value: string; deleted: boolean }> = [];
-    for (const d of dirty) {
-      encrypted.push(d.deleted ? d : { ...d, value: await encryptForSync(d.value) });
-    }
-    const authoritative = await backend.upsertRows(encrypted);
+    const authoritative = await backend.upsertRows(dirty);
     const serverTime = new Map(authoritative.map((r) => [r.key, r.updated_at]));
     const now = new Date().toISOString();
     for (const { key, value, deleted } of dirty) {
@@ -710,7 +902,12 @@ export async function writeFileBackup(force = false): Promise<void> {
 // ─── Manager (storage hook + timers) ───────────────────────────────────────
 
 const PUSH_DEBOUNCE_MS = 2000;
-const PULL_INTERVAL_MS = 60_000;
+/** Fallback poll — realtime events make instant sync; this catches gaps. */
+const PULL_INTERVAL_MS = 300_000;
+/** Batch burst of realtime events (one send touches several keys) into one reconcile. */
+const REALTIME_BATCH_MS = 300;
+/** Minimum gap between focus-triggered full syncs. */
+const FOCUS_SYNC_THROTTLE_MS = 60_000;
 
 let storageHookInstalled = false;
 const dirtySince = new Map<string, string>();
@@ -757,20 +954,31 @@ function installStorageHook(): void {
 
 /**
  * Start background sync for a signed-in user. Returns a stop function.
- * Local writes push (debounced 2s); a full pull-merge-push runs every minute
- * and on window focus. Safe to call once per signed-in session only — the
- * caller stops the previous manager on sign-out.
+ * Local writes push (debounced 2s); realtime events apply as they arrive
+ * (batched 300ms); a manifest-based pull-merge-push runs every few minutes
+ * and on window focus as the fallback. Safe to call once per signed-in
+ * session only — the caller stops the previous manager on sign-out.
  */
 export function startSyncManager(
   backend: SyncBackend,
-  opts?: { onSync?: (result: SyncResult & { error?: string; pushOnly?: boolean }) => void },
+  opts?: {
+    onSync?: (result: SyncResult & { error?: string; pushOnly?: boolean }) => void;
+    /** Realtime row feed (e.g. createRealtimeSubscription). Rows already
+     * carry their values — applied through the reconcile path directly. */
+    subscribeChanges?: (onRow: (row: RemoteRow) => void) => () => void;
+  },
 ): () => void {
   let stopped = false;
   let pushTimer: ReturnType<typeof setTimeout> | null = null;
   let syncing = false;
+  let lastFullSyncAt = 0;
 
-  const fullSync = async () => {
+  const fullSync = async (force = false) => {
     if (stopped || syncing) return;
+    // Focus can fire in bursts (cmd-tab round-trips) — the manifest fetch is
+    // small, but there's no reason to repeat it more than once a minute.
+    if (!force && Date.now() - lastFullSyncAt < FOCUS_SYNC_THROTTLE_MS) return;
+    lastFullSyncAt = Date.now();
     syncing = true;
     try {
       const result = await syncNow(backend, dirtySince);
@@ -793,9 +1001,7 @@ export function startSyncManager(
           const { error } = await pushDirty(backend, dirtySince);
           if (!stopped) {
             if (!error) dirtySince.clear();
-            // pushOnly: no fetch ran, so the empty undecryptable list proves
-            // nothing — UI must not treat it as a clean bill of key health.
-            opts?.onSync?.({ pushed: 0, pulled: 0, deletedLocal: 0, merged: [], undecryptable: [], error, pushOnly: true });
+            opts?.onSync?.({ pushed: 0, pulled: 0, deletedLocal: 0, merged: [], legacyEncrypted: [], error, pushOnly: true });
           }
         } finally {
           syncing = false;
@@ -804,15 +1010,46 @@ export function startSyncManager(
     }, PUSH_DEBOUNCE_MS);
   };
 
+  // Realtime feed: batch incoming rows for a moment (one send touches
+  // several keys), skip own echoes (already-recorded server timestamps),
+  // then reconcile the batch — pull AND push, so merges propagate.
+  const pendingRealtime = new Map<string, RemoteRow>();
+  let realtimeTimer: ReturnType<typeof setTimeout> | null = null;
+  const unsubscribe =
+    opts?.subscribeChanges?.((row) => {
+      if (stopped || !isSyncedKey(row.key)) return;
+      const m = loadMeta()[row.key];
+      if (!row.deleted && m && cmpTime(row.updated_at, m.syncedAt) === 0) return;
+      pendingRealtime.set(row.key, row);
+      if (realtimeTimer) clearTimeout(realtimeTimer);
+      realtimeTimer = setTimeout(() => {
+        realtimeTimer = null;
+        const rows = [...pendingRealtime.values()];
+        pendingRealtime.clear();
+        void (async () => {
+          if (stopped || syncing) return;
+          syncing = true;
+          try {
+            const result = await syncRows(backend, rows, dirtySince);
+            if (!stopped) opts?.onSync?.(result);
+          } finally {
+            syncing = false;
+          }
+        })();
+      }, REALTIME_BATCH_MS);
+    }) ?? null;
+
   installStorageHook();
   currentSchedulePush = schedulePush;
-  const interval = setInterval(fullSync, PULL_INTERVAL_MS);
+  const interval = setInterval(() => void fullSync(true), PULL_INTERVAL_MS);
   const onFocus = () => void fullSync();
   window.addEventListener("focus", onFocus);
-  void fullSync(); // initial pull-merge-push on start
+  void fullSync(true); // initial pull-merge-push on start
 
   return () => {
     stopped = true;
+    unsubscribe?.();
+    if (realtimeTimer) clearTimeout(realtimeTimer);
     if (currentSchedulePush === schedulePush) currentSchedulePush = null;
     if (pushTimer) clearTimeout(pushTimer);
     clearInterval(interval);

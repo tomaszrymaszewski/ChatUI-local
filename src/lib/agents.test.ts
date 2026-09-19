@@ -5,6 +5,7 @@ import {
   updateAgentDefinition,
   deleteAgentDefinition,
   subscribeToAgents,
+  type AgentUpdatePatch,
 } from "@/lib/agents";
 
 // The vitest environment is node — stub the browser globals agents.ts uses.
@@ -92,6 +93,42 @@ describe("agent definitions storage", () => {
     const all = loadAgentDefinitions();
     expect(all).toHaveLength(1);
     expect(all[0].name).toBe("Invoice Boss");
+  });
+
+  it("stamps createdAt and updatedAt together on save", () => {
+    const saved = saveAgentDefinition(sampleDef);
+    expect(saved.createdAt).toBeTruthy();
+    expect(saved.updatedAt).toBe(saved.createdAt);
+  });
+
+  it("bumps updatedAt on update but keeps id and createdAt", () => {
+    const saved = saveAgentDefinition(sampleDef);
+    const updated = updateAgentDefinition(saved.id, { purpose: "New purpose" });
+    expect(updated?.id).toBe(saved.id);
+    expect(updated?.createdAt).toBe(saved.createdAt);
+    expect(Date.parse(updated?.updatedAt ?? "")).toBeGreaterThanOrEqual(Date.parse(saved.createdAt));
+  });
+
+  it("ignores forged identity and timestamp fields in patches", () => {
+    const saved = saveAgentDefinition(sampleDef);
+    const updated = updateAgentDefinition(saved.id, {
+      name: "Renamed",
+      ...({ id: "forged", createdAt: "2000-01-01T00:00:00.000Z", updatedAt: "2000-01-01T00:00:00.000Z" } as unknown as AgentUpdatePatch),
+    });
+    expect(updated?.id).toBe(saved.id);
+    expect(updated?.createdAt).toBe(saved.createdAt);
+    expect(updated?.updatedAt).not.toBe("2000-01-01T00:00:00.000Z");
+  });
+
+  it("backfills updatedAt from createdAt for legacy records", () => {
+    const saved = saveAgentDefinition(sampleDef);
+    const legacy = { ...saved };
+    delete (legacy as Partial<typeof legacy>).updatedAt;
+    storage.set("chatui:agents", JSON.stringify([legacy]));
+    const all = loadAgentDefinitions();
+    expect(all[0].updatedAt).toBe(saved.createdAt);
+    // The backfill persists so it runs once, not on every load.
+    expect(JSON.parse(storage.get("chatui:agents")!)[0].updatedAt).toBe(saved.createdAt);
   });
 
   it("clears a patchable field back to undefined (e.g. model)", () => {

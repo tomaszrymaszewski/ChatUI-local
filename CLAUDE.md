@@ -120,19 +120,38 @@ sync on top of the local store — anonymous mode works fully offline and is unc
   `TAURI_SIGNING_PRIVATE_KEY` env var (set in CI secrets, not committed). The release
   workflow is `.github/workflows/release.yml` (tauri-action on `v*` tag push).
 - **Accounts + cloud sync** (`src/lib/supabase.ts`, `src/hooks/use-auth.ts`,
-  `src/lib/sync.ts`, `src/lib/sync-crypto.ts`, `supabase/schema.sql`): email/password
-  auth; every tracked `chatui:*` key mirrors to one `user_data` row per (user, key) as
-  an end-to-end encrypted AES-256-GCM envelope — the server only ever holds ciphertext.
-  The device key lives in local-only `chatui:sync:key` (never synced; new devices join via
-  the recovery code in Account → Data, and undecryptable rows are skipped fail-closed until
-  then). Sync is per-key last-write-wins with tombstones, except sessions/message stores
+  `src/lib/sync.ts`, `supabase/schema.sql`): email/password auth; every tracked
+  `chatui:*` key mirrors to one `user_data` row per (user, key), stored as plaintext —
+  E2E encryption was removed (it broke down when devices held different keys, e.g. dev vs
+  production app — different webview origins get different localStorage, so each device
+  generated its own key and every row looked undecryptable; a future, better design may
+  reintroduce it). Rows still in the old AES envelope shape are never pulled and get
+  overwritten by live local data on push (`isLegacyEnvelope`). Sync is per-key
+  last-write-wins with tombstones, except sessions/message stores/agents
   which union-merge by record id (`mergeRecordLists`, `planSync` — pure, unit-tested);
   ambiguous states fail closed toward local (blank cloud rows never overwrite populated
   data; deletes travel as tombstones — `deleteProvider` drops the key when the list empties).
-  Hooks must re-read storage in mutations and dispatch `*-changed` events so pulls
-  can't be clobbered or go stale. Successful syncs also write JSON backups to
-  `<base>/backups/` via the existing `write_text_file` command. Never put the
-  Supabase *secret* key in the app — only the publishable key in `.env`.
+  Egress is frugal: full syncs fetch a value-less manifest first and download values only
+  for rows that moved since the last reconcile (unchanged keys are neither downloaded nor
+  re-uploaded); instant cross-device updates ride Supabase Realtime postgres_changes on
+  `user_data` (`createRealtimeSubscription`, requires the table in the supabase_realtime
+  publication — see schema.sql), batched 300 ms and reconciled through the same path
+  (`syncRows`); the value-less-manifest poll runs every 5 min + on focus (throttled) as
+  the fallback. Pushes stay write-debounced (2 s). Hooks must re-read storage in
+  mutations and dispatch `*-changed` events so pulls can't be clobbered or go stale.
+  Successful syncs also write JSON backups to `<base>/backups/` via the existing
+  `write_text_file` command. Never put the Supabase *secret* key in the app — only the
+  publishable key in `.env`. Attachment BYTES never sync — they live in IndexedDB
+  (`chatui-files`) device-only; sync carries message records with attachment metadata only.
+- **Attachments to agents as file paths** (`src/lib/attachment-context.ts`,
+  `src/lib/deliverables.ts`, Rust `write_file_base64`): on agent runs (agent tab + task
+  mode, i.e. whenever `taskProfile` exists), non-image chat attachments are copied into
+  the run's deliverables folder (`<dir>/attachments/<id>-<name>`) and expressed to the
+  agent as a path note instead of inline text (images still embed as data URLs; plain
+  chat runs keep inline text — no file tools there). `use-deep-agent` adds the run's
+  deliverables dir to the sandbox `allowedDirectories` so saved agents can read those
+  paths (and their own deliverables); browser dev without Tauri falls back to inline
+  text.
 - **Mode triggers** (`src/lib/mode-triggers.ts`): typing "discuss…", "teach me…",
   "i want to learn…", or "research…" as the first word of the composer auto-activates
   the corresponding chat mode (button lights up blue + expands). Detection is live:

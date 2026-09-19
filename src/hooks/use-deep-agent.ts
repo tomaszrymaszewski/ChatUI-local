@@ -720,6 +720,19 @@ class AgentController implements AgentControllerApi {
         if (retrieval.block) {
           instructions = [instructions, retrieval.block].filter(Boolean).join("\n\n");
         }
+        const deliverablesDir = await ensureDeliverablesDir(this.sessionId);
+        // Sandboxed agents gain read/write on this run's deliverables folder
+        // (chat attachments are materialized there; the agent should also be
+        // able to read its own deliverables). Unrestricted runs are unchanged.
+        const sandbox = opts.taskProfile?.sandbox
+          ? {
+              ...opts.taskProfile.sandbox,
+              allowedDirectories: [
+                ...(opts.taskProfile.sandbox.allowedDirectories ?? []),
+                ...(deliverablesDir ? [deliverablesDir] : []),
+              ],
+            }
+          : opts.taskProfile?.sandbox;
         session = await DeepAgentSession.create({
           provider: opts.provider,
           modelName: opts.modelName,
@@ -733,8 +746,8 @@ class AgentController implements AgentControllerApi {
           enableFileTools: opts.taskProfile?.enableFileTools,
           skillNames: opts.taskProfile?.skillNames,
           mcpNames: opts.taskProfile?.mcpNames,
-          sandbox: opts.taskProfile?.sandbox,
-          deliverablesDir: await ensureDeliverablesDir(this.sessionId),
+          sandbox,
+          deliverablesDir,
         });
 
         // A run must not stop on its own while the todo list still has work:

@@ -438,6 +438,46 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
 
               <div className="flex flex-col gap-4">
                 <div className="flex flex-col gap-0.5">
+                  <span className="text-sm font-semibold">Suggestions</span>
+                  <span className="text-xs text-muted-foreground">
+                    Starter prompts and agent recommendations. Each can be
+                    turned off separately.
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-sm">Prompt suggestions</span>
+                    <span className="text-xs text-muted-foreground">
+                      Follow-up ghost text in chats and starter prompts for agents
+                    </span>
+                  </div>
+                  <Switch
+                    checked={settings.promptSuggestions}
+                    onCheckedChange={(v) =>
+                      updateSettings({ promptSuggestions: v })
+                    }
+                  />
+                </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-sm">Agent suggestions</span>
+                    <span className="text-xs text-muted-foreground">
+                      Recommend which agent to use when starting a session
+                    </span>
+                  </div>
+                  <Switch
+                    checked={settings.agentSuggestions}
+                    onCheckedChange={(v) =>
+                      updateSettings({ agentSuggestions: v })
+                    }
+                  />
+                </div>
+              </div>
+
+              <Separator />
+
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-col gap-0.5">
                   <span className="text-sm font-semibold">Terminal commands</span>
                   <span className="text-xs text-muted-foreground">
                     How agent-mode tasks may run commands on your Mac

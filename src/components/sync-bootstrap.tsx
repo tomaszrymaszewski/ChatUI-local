@@ -1,27 +1,21 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 import { toast } from "sonner";
 import { useAuth } from "@/hooks/use-auth";
-import { createSupabaseBackend, startSyncManager } from "@/lib/sync";
-import { shouldPromptRecoveryCodeSave } from "@/lib/sync-crypto";
-import { SaveRecoveryCodeDialog } from "@/components/save-recovery-code-dialog";
+import { createRealtimeSubscription, createSupabaseBackend, startSyncManager } from "@/lib/sync";
 
 /**
  * Owns the cloud-sync lifecycle for the whole app (onboarding + main UI):
  * starts the sync manager on sign-in, stops it on sign-out, and toasts the
  * outcome of the initial merge. Background syncs stay silent — the initial
- * result is the one the user asked for by connecting.
- *
- * Also pops the "save your recovery code" dialog after a clean full sync
- * while this device's key is unconfirmed (at most once per launch; the ack
- * persists, Later snoozes to next launch).
+ * result is the one the user asked for by connecting. Instant cross-device
+ * updates ride Supabase Realtime (postgres_changes on user_data); the
+ * interval poll and focus sync are fallbacks.
  */
 export function SyncBootstrap() {
   const { user, configured } = useAuth();
-  const [saveDialogOpen, setSaveDialogOpen] = useState(false);
   const stopRef = useRef<(() => void) | null>(null);
   const toastedForRef = useRef<string | null>(null);
   const lastUserRef = useRef<string | null>(null);
-  const promptedRef = useRef(false);
 
   useEffect(() => {
     if (lastUserRef.current !== (user?.id ?? null)) {
@@ -31,20 +25,13 @@ export function SyncBootstrap() {
     if (!configured || !user) {
       stopRef.current?.();
       stopRef.current = null;
-      setSaveDialogOpen(false);
       return;
     }
     const userId = user.id;
     const backend = createSupabaseBackend();
     stopRef.current = startSyncManager(backend, {
+      subscribeChanges: createRealtimeSubscription,
       onSync: (result) => {
-        // Evaluated on every sync (not just the first): the key may only be
-        // generated later, on the first background push. Push-only results
-        // are skipped inside the predicate — they never fetched.
-        if (shouldPromptRecoveryCodeSave(result) && !promptedRef.current) {
-          promptedRef.current = true;
-          setSaveDialogOpen(true);
-        }
         if (toastedForRef.current === userId) return;
         // The manager's first callback is the initial pull-merge-push (its
         // debounced pushes only fire on later local writes).
@@ -61,17 +48,22 @@ export function SyncBootstrap() {
           }
           return;
         }
-        if (result.undecryptable.length > 0) {
-          const n = result.undecryptable.length;
+        if (result.legacyEncrypted.length > 0) {
+          const n = result.legacyEncrypted.length;
           toast.warning(
-            `Connected, but ${n} synced ${n === 1 ? "item" : "items"} couldn't be decrypted on this device. Enter your sync recovery code in Settings → Account → Data.`,
+            `Connected, but ${n} legacy encrypted cloud ${n === 1 ? "item was" : "items were"} skipped — this device's data replaces them as it syncs.`,
           );
           return;
         }
         const parts: string[] = [];
         if (result.pulled > 0) parts.push(`${result.pulled} downloaded`);
         if (result.pushed > 0) parts.push(`${result.pushed} uploaded`);
-        if (result.merged.length > 0) parts.push("chats merged across devices");
+        if (result.merged.length > 0) {
+          const kinds: string[] = [];
+          if (result.merged.some((k) => k !== "chatui:agents")) kinds.push("chats");
+          if (result.merged.includes("chatui:agents")) kinds.push("agents");
+          parts.push(`${kinds.join(" and ")} merged across devices`);
+        }
         if (result.deletedLocal > 0) parts.push(`${result.deletedLocal} removed`);
         toast.success(
           parts.length > 0
@@ -86,5 +78,5 @@ export function SyncBootstrap() {
     };
   }, [user, configured]);
 
-  return <SaveRecoveryCodeDialog open={saveDialogOpen} onOpenChange={setSaveDialogOpen} />;
+  return null;
 }

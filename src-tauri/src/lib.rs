@@ -416,6 +416,19 @@ fn write_text_file(path: String, content: String) -> Result<(), String> {
     fs::write(&p, content).map_err(|e| e.to_string())
 }
 
+/// Binary counterpart of write_text_file: chat attachments arrive as base64
+/// (the webview bridge is JSON) and land on disk where the agent's file tools
+/// can read them.
+#[tauri::command]
+fn write_file_base64(path: String, data: String) -> Result<(), String> {
+    let bytes = base64_standard_decode(&data)?;
+    let p = PathBuf::from(&path);
+    if let Some(parent) = p.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&p, bytes).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn read_text_file(path: String) -> Result<String, String> {
     fs::read_to_string(&path).map_err(|e| e.to_string())
@@ -3228,6 +3241,36 @@ fn base64_standard(data: &[u8]) -> String {
     out
 }
 
+/// Decode standard base64 (padding optional; both `+/` and `-_` alphabets
+/// accepted). Errors on any other byte.
+fn base64_standard_decode(s: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Result<u32, String> {
+        match c {
+            b'A'..=b'Z' => Ok((c - b'A') as u32),
+            b'a'..=b'z' => Ok((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Ok((c - b'0' + 52) as u32),
+            b'+' | b'-' => Ok(62),
+            b'/' | b'_' => Ok(63),
+            _ => Err(format!("invalid base64 byte: {}", c as char)),
+        }
+    }
+    let mut out = Vec::with_capacity(s.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &b in s.as_bytes() {
+        if b == b'=' || b.is_ascii_whitespace() {
+            continue;
+        }
+        acc = ((acc << 6) | val(b)?) & 0xFF_FFFF;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((acc >> bits) & 0xFF) as u8);
+        }
+    }
+    Ok(out)
+}
+
 /// Read a file as base64 so the chat can offer it as a download (generated
 /// deliverables: pptx, docx, zip, images, …). Read-only, no approval card —
 /// the agent chose to hand the file to the user, which is the point.
@@ -4007,6 +4050,51 @@ mod tests {
             super::parse_resource_metadata_url(header).as_deref(),
             Some("https://mcp.zapier.com/.well-known/oauth-protected-resource/api/v1/connect")
         );
+    }
+
+    #[test]
+    fn base64_decode_round_trips_bytes() {
+        // Binary-ish payload incl. every byte value and a zero/high-byte tail.
+        let mut data: Vec<u8> = (0u8..=255).collect();
+        data.extend_from_slice(b"attachment bytes \x00\xff tail");
+        let encoded = super::base64_standard(&data);
+        assert_eq!(super::base64_standard_decode(&encoded).unwrap(), data);
+    }
+
+    #[test]
+    fn base64_decode_accepts_urlsafe_alphabet_and_missing_padding() {
+        // 'Q'… sequences encode identically in both alphabets; check the
+        // lenient variants decode to the same bytes.
+        assert_eq!(super::base64_standard_decode("QQ==").unwrap(), b"A".to_vec());
+        assert_eq!(super::base64_standard_decode("QQ").unwrap(), b"A".to_vec());
+        assert_eq!(super::base64_standard_decode("Q Q ==").unwrap(), b"A".to_vec());
+    }
+
+    #[test]
+    fn base64_decode_rejects_garbage() {
+        assert!(super::base64_standard_decode("!!!").is_err());
+        assert!(super::base64_standard_decode("a?b=").is_err());
+    }
+
+    #[test]
+    fn write_file_base64_creates_parents_and_writes_bytes() {
+        let dir = std::env::temp_dir().join(format!("chatui-wfb64-{}-{}", std::process::id(), std::path::Path::new(&std::env::temp_dir()).exists() as u8));
+        let path = dir.join("nested/att.bin");
+        super::write_file_base64(
+            path.to_string_lossy().to_string(),
+            super::base64_standard(&[0u8, 1, 254, 255]),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), vec![0u8, 1, 254, 255]);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_file_base64_rejects_invalid_data() {
+        let dir = std::env::temp_dir().join(format!("chatui-wfb64-bad-{}", std::process::id()));
+        let path = dir.join("att.bin");
+        assert!(super::write_file_base64(path.to_string_lossy().to_string(), "!!!".into()).is_err());
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4806,6 +4894,7 @@ pub fn run() {
             list_subdirectories,
             list_dir_entries,
             write_text_file,
+            write_file_base64,
             read_text_file,
             path_exists,
             remove_path,

@@ -23,13 +23,20 @@ export function loadAgentDefinitions(): AgentDefinition[] {
     // One-time migration: "read past chats" used to grant access to every
     // session. After the own/external split, legacy agents keep that reach
     // by upgrading to externalChats: "all" (users can narrow it per agent).
+    // Records saved before updatedAt existed backfill it from createdAt so
+    // cloud-sync merges can order them.
     let migrated = false;
     const next = valid.map((a) => {
+      let rec = a;
       if ((a as AgentDefinition).readChats && a.externalChats === undefined) {
         migrated = true;
-        return { ...a, externalChats: "all" as const };
+        rec = { ...rec, externalChats: "all" as const };
       }
-      return a;
+      if (typeof (rec as Partial<AgentDefinition>).updatedAt !== "string") {
+        migrated = true;
+        rec = { ...rec, updatedAt: rec.createdAt };
+      }
+      return rec;
     });
     if (migrated) persistAgents(next);
     void remapLegacySandboxFolders();
@@ -76,13 +83,15 @@ async function remapLegacySandboxFolders(): Promise<void> {
 }
 
 export function saveAgentDefinition(
-  def: Omit<AgentDefinition, "id" | "createdAt">,
+  def: Omit<AgentDefinition, "id" | "createdAt" | "updatedAt">,
 ): AgentDefinition {
   const agents = loadAgentDefinitions();
+  const now = new Date().toISOString();
   const full: AgentDefinition = {
     ...def,
     id: crypto.randomUUID(),
-    createdAt: new Date().toISOString(),
+    createdAt: now,
+    updatedAt: now,
   };
   persistAgents([full, ...agents]);
   return full;
@@ -94,7 +103,7 @@ export function deleteAgentDefinition(id: string) {
 
 /** Fields callers may patch on a saved agent (identity/config only). */
 export type AgentUpdatePatch = Partial<
-  Omit<AgentDefinition, "id" | "createdAt" | "capabilities">
+  Omit<AgentDefinition, "id" | "createdAt" | "updatedAt" | "capabilities">
 > & {
   /** Merged into the existing capabilities (partial allowed). */
   capabilities?: Partial<AgentDefinition["capabilities"]>;
@@ -115,9 +124,11 @@ export function updateAgentDefinition(
   const next: AgentDefinition = {
     ...prev,
     ...patch,
-    // Never let a patch move or recreate the record.
+    // Never let a patch move or recreate the record (updatedAt always stamps
+    // now so cloud-sync merges order edits — a forged stamp is overwritten).
     id: prev.id,
     createdAt: prev.createdAt,
+    updatedAt: new Date().toISOString(),
     capabilities: { ...prev.capabilities, ...(patch.capabilities ?? {}) },
   };
   agents[idx] = next;

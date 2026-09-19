@@ -58,6 +58,8 @@ function settings(overrides: Partial<UserSettings> = {}): UserSettings {
     knowledgeSources: { chats: true, files: true, images: true, memories: true },
     contextCompression: false,
     taskFinishNotifications: true,
+    promptSuggestions: true,
+    agentSuggestions: true,
     ...overrides,
   };
 }

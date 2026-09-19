@@ -1,6 +1,10 @@
-import { useMemo, useState } from "react";
-import { ArrowUp, Check, FileText, Plus, X } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { ArrowUp, Check, FileText, MessageCircle, Plus, X } from "lucide-react";
 import type { AgentDefinition, ChatSession, MessageAttachment } from "@/types";
+import {
+  NEW_AGENT_SUGGESTIONS,
+  sessionSuggestionsFor,
+} from "@/lib/agent-suggestions";
 import { AgentAvatar } from "@/components/agent-avatar";
 import {
   DropdownMenu,
@@ -28,8 +32,8 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Spinner } from "@/components/ui/spinner";
 import { cn } from "@/lib/utils";
 
-/** Composer modes: the three ways to start something from the dashboard. */
-export type DashboardComposeMode = "task" | "agent" | "session";
+/** Composer modes: the two ways to start something from the dashboard. */
+export type DashboardComposeMode = "agent" | "session";
 
 function formatWhen(date: Date) {
   const now = new Date();
@@ -51,10 +55,11 @@ function formatBytes(bytes: number) {
 
 /**
  * The Agents tab's default view — a small mission control: every saved agent
- * with its recent tasks, and a composer pinned to the bottom that starts a
- * new-agent setup, a session with a picked agent (defaults to the most
- * recent one), or a standalone task — which hands off to the Chat tab, where
- * unassigned tasks live as task-mode chats.
+ * with its recent sessions, and a composer pinned to the bottom that starts
+ * a new-agent setup or a session with an explicitly picked agent. Focusing
+ * the composer opens a search-style suggestion dropdown attached above it:
+ * agent descriptions in "New Agent" mode, the picked agent's personalized
+ * prompts in session mode, or the agent picker when none is chosen yet.
  */
 export function AgentDashboard({
   agents,
@@ -67,13 +72,15 @@ export function AgentDashboard({
   onSend,
   files = [],
   onRemoveFile,
+  promptSuggestions,
+  agentSuggestions,
 }: {
   agents: AgentDefinition[];
   /** Agent-tab sessions, newest first. */
   sessions: ChatSession[];
   runningIds?: Set<string>;
   sendOnEnter: boolean;
-  /** Composer model picker (tasks and new agents run on the composer's model). */
+  /** Composer model picker (sessions and new agents run on the composer's model). */
   modelSelect: React.ReactNode;
   onOpenAgentConsole: (agentId: string) => void;
   onSelectSession: (id: string) => void;
@@ -81,10 +88,18 @@ export function AgentDashboard({
   /** Files dropped/attached for the next send (owned by ChatView's composer state). */
   files?: MessageAttachment[];
   onRemoveFile?: (id: string) => void;
+  /** Settings toggles — prompt starters and agent recommendations. */
+  promptSuggestions: boolean;
+  agentSuggestions: boolean;
 }) {
-  const [mode, setMode] = useState<DashboardComposeMode>("task");
+  const [mode, setMode] = useState<DashboardComposeMode>(() =>
+    agents.length > 0 ? "session" : "agent",
+  );
   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
   const [inputText, setInputText] = useState("");
+  const [focused, setFocused] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const sessionsByAgent = useMemo(() => {
     const map = new Map<string, ChatSession[]>();
@@ -100,14 +115,56 @@ export function AgentDashboard({
   const runningCountFor = (agentId: string) =>
     (sessionsByAgent.get(agentId) ?? []).filter((s) => runningIds?.has(s.id)).length;
 
-  // "New Agent Session" defaults to the most recent agent: the one used last
-  // (sessions are newest-first), or the newest-created agent otherwise.
-  const mostRecentAgentId = useMemo(() => {
-    const lastAgentSession = sessions.find((s) => s.agentId);
-    return lastAgentSession?.agentId ?? agents[0]?.id;
-  }, [sessions, agents]);
-  const effectiveAgentId = pickedAgentId ?? mostRecentAgentId ?? null;
-  const selectedAgent = agents.find((a) => a.id === effectiveAgentId) ?? null;
+  // Session mode requires an explicit pick — no silent default. The most
+  // recently used agent is only a *suggested* badge in the picker (gated by
+  // the agent-suggestions setting).
+  const selectedAgent = agents.find((a) => a.id === pickedAgentId) ?? null;
+
+  const suggestedAgentId = useMemo(() => {
+    if (!agentSuggestions) return null;
+    return (
+      sessions.find((s) => s.agentId && agents.some((a) => a.id === s.agentId))
+        ?.agentId ?? null
+    );
+  }, [sessions, agents, agentSuggestions]);
+
+  // Agent order for the picker: most recently used first when agent
+  // suggestions are on (so the suggestion is one click away), alphabetical
+  // otherwise.
+  const orderedAgents = useMemo(() => {
+    if (!agentSuggestions) {
+      return [...agents].sort((a, b) => a.name.localeCompare(b.name));
+    }
+    const recentFirst: string[] = [];
+    for (const s of sessions) {
+      if (s.agentId && !recentFirst.includes(s.agentId)) recentFirst.push(s.agentId);
+    }
+    const rank = (id: string) => {
+      const i = recentFirst.indexOf(id);
+      return i === -1 ? recentFirst.length : i;
+    };
+    return [...agents].sort((a, b) => rank(a.id) - rank(b.id) || a.name.localeCompare(b.name));
+  }, [agents, sessions, agentSuggestions]);
+
+  // Personalized prompt starters for the picked agent (recent session titles
+  // with it first). Empty until an agent is chosen.
+  const promptList = useMemo(() => {
+    if (!promptSuggestions) return [];
+    if (mode === "agent") return NEW_AGENT_SUGGESTIONS;
+    return selectedAgent ? sessionSuggestionsFor(selectedAgent, sessions) : [];
+  }, [mode, promptSuggestions, selectedAgent, sessions]);
+
+  const showAgentList = mode === "session" && !selectedAgent;
+  // Suggestions open at the top of the dashboard while the composer is
+  // active; the sections below fade until it closes.
+  const suggestionsOpen =
+    (focused || pickerOpen) &&
+    (showAgentList || promptList.length > 0);
+
+  const pickAgent = (id: string) => {
+    setPickedAgentId(id);
+    textareaRef.current?.focus();
+  };
 
   const canSend =
     (inputText.trim().length > 0 || files.length > 0) &&
@@ -123,16 +180,25 @@ export function AgentDashboard({
   const placeholder =
     mode === "agent"
       ? "Describe what this new agent should do and it will set itself up…"
-      : mode === "session"
-        ? selectedAgent
-          ? `Message ${selectedAgent.name}…`
-          : "Pick an agent to start a session…"
-        : "Describe what you want to do…";
+      : selectedAgent
+        ? `Message ${selectedAgent.name}…`
+        : "Choose an agent to start a session…";
+
+  const fillPrompt = (s: string) => {
+    setInputText(s);
+    textareaRef.current?.focus();
+  };
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <ScrollArea className="min-h-0 flex-1">
         <div className="mx-auto w-full max-w-5xl px-4 pb-8">
+          <div
+            className={cn(
+              "transition-opacity duration-300",
+              suggestionsOpen && "pointer-events-none opacity-0",
+            )}
+          >
           {/* ─── Your workers ─── */}
           <section className="flex flex-col gap-3">
             <div className="flex items-center gap-2">
@@ -146,7 +212,10 @@ export function AgentDashboard({
             {agents.length === 0 ? (
               <button
                 type="button"
-                onClick={() => setMode("agent")}
+                onClick={() => {
+                  setMode("agent");
+                  textareaRef.current?.focus();
+                }}
                 className={cn(
                   "flex items-center gap-3 rounded-xl border border-dashed p-5 text-left transition-colors",
                   "hover:border-foreground/30 hover:bg-muted/50",
@@ -162,7 +231,7 @@ export function AgentDashboard({
               </button>
             ) : (
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {agents.map((agent) => {
+                {agents.slice(0, 5).map((agent) => {
                   const agentSessions = sessionsByAgent.get(agent.id) ?? [];
                   const last = agentSessions[0];
                   const running = runningCountFor(agent.id);
@@ -213,6 +282,19 @@ export function AgentDashboard({
                     </div>
                   );
                 })}
+                {/* Trailing card: start a new agent setup */}
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    setMode("agent");
+                    textareaRef.current?.focus();
+                  }}
+                  className="flex min-h-24 cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed p-4 text-muted-foreground transition-colors hover:border-foreground/30 hover:bg-muted/50 hover:text-foreground"
+                >
+                  <Plus className="size-5" />
+                  <span className="text-sm font-medium">Add agent</span>
+                </button>
               </div>
             )}
           </section>
@@ -227,9 +309,8 @@ export function AgentDashboard({
                   : `${sessions.length} session${sessions.length === 1 ? "" : "s"}`}
               </span>
             </div>
-            {sessions.length > 0 && (
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {sessions.slice(0, 9).map((session) => {
+            <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {sessions.slice(0, 5).map((session) => {
                   const agent = agents.find((a) => a.id === session.agentId) ?? null;
                   const isRunning = runningIds?.has(session.id) ?? false;
                   return (
@@ -277,15 +358,116 @@ export function AgentDashboard({
                     </div>
                   );
                 })}
+                {/* Trailing card: start a new agent session */}
+                <button
+                  type="button"
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => {
+                    setMode("session");
+                    textareaRef.current?.focus();
+                  }}
+                  className="flex min-h-24 cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed p-4 text-muted-foreground transition-colors hover:border-foreground/30 hover:bg-muted/50 hover:text-foreground"
+                >
+                  <Plus className="size-5" />
+                  <span className="text-sm font-medium">New session</span>
+                </button>
               </div>
-            )}
           </section>
+          </div>
         </div>
       </ScrollArea>
 
       {/* ─── Composer — pinned to the bottom ─── */}
       <div className="relative shrink-0">
         <div className="mx-auto w-full max-w-5xl px-4 pb-4">
+          {/* ─── Suggestions — search-style panel right above the textbox ─── */}
+          {suggestionsOpen && (
+            <div className="mb-2 animate-in fade-in slide-in-from-bottom-2 overflow-hidden rounded-xl border bg-card shadow-lg duration-200">
+              <div className="flex items-center gap-2 px-4 pb-1 pt-3">
+                {showAgentList ? (
+                  <>
+                    <span className="text-xs font-medium">Choose an agent</span>
+                    <span className="text-xs text-muted-foreground">
+                      {agentSuggestions && suggestedAgentId
+                        ? "most recent first"
+                        : `${agents.length} agent${agents.length === 1 ? "" : "s"}`}
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    {mode === "session" && selectedAgent && (
+                      <AgentAvatar seed={selectedAgent.id} className="size-4 shrink-0" />
+                    )}
+                    <span className="text-xs font-medium">
+                      {mode === "agent"
+                        ? "Describe your new agent"
+                        : selectedAgent
+                          ? `Prompts for ${selectedAgent.name}`
+                          : "Start with a prompt"}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      pick one to fill the composer
+                    </span>
+                  </>
+                )}
+              </div>
+              <div className="max-h-64 overflow-y-auto pb-1">
+                {showAgentList ? (
+                  agents.length === 0 ? (
+                    <button
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => setMode("agent")}
+                      className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm transition-colors hover:bg-muted/60"
+                    >
+                      <Plus className="size-4 shrink-0 text-muted-foreground" />
+                      <span>No agents yet — describe one in New Agent mode</span>
+                    </button>
+                  ) : (
+                    orderedAgents.map((a) => (
+                      <button
+                        key={a.id}
+                        type="button"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => pickAgent(a.id)}
+                        className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-muted/60"
+                      >
+                        <AgentAvatar seed={a.id} className="size-6 shrink-0" />
+                        <span className="flex min-w-0 flex-1 flex-col">
+                          <span className="truncate text-sm font-medium">{a.name}</span>
+                          <span className="truncate text-xs text-muted-foreground">
+                            {a.purpose || "No purpose set"}
+                          </span>
+                        </span>
+                        {a.id === suggestedAgentId && (
+                          <span className="shrink-0 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                            Suggested
+                          </span>
+                        )}
+                      </button>
+                    ))
+                  )
+                ) : (
+                  promptList.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => fillPrompt(s)}
+                      className="flex w-full items-center gap-3 px-4 py-2.5 text-left text-sm transition-colors hover:bg-muted/60"
+                    >
+                      {mode === "agent" ? (
+                        <Plus className="size-4 shrink-0 text-muted-foreground" />
+                      ) : (
+                        <MessageCircle className="size-4 shrink-0 text-muted-foreground" />
+                      )}
+                      <span className="min-w-0 flex-1 truncate">{s}</span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
           <InputGroup>
             {files.length > 0 && (
               <InputGroupAddon align="block-start">
@@ -317,8 +499,11 @@ export function AgentDashboard({
               </InputGroupAddon>
             )}
             <InputGroupTextarea
+              ref={textareaRef}
               value={inputText}
               onChange={(e) => setInputText(e.currentTarget.value)}
+              onFocus={() => setFocused(true)}
+              onBlur={() => setFocused(false)}
               onKeyDown={(e) => {
                 if (sendOnEnter && e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
@@ -333,7 +518,6 @@ export function AgentDashboard({
               <div className="flex items-center gap-0.5 rounded-full border p-0.5">
                 {(
                   [
-                    { key: "task", label: "New Task" },
                     { key: "agent", label: "New Agent" },
                     { key: "session", label: "New Agent Session" },
                   ] as Array<{ key: DashboardComposeMode; label: string }>
@@ -354,31 +538,49 @@ export function AgentDashboard({
                 ))}
               </div>
 
-              {/* Agent picker — session mode; chevron slides in on hover */}
-              {mode === "session" && selectedAgent && (
-                <DropdownMenu>
+              {/* Agent picker — session mode always shows it: a session needs an explicit pick */}
+              {mode === "session" && (
+                <DropdownMenu onOpenChange={setPickerOpen}>
                   <DropdownMenuTrigger asChild>
                     <button
                       type="button"
-                      className="group flex min-w-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors hover:bg-accent"
-                      title={`${selectedAgent.name} — ${selectedAgent.purpose || "no purpose set"}`}
+                      className={cn(
+                        "group flex min-w-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition-colors hover:bg-accent",
+                        !selectedAgent && "border-dashed text-muted-foreground",
+                      )}
+                      title={
+                        selectedAgent
+                          ? `${selectedAgent.name} — ${selectedAgent.purpose || "no purpose set"}`
+                          : "Choose an agent for this session"
+                      }
                     >
-                      <AgentAvatar seed={selectedAgent.id} className="size-4 shrink-0" />
-                      <span className="max-w-36 truncate">{selectedAgent.name}</span>
+                      {selectedAgent ? (
+                        <>
+                          <AgentAvatar seed={selectedAgent.id} className="size-4 shrink-0" />
+                          <span className="max-w-36 truncate">{selectedAgent.name}</span>
+                        </>
+                      ) : (
+                        <span>Choose agent</span>
+                      )}
                     </button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="start" className="max-h-72 overflow-y-auto">
-                    {agents.map((a) => (
+                    {orderedAgents.map((a) => (
                       <DropdownMenuItem
                         key={a.id}
-                        onClick={() => setPickedAgentId(a.id)}
-                        className={cn(a.id === selectedAgent.id && "bg-accent")}
+                        onClick={() => pickAgent(a.id)}
+                        className={cn(a.id === selectedAgent?.id && "bg-accent")}
                       >
                         <AgentAvatar seed={a.id} className="size-4" />
                         <span className="min-w-0 flex-col">
                           <span className="max-w-48 truncate text-sm">{a.name}</span>
                         </span>
-                        {a.id === selectedAgent.id && <Check className="ml-auto size-3.5" />}
+                        {a.id === suggestedAgentId && (
+                          <span className="ml-auto rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
+                            Suggested
+                          </span>
+                        )}
+                        {a.id === selectedAgent?.id && <Check className="size-3.5" />}
                       </DropdownMenuItem>
                     ))}
                   </DropdownMenuContent>

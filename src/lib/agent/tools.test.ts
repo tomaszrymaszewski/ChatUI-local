@@ -154,6 +154,43 @@ describe("mcp proxy tools", () => {
   });
 });
 
+describe("structured input schema", () => {
+  const structuredInput = () =>
+    buildAgentTools(true, () => null, "chat").find((t) => t.name === "request_structured_input")!;
+  const parseForm = (input: unknown) =>
+    (structuredInput().schema as z.ZodObject).parse(input) as {
+      title: string;
+      fields: Array<{ name: string; type: string; options?: string[] }>;
+    };
+
+  it("defaults a missing title instead of failing the call", () => {
+    const parsed = parseForm({
+      fields: [{ name: "topic", label: "Topic", type: "text", required: true }],
+    });
+    expect(parsed.title).toBe("A few questions");
+  });
+
+  it("falls back to text on an invented field type instead of failing", () => {
+    const parsed = parseForm({
+      title: "Setup",
+      fields: [{ name: "pick", label: "Pick", type: "radio", options: ["a", "b"] }],
+    });
+    expect(parsed.fields[0].type).toBe("text");
+  });
+
+  it("accepts a representative select form untouched", () => {
+    const parsed = parseForm({
+      title: "Deep research setup",
+      fields: [
+        { name: "topic", label: "Topic", type: "text", required: true },
+        { name: "depth", label: "Depth", type: "select", options: ["Quick", "Thorough"] },
+      ],
+    });
+    expect(parsed.fields).toHaveLength(2);
+    expect(parsed.fields[1].type).toBe("select");
+  });
+});
+
 describe("Mac app tools", () => {
   it("are available in the task profile alongside run_command", () => {
     const names = buildAgentTools(true, () => null, "task", true).map((t) => t.name);

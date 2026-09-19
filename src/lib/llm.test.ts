@@ -1,12 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PROVIDERS_EVENT,
+  buildFollowUpPrompt,
+  buildQuestionOptionsPrompt,
   capTitleWords,
+  cleanFollowUpSuggestion,
   createProvider,
   deleteProvider,
   fetchProviders,
   getProviderApiKey,
   instantChatTitle,
+  parseQuestionOptions,
   updateProvider,
 } from "./llm";
 
@@ -139,5 +143,99 @@ describe("instantChatTitle", () => {
 
   it("falls back to a word-based title for attachments-only sends", () => {
     expect(instantChatTitle("Attachments")).toBe("Attachments");
+  });
+});
+
+describe("buildFollowUpPrompt", () => {
+  it("folds the title and recent exchanges into the prompt", () => {
+    const { system, user } = buildFollowUpPrompt(
+      [
+        { role: "user", content: "Plan my Kyoto trip" },
+        { role: "assistant", content: "Autumn is lovely." },
+      ],
+      "Kyoto planning",
+    );
+    expect(system).toMatch(/user's voice/);
+    expect(user).toContain("Kyoto planning");
+    expect(user).toContain("User: Plan my Kyoto trip");
+    expect(user).toContain("Assistant: Autumn is lovely.");
+  });
+
+  it("caps messages and length", () => {
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      role: i % 2 === 0 ? "user" : "assistant",
+      content: `x${i} `.repeat(300),
+    }));
+    const { user } = buildFollowUpPrompt(many);
+    expect(user.length).toBeLessThan(20 * 400);
+    expect(user).toContain("x19");
+    expect(user).not.toContain("x0 x0");
+  });
+});
+
+describe("buildQuestionOptionsPrompt", () => {
+  it("asks for short answers to the exact question with context", () => {
+    const { system, user } = buildQuestionOptionsPrompt(
+      "When should we leave?",
+      [
+        { role: "user", content: "Plan my Kyoto trip" },
+        { role: "assistant", content: "Autumn is lovely. When should we leave?" },
+      ],
+    );
+    expect(system).toMatch(/JSON array/);
+    expect(user).toContain("Question: When should we leave?");
+    expect(user).toContain("User: Plan my Kyoto trip");
+  });
+});
+
+describe("parseQuestionOptions", () => {
+  it("parses a JSON array", () => {
+    expect(parseQuestionOptions('["Tomorrow", "Next week"]')).toEqual([
+      "Tomorrow",
+      "Next week",
+    ]);
+  });
+
+  it("finds JSON inside fences and prose", () => {
+    expect(
+      parseQuestionOptions('Sure:\n```json\n["A", "B"]\n```'),
+    ).toEqual(["A", "B"]);
+  });
+
+  it("falls back to one-per-line lists", () => {
+    expect(
+      parseQuestionOptions("- Tomorrow morning\n2. Next week\n* \"No rush\""),
+    ).toEqual(["Tomorrow morning", "Next week", "No rush"]);
+  });
+
+  it("caps at three, dedupes, and rejects leaks and empties", () => {
+    expect(parseQuestionOptions('["A", "B", "C", "D", "A"]')).toEqual(["A", "B", "C"]);
+    expect(parseQuestionOptions("")).toEqual([]);
+    expect(parseQuestionOptions("[]")).toEqual([]);
+    expect(parseQuestionOptions("As an AI, I cannot decide")).toEqual([]);
+    expect(parseQuestionOptions("Here are some ideas")).toEqual([]);
+  });
+});
+
+describe("cleanFollowUpSuggestion", () => {
+  it("keeps a clean single line", () => {
+    expect(cleanFollowUpSuggestion("What else should I pack?")).toBe(
+      "What else should I pack?",
+    );
+  });
+
+  it("strips quotes, labels, and extra lines", () => {
+    expect(cleanFollowUpSuggestion('"Tell me more."\nSecond line')).toBe(
+      "Tell me more.",
+    );
+    expect(cleanFollowUpSuggestion("User: Go deeper")).toBe("Go deeper");
+  });
+
+  it("caps length and rejects declines and leaks", () => {
+    expect(cleanFollowUpSuggestion(`y`.repeat(200)).length).toBeLessThanOrEqual(140);
+    expect(cleanFollowUpSuggestion("")).toBe("");
+    expect(cleanFollowUpSuggestion("NOTHING")).toBe("");
+    expect(cleanFollowUpSuggestion("Here is a suggestion: pack socks")).toBe("");
+    expect(cleanFollowUpSuggestion("As an AI, I think…")).toBe("");
   });
 });

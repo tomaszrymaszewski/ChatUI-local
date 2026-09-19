@@ -150,6 +150,8 @@ export interface AgentDefinition {
   /** Knowledge files/images sent with every run of this agent. */
   attachments?: AgentAttachment[];
   createdAt: string;
+  /** Last user- or agent-driven edit (bumped on every update; feeds cloud-sync merge). */
+  updatedAt: string;
 }
 
 /**
@@ -282,4 +284,8 @@ export interface UserSettings {
   contextCompression: boolean;
   /** Post a macOS notification when a background task finishes. */
   taskFinishNotifications: boolean;
+  /** Show follow-up ghost text and starter-prompt suggestions. */
+  promptSuggestions: boolean;
+  /** Recommend which agent to use when starting an agent session. */
+  agentSuggestions: boolean;
 }
