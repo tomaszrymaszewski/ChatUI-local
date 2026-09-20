@@ -46,13 +46,203 @@ function glmReasoningEffort(effort: ReasoningEffort | undefined): "low" | "high"
  * them so requests match a plain fetch with only Authorization + Content-Type
  * (what the pre-agent code sent).
  */
-const corsSafeFetch: typeof fetch = (input, init) => {
+/**
+ * Host fragment of Google's OpenAI-compatible endpoint. Only requests to
+ * this host get thought-signature handling — every other provider sees
+ * byte-identical bodies to before.
+ */
+const GEMINI_OPENAI_HOST = "generativelanguage.googleapis.com";
+
+/**
+ * Google-documented bypass for thought-signature validation: when a
+ * functionCall part has no captured signature (parallel-call tails, history
+ * replayed without one), sending base64("skip_thought_signature_validator")
+ * keeps the request valid instead of 400ing with "Function call is missing
+ * a thought_signature in functionCall parts".
+ */
+export const GEMINI_SKIP_THOUGHT_SIGNATURE = "c2tpcF90aG91Z2h0X3NpZ25hdHVyZV92YWxpZGF0b3I=";
+
+/** Cap on remembered signatures so long sessions can't grow this map forever. */
+const MAX_THOUGHT_SIGNATURES = 1000;
+
+/**
+ * Real thought signatures captured from Gemini responses, keyed by tool-call
+ * id. Gemini attaches the signature to the FIRST tool call of a response, so
+ * parallel calls after it have none — those (and ids never seen, e.g. from
+ * history replay) fall back to GEMINI_SKIP_THOUGHT_SIGNATURE at send time.
+ */
+const geminiThoughtSignatures = new Map<string, string>();
+
+/** Forgets captured signatures (tests). */
+export function clearGeminiThoughtSignatures(): void {
+  geminiThoughtSignatures.clear();
+}
+
+function rememberThoughtSignature(id: string, sig: unknown): void {
+  if (typeof id !== "string" || !id || typeof sig !== "string" || !sig) return;
+  geminiThoughtSignatures.set(id, sig);
+  if (geminiThoughtSignatures.size > MAX_THOUGHT_SIGNATURES) {
+    const oldest = geminiThoughtSignatures.keys().next().value;
+    if (oldest !== undefined) geminiThoughtSignatures.delete(oldest);
+  }
+}
+
+function signatureOfToolCall(tc: unknown): string | null {
+  if (!tc || typeof tc !== "object") return null;
+  const extra = (tc as { extra_content?: { google?: { thought_signature?: unknown } } }).extra_content;
+  const nested = extra?.google?.thought_signature;
+  if (typeof nested === "string" && nested) return nested;
+  const top = (tc as { thought_signature?: unknown }).thought_signature;
+  return typeof top === "string" && top ? top : null;
+}
+
+/**
+ * Ensures every assistant tool_call in an outgoing chat-completions body
+ * carries a thought signature at Google's OpenAI-compat location
+ * (extra_content.google.thought_signature): the captured real one when this
+ * session saw it, the skip-validator sentinel otherwise. LangChain rebuilds
+ * request tool_calls from its own message objects (which drop the field), so
+ * without this the second turn of any Gemini thinking-model tool run 400s.
+ * Pure (besides the capture map): unparseable bodies and bodies without
+ * assistant tool_calls come back unchanged. Exported for tests.
+ */
+export function injectGeminiThoughtSignatures(body: string): string {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return body;
+  }
+  const messages = (parsed as { messages?: unknown })?.messages;
+  if (!Array.isArray(messages)) return body;
+  let changed = false;
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const msg = m as { role?: unknown; tool_calls?: unknown };
+    if (msg.role !== "assistant" || !Array.isArray(msg.tool_calls)) continue;
+    for (const tc of msg.tool_calls) {
+      if (!tc || typeof tc !== "object") continue;
+      const existing = signatureOfToolCall(tc);
+      const id = (tc as { id?: unknown }).id;
+      if (existing) {
+        if (typeof id === "string") rememberThoughtSignature(id, existing);
+        continue;
+      }
+      const sig =
+        (typeof id === "string" && geminiThoughtSignatures.get(id)) || GEMINI_SKIP_THOUGHT_SIGNATURE;
+      const rec = tc as { extra_content?: { google?: Record<string, unknown> } };
+      rec.extra_content = {
+        ...(rec.extra_content ?? {}),
+        google: { ...(rec.extra_content?.google ?? {}), thought_signature: sig },
+      };
+      changed = true;
+    }
+  }
+  return changed ? JSON.stringify(parsed) : body;
+}
+
+/**
+ * Records thought signatures from a Gemini chat-completions response body —
+ * one JSON object (non-streaming) or SSE `data:` lines (streaming deltas).
+ * Streaming ids arrive on the first chunk per index while the signature can
+ * ride a later chunk for the same index, so index→id is tracked per body.
+ * Never throws. Exported for tests.
+ */
+export function captureGeminiThoughtSignatures(text: string): void {
+  const payloads: unknown[] = [];
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      payloads.push(JSON.parse(trimmed));
+    } catch {
+      return;
+    }
+  } else {
+    for (const line of text.split("\n")) {
+      const data = line.startsWith("data:") ? line.slice(5).trim() : "";
+      if (!data || data === "[DONE]") continue;
+      try {
+        payloads.push(JSON.parse(data));
+      } catch {
+        // keep-alive comments and partial lines carry nothing
+      }
+    }
+  }
+  const idByIndex = new Map<number, string>();
+  const pendingSigByIndex = new Map<number, string>();
+  const handle = (tc: unknown) => {
+    if (!tc || typeof tc !== "object") return;
+    const rec = tc as { id?: unknown; index?: unknown };
+    const idx = typeof rec.index === "number" ? rec.index : null;
+    const id = typeof rec.id === "string" && rec.id ? rec.id : null;
+    if (idx !== null && id) {
+      idByIndex.set(idx, id);
+      const pending = pendingSigByIndex.get(idx);
+      if (pending) {
+        rememberThoughtSignature(id, pending);
+        pendingSigByIndex.delete(idx);
+      }
+    }
+    const sig = signatureOfToolCall(tc);
+    if (!sig) return;
+    if (id) rememberThoughtSignature(id, sig);
+    else if (idx !== null) {
+      const known = idByIndex.get(idx);
+      if (known) rememberThoughtSignature(known, sig);
+      else pendingSigByIndex.set(idx, sig);
+    }
+  };
+  for (const p of payloads) {
+    const choices = (p as { choices?: unknown })?.choices;
+    if (!Array.isArray(choices)) continue;
+    for (const c of choices) {
+      if (!c || typeof c !== "object") continue;
+      const choice = c as { delta?: { tool_calls?: unknown }; message?: { tool_calls?: unknown } };
+      const tcs = choice.delta?.tool_calls ?? choice.message?.tool_calls;
+      if (Array.isArray(tcs)) for (const tc of tcs) handle(tc);
+    }
+  }
+}
+
+/** Reads the request URL out of any fetch input shape. */
+function fetchInputUrl(input: Parameters<typeof fetch>[0]): string {
+  if (typeof input === "string") return input;
+  if (typeof URL !== "undefined" && input instanceof URL) return input.href;
+  if (typeof Request !== "undefined" && input instanceof Request) return input.url;
+  return "";
+}
+
+/**
+ * Pumps a Gemini response stream in the background, recording thought
+ * signatures for later requests. Never rejects.
+ */
+async function tapGeminiThoughtSignatures(stream: ReadableStream<Uint8Array>): Promise<void> {
+  try {
+    await captureGeminiThoughtSignatures(await new Response(stream).text());
+  } catch {
+    // capture is best-effort — a missed signature just means the sentinel
+  }
+}
+
+export const corsSafeFetch: typeof fetch = async (input, init) => {
   const headers = new Headers(init?.headers);
   for (const key of Array.from(headers.keys())) {
     const k = key.toLowerCase();
     if (k.startsWith("x-stainless-") || k === "user-agent") headers.delete(key);
   }
-  return fetch(input, { ...init, headers });
+  const gemini = fetchInputUrl(input).includes(GEMINI_OPENAI_HOST);
+  let body = init?.body;
+  if (gemini && typeof body === "string") {
+    const patched = injectGeminiThoughtSignatures(body);
+    if (patched !== body) body = patched;
+  }
+  const res = await fetch(input, body !== init?.body ? { ...init, headers, body } : { ...init, headers });
+  if (gemini && res.ok && res.body) {
+    const [forward, tap] = res.body.tee();
+    void tapGeminiThoughtSignatures(tap);
+    return new Response(forward, { status: res.status, statusText: res.statusText, headers: res.headers });
+  }
+  return res;
 };
 
 /**

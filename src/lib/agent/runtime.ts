@@ -12,6 +12,7 @@ import { buildSystemPrompt } from "@/lib/llm";
 import { createChatModel } from "@/lib/agent/models";
 import { buildAgentTools, type ToolProfile } from "@/lib/agent/tools";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
+import { homeDir, normalizePath } from "@/lib/agent/sandbox";
 import { loadMcpTools, createMcpProxy, type McpProxy, type McpToolsResult } from "@/lib/agent/mcp";
 import { loadSkillFiles, type SkillFile } from "@/lib/agent/skills";
 import type { RunContext } from "@/lib/agent/run-context";
@@ -469,6 +470,28 @@ function basename(path: string): string {
 }
 
 /**
+ * Builds the files-widget entry for a finished write_local_file call from
+ * the raw tool-call path and its result text. The path is normalized exactly
+ * like share_files normalizes (~/… expansion, ./… resolution) so both flows
+ * land on the same string and merge into one widget row; the byte count is
+ * parsed from both the create/overwrite ("(N bytes)") and append
+ * ("(now N bytes)") result formats. Exported for tests.
+ */
+export function writeLocalFileActivity(
+  path: string,
+  detail: string | undefined,
+  home: string | null,
+): NonNullable<ActivityItem["file"]> {
+  const bytesMatch = detail ? /\((?:now )?(\d+) bytes\)/.exec(detail) : null;
+  const normalized = normalizePath(path, home);
+  return {
+    path: normalized,
+    name: basename(normalized),
+    ...(bytesMatch ? { bytes: Number(bytesMatch[1]) } : {}),
+  };
+}
+
+/**
  * Provider-reported token counts of an assembled model message
  * (AIMessage.usage_metadata). Null when the message carries none — providers
  * that omit usage in streaming simply report nothing. Exported for tests and
@@ -788,18 +811,18 @@ export class DeepAgentSession {
             }
             // A completed write_local_file names the file it produced —
             // remember it so the session files widget can offer a download.
+            // The path is normalized exactly like share_files normalizes
+            // (~/… expansion, ./… resolution) so both flows land on the same
+            // string and the widget merges them into one row instead of
+            // showing the same file twice.
             let file: ActivityItem["file"];
             if (
               status === "finished" &&
               call.name === "write_local_file" &&
               typeof input?.path === "string"
             ) {
-              const bytesMatch = detail ? /\((\d+) bytes\)/.exec(detail) : null;
-              file = {
-                path: input.path,
-                name: basename(input.path),
-                ...(bytesMatch ? { bytes: Number(bytesMatch[1]) } : {}),
-              };
+              const home = await homeDir().catch(() => null);
+              file = writeLocalFileActivity(input.path, detail, home);
             }
             emit({
               type: "activity",

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AGENT_BUILDER_PROMPT, toolCallArgsPreview, toolCallLabel, usageOfMessage } from "./runtime";
+import { AGENT_BUILDER_PROMPT, toolCallArgsPreview, toolCallLabel, usageOfMessage, writeLocalFileActivity } from "./runtime";
 
 describe("toolCallArgsPreview", () => {
   it("previews write_local_file with a path header and content head", () => {
@@ -133,5 +133,38 @@ describe("AGENT_BUILDER_PROMPT", () => {
     expect(AGENT_BUILDER_PROMPT).toMatch(/create_agent exactly once/);
     expect(AGENT_BUILDER_PROMPT).toMatch(/write everything\s+settled above into its system_prompt/);
     expect(AGENT_BUILDER_PROMPT).toMatch(/not just the first message/);
+  });
+});
+
+describe("writeLocalFileActivity", () => {
+  const HOME = "/Users/tester";
+
+  it("normalizes ~/… to the share_files form so the widget merges them", () => {
+    const out = writeLocalFileActivity("~/Documents/report.docx", "Created ~/Documents/report.docx (12 bytes).", HOME);
+    expect(out.path).toBe("/Users/tester/Documents/report.docx");
+    expect(out.name).toBe("report.docx");
+    expect(out.bytes).toBe(12);
+  });
+
+  it("resolves ./… segments like share_files does", () => {
+    const out = writeLocalFileActivity("/a/./b/../b/f.txt", "Created /a/./b/../b/f.txt (3 bytes).", HOME);
+    expect(out.path).toBe("/a/b/f.txt");
+  });
+
+  it("parses the append result format so sizes don't stick at 0", () => {
+    expect(
+      writeLocalFileActivity("/a/f.txt", "Appended to /a/f.txt (now 456 bytes).", HOME).bytes,
+    ).toBe(456);
+    expect(
+      writeLocalFileActivity("/a/f.txt", "Overwrote /a/f.txt with the new content (78 bytes).", HOME).bytes,
+    ).toBe(78);
+  });
+
+  it("omits bytes when the result text carries no count", () => {
+    expect(writeLocalFileActivity("/a/f.txt", "Could not write /a/f.txt: denied", HOME)).toEqual({
+      path: "/a/f.txt",
+      name: "f.txt",
+    });
+    expect(writeLocalFileActivity("/a/f.txt", undefined, HOME).bytes).toBeUndefined();
   });
 });

@@ -59,6 +59,7 @@ import { StructuredInputForm } from "@/components/structured-input-form";
 import { SuggestionCard, installSkillByName } from "@/components/suggestion-card";
 import { type Artifact } from "@/lib/artifacts";
 import { downloadSharedFile } from "@/lib/local-file";
+import { mergeSessionFiles } from "@/lib/shared-files";
 import { checkForUpdate, loadUpdateSettings, isUpdaterAvailable } from "@/lib/updater";
 import { detectModeTrigger } from "@/lib/mode-triggers";
 import { followUpSuggestion } from "@/lib/agent-suggestions";
@@ -278,8 +279,36 @@ const SIDEBAR_EXPANDED_PX = 256;
 /** Right-hand space the widget stack reserves (18rem widget + 2 × 0.75rem). */
 const WIDGETS_RESERVED_PX = 312;
 
+// Which chat/agent session was open, per tab — local-only UI state (never
+// synced) so a real reload (e.g. macOS reclaiming the webview) reopens where
+// the user left off instead of dropping to the homescreen.
+const ACTIVE_TAB_KEY = "chatui:active-tab";
+const ACTIVE_SESSION_BY_TAB_KEY = "chatui:active-session-by-tab";
+
+function loadActiveTab(): "chat" | "agent" {
+  try {
+    return localStorage.getItem(ACTIVE_TAB_KEY) === "agent" ? "agent" : "chat";
+  } catch {
+    return "chat";
+  }
+}
+
+function loadActiveSessionByTab(): Record<"chat" | "agent", string | null> {
+  try {
+    const raw = localStorage.getItem(ACTIVE_SESSION_BY_TAB_KEY);
+    if (!raw) return { chat: null, agent: null };
+    const parsed = JSON.parse(raw) as { chat?: unknown; agent?: unknown };
+    return {
+      chat: typeof parsed.chat === "string" ? parsed.chat : null,
+      agent: typeof parsed.agent === "string" ? parsed.agent : null,
+    };
+  } catch {
+    return { chat: null, agent: null };
+  }
+}
+
 export function ChatView() {
-  const [activeTab, setActiveTab] = useState<"chat" | "agent">("chat");
+  const [activeTab, setActiveTab] = useState<"chat" | "agent">(loadActiveTab);
   const { sessions, allSessions, createSession, deleteSession, updateSession, moveToChatTab } =
     useSessions(activeTab);
   const { projects, createProject, updateProject, deleteProject, addProjectFile, deleteProjectFile, addProjectImage, deleteProjectImage, refetch: refetchProjects } =
@@ -291,7 +320,21 @@ export function ChatView() {
 
   const [activeSessionByTab, setActiveSessionByTab] = useState<
     Record<"chat" | "agent", string | null>
-  >({ chat: null, agent: null });
+  >(loadActiveSessionByTab);
+  useEffect(() => {
+    try {
+      localStorage.setItem(ACTIVE_TAB_KEY, activeTab);
+    } catch {
+      // private-mode quota — the session just won't survive a reload
+    }
+  }, [activeTab]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(ACTIVE_SESSION_BY_TAB_KEY, JSON.stringify(activeSessionByTab));
+    } catch {
+      // private-mode quota — the session just won't survive a reload
+    }
+  }, [activeSessionByTab]);
   const activeSessionId = activeSessionByTab[activeTab] ?? null;
   const setActiveSessionId = useCallback(
     (id: string | null) =>
@@ -851,30 +894,18 @@ export function ChatView() {
 
   // Files generated during this session for the files widget: shared files
   // and write_local_file results — the live run first, then the persisted
-  // active path — deduped by path (a later entry with a known size wins).
+  // active path. Same-path entries merge (a later known size wins); a stale
+  // activity trace of a file that was shared under another path collapses so
+  // the widget shows the actual file once (see mergeSessionFiles).
   const sessionFiles: SharedFile[] = (() => {
-    const byPath = new Map<string, SharedFile>();
-    const add = (f: SharedFile) => {
-      const prev = byPath.get(f.path);
-      byPath.set(f.path, prev ? { ...prev, ...f, size: f.size ?? prev.size } : f);
-    };
-    const fromActivities = (acts: ActivityItem[] | undefined) => {
-      for (const a of acts ?? []) {
-        if (!a.file || a.status === "error") continue;
-        const shared: SharedFile = { path: a.file.path, name: a.file.name };
-        if (a.file.bytes !== undefined) shared.size = a.file.bytes;
-        add(shared);
-      }
-    };
+    const sources: Array<{ shares: SharedFile[]; activities: ActivityItem[] }> = [];
     if (agent?.isRunning) {
-      for (const f of agent.files) add(f);
-      fromActivities(agent.activities);
+      sources.push({ shares: agent.files, activities: agent.activities });
     }
     for (const node of activePath) {
-      for (const f of node.message.files ?? []) add(f);
-      fromActivities(node.message.activities);
+      sources.push({ shares: node.message.files ?? [], activities: node.message.activities ?? [] });
     }
-    return Array.from(byPath.values());
+    return mergeSessionFiles(sources);
   })();
 
   // Widgets shown = stack slid in; the chat column reserves matching
