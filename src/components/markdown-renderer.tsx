@@ -16,6 +16,7 @@ import { Highlight, Prism, themes } from "prism-react-renderer";
 import { useTheme } from "next-themes";
 import { FileCode } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { parseChartSpec } from "@/lib/chart-spec";
 
 interface MarkdownRendererProps {
   content: string;
@@ -127,12 +128,25 @@ function MermaidBlock({ code }: { code: string }) {
   // synchronous main-thread layout on partial source. The timer resets with
   // every code change, so rendering only starts once the source is stable.
   useEffect(() => {
+    // A render attempted during a streaming pause can fail on partial source;
+    // that transient error must not stick once the full code arrives.
+    setError(null);
     let cancelled = false;
     const timer = setTimeout(() => {
       (async () => {
         try {
           const { default: mermaid } = await import("mermaid");
-          mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "neutral" });
+          mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: "strict",
+            theme: "neutral",
+            // htmlLabels measure in the DOM (accurate widths); wrap keeps long
+            // labels inside their node boxes instead of clipping the endings;
+            // padding adds breathing room around measured text.
+            htmlLabels: true,
+            wrap: true,
+            flowchart: { padding: 12 },
+          });
           const rendered = await mermaid.render(id, code);
           if (!cancelled) setSvg(rendered.svg);
         } catch (err) {
@@ -167,30 +181,39 @@ function VegaBlock({ spec }: { spec: string }) {
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
 
+  // Debounced like MermaidBlock: while a ```chart fence streams in, every tick
+  // holds partial JSON and parsing it can only fail ("Unterminated string").
+  // The timer resets with every change so embedding starts once stable, and a
+  // transient failure never sticks past the next tick.
   useEffect(() => {
+    setError(null);
+    setDone(false);
     let cancelled = false;
     let finalize: (() => void) | undefined;
-    (async () => {
-      try {
-        const parsed = JSON.parse(spec);
-        const { default: embed } = await import("vega-embed");
-        if (cancelled || !ref.current) return;
-        const result = await embed(ref.current, parsed, {
-          actions: false,
-          renderer: "svg",
-        });
-        if (cancelled) {
-          result.finalize();
-          return;
+    const timer = setTimeout(() => {
+      (async () => {
+        try {
+          const parsed = parseChartSpec(spec);
+          const { default: embed } = await import("vega-embed");
+          if (cancelled || !ref.current) return;
+          const result = await embed(ref.current, parsed, {
+            actions: false,
+            renderer: "svg",
+          });
+          if (cancelled) {
+            result.finalize();
+            return;
+          }
+          finalize = () => result.finalize();
+          setDone(true);
+        } catch (err) {
+          if (!cancelled) setError(err instanceof Error ? err.message : String(err));
         }
-        finalize = () => result.finalize();
-        setDone(true);
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
-      }
-    })();
+      })();
+    }, 300);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
       finalize?.();
     };
   }, [spec]);

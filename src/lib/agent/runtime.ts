@@ -37,6 +37,7 @@ import {
 } from "@/lib/agent/compression";
 import { emptyResponseGuardMiddleware } from "@/lib/agent/empty-response-guard";
 import { subagentErrorCaptureMiddleware } from "@/lib/agent/subagent-error-capture";
+import { ensureBrowserAsyncLocalStorage } from "@/lib/agent/browser-als-shim";
 
 /**
  * deepagents ships its own filesystem tools (ls, read_file, write_file, …)
@@ -626,6 +627,10 @@ export class DeepAgentSession {
   ) {}
 
   static async create(opts: AgentSessionOptions): Promise<DeepAgentSession> {
+    // Browser fallback for LangChain's AsyncLocalStorage context: without it
+    // the `task` tool's getCurrentTaskInput() throws "Config not retrievable"
+    // in the WKWebView and subagents never spawn. No-op in Node.
+    ensureBrowserAsyncLocalStorage();
     const model = await createChatModel(opts.provider, opts.modelName, opts.reasoningEffort);
     const mcp = await loadMcpTools(opts.projectDir, opts.mcpNames);
     // On-demand proxy for the non-hot connectors — including ones connected
