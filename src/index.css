@@ -168,6 +168,71 @@
   }
 }
 
+/*
+ * Agent avatar faces: on hover the eyes glance up/down or left/right
+ * (back to center), or the whole face does a small spin and settles back.
+ * Which one plays is picked at random per avatar.
+ */
+@keyframes agent-face-look-y {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  30% {
+    transform: translateY(-8%);
+  }
+  65% {
+    transform: translateY(8%);
+  }
+}
+
+@keyframes agent-face-look-x {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  30% {
+    transform: translateX(-8%);
+  }
+  65% {
+    transform: translateX(8%);
+  }
+}
+
+@keyframes agent-face-spin-cw {
+  0%,
+  100% {
+    rotate: 0deg;
+  }
+  50% {
+    rotate: 14deg;
+  }
+}
+
+@keyframes agent-face-spin-ccw {
+  0%,
+  100% {
+    rotate: 0deg;
+  }
+  50% {
+    rotate: -14deg;
+  }
+}
+
+/*
+ * Find-in-conversation (⌘F) match highlights — painted through the CSS
+ * Custom Highlight API, no DOM mutation. Browsers without the API simply
+ * show no paint; the count and scrolling still work.
+ */
+::highlight(conv-find) {
+  background-color: color-mix(in oklab, var(--color-yellow-300) 55%, transparent);
+}
+
+::highlight(conv-find-current) {
+  background-color: var(--color-yellow-400);
+  color: var(--color-black);
+}
+
 :root {
   --bg-pattern-color: color-mix(in oklab, var(--foreground) 6%, transparent);
 }

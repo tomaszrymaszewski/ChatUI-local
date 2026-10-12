@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   cmpTime,
   hashValue,
+  healCaseVariantRecords,
   isSyncedKey,
   mergeRecordLists,
   planSync,
+  pruneEmptySessions,
   pushDirty,
   setStorageHookSuspended,
   startSyncManager,
@@ -130,6 +132,128 @@ describe("mergeRecordLists", () => {
     );
     expect(mergeRecordLists("local-string", "{bad json", spec)).toBe("local-string");
     expect(mergeRecordLists("{bad json", JSON.stringify([rec]), spec)).toBe("{bad json");
+  });
+
+  it("collapses case-variant UUID records written by the phone", () => {
+    const id = "3f8a1b2c-4d5e-4f60-8a9b-0c1d2e3f4a5b";
+    const local = JSON.stringify([
+      { id: id.toLowerCase(), title: "Desktop", updatedAt: "2026-09-15T12:00:00Z", chatMode: "learn" },
+    ]);
+    const remote = JSON.stringify([
+      { id: id.toUpperCase(), title: "Phone", updatedAt: "2026-09-15T12:00:00Z" },
+    ]);
+    expect(JSON.parse(mergeRecordLists(local, remote, spec))).toEqual([
+      { id, title: "Desktop", updatedAt: "2026-09-15T12:00:00Z", chatMode: "learn" },
+    ]);
+  });
+
+  it("normalizes message ids and session_id while merging", () => {
+    const id = "AAAAAAAA-BBBB-4CCC-8DDD-EEEEFFFF0000";
+    const sessionId = "11111111-2222-4333-8444-555555555555";
+    const message = (messageId: string, session: string) => ({
+      id: messageId,
+      session_id: session,
+      role: "user",
+      content: "hi",
+      timestamp: "2026-09-15T12:00:00Z",
+    });
+    const local = JSON.stringify([message(id, sessionId)]);
+    const remote = JSON.stringify([message(id.toLowerCase(), sessionId.toLowerCase())]);
+    const merged = JSON.parse(
+      mergeRecordLists(local, remote, { idKey: "id", timeKey: "timestamp" }),
+    ) as Array<Record<string, string>>;
+    expect(merged).toHaveLength(1);
+    expect(merged[0].id).toBe(id.toLowerCase());
+    expect(merged[0].session_id).toBe(sessionId.toLowerCase());
+  });
+
+  it("keeps non-UUID ids untouched", () => {
+    const local = JSON.stringify([{ id: "p1", name: "Provider", updatedAt: "2026-09-15T12:00:00Z" }]);
+    const remote = JSON.stringify([{ id: "p2", name: "Other", updatedAt: "2026-09-15T11:00:00Z" }]);
+    const merged = JSON.parse(mergeRecordLists(local, remote, spec)) as Array<{ id: string }>;
+    expect(merged.map((r) => r.id).sort()).toEqual(["p1", "p2"]);
+  });
+});
+
+describe("healCaseVariantRecords", () => {
+  it("normalizes case-variant session records once", () => {
+    const id = "abcdef01-2345-4678-89ab-cdef01234567";
+    localStorage.setItem(
+      "chatui:sessions",
+      JSON.stringify([
+        { id: id.toLowerCase(), title: "Desktop", updatedAt: "2026-09-15T12:00:00Z", chatMode: "learn" },
+        { id: id.toUpperCase(), title: "Phone", updatedAt: "2026-09-15T12:00:00Z" },
+      ]),
+    );
+
+    healCaseVariantRecords();
+
+    const stored = JSON.parse(localStorage.getItem("chatui:sessions") ?? "[]") as Array<{
+      id: string;
+      title: string;
+      chatMode?: string;
+    }>;
+    expect(stored).toHaveLength(1);
+    expect(stored[0].id).toBe(id.toLowerCase());
+    expect(stored[0].title).toBe("Desktop");
+    expect(stored[0].chatMode).toBe("learn");
+
+    // The one-time flag prevents redundant rewrites on later launches.
+    const valueAfterHeal = localStorage.getItem("chatui:sessions");
+    healCaseVariantRecords();
+    expect(localStorage.getItem("chatui:sessions")).toBe(valueAfterHeal);
+  });
+});
+
+describe("pruneEmptySessions", () => {
+  const NOW = "2026-09-15T12:00:00.000Z";
+  const OLD = "2026-09-14T12:00:00.000Z";
+  const FRESH = "2026-09-15T11:55:00.000Z";
+  const SID = "abcdef01-2345-4678-89ab-cdef01234567";
+
+  it("drops old sessions with no message store, keeps fresh and setup ones", () => {
+    const json = JSON.stringify([
+      { id: SID, title: "New chat", updatedAt: OLD },
+      { id: "bbbbbbbb-0000-4000-8000-000000000001", title: "Fresh", updatedAt: FRESH },
+      { id: "cccccccc-0000-4000-8000-000000000001", title: "Setup", updatedAt: OLD, isSetup: true },
+    ]);
+    const out = JSON.parse(pruneEmptySessions(json, new Map(), [], new Set(), NOW)) as Array<{ id: string }>;
+    expect(out.map((s) => s.id)).toEqual([
+      "bbbbbbbb-0000-4000-8000-000000000001",
+      "cccccccc-0000-4000-8000-000000000001",
+    ]);
+  });
+
+  it("keeps sessions with messages and drops empty stores", () => {
+    const withMessages = "dddddddd-0000-4000-8000-000000000001";
+    const empty = "eeeeeeee-0000-4000-8000-000000000001";
+    const local = new Map([
+      [`chatui:messages:${withMessages}`, JSON.stringify([{ id: "m1" }])],
+      [`chatui:messages:${empty}`, "[]"],
+    ]);
+    const json = JSON.stringify([
+      { id: withMessages, title: "Has messages", updatedAt: OLD },
+      { id: empty, title: "Empty", updatedAt: OLD },
+    ]);
+    const out = JSON.parse(pruneEmptySessions(json, local, [], new Set(), NOW)) as Array<{ id: string }>;
+    expect(out.map((s) => s.id)).toEqual([withMessages]);
+  });
+
+  it("keeps a session whose live cloud store could not be inspected", () => {
+    const liveSid = "ffffffff-0000-4000-8000-000000000001";
+    const envelope = JSON.stringify({ v: 1, alg: "A256GCM", iv: "AAAAAAAAAAAAAAAA", ct: "AAAA" });
+    const json = JSON.stringify([{ id: liveSid, title: "Legacy", updatedAt: OLD }]);
+    const live = new Set([liveSid]);
+    // Live store with no value anywhere → content unknown, keep.
+    expect(pruneEmptySessions(json, new Map(), [], live, NOW)).toBe(json);
+    // Live store holding an unreadable legacy envelope → assume content.
+    const remote = [row(`chatui:messages:${liveSid}`, envelope, NOW)];
+    expect(pruneEmptySessions(json, new Map(), remote, live, NOW)).toBe(json);
+  });
+
+  it("skips pruning when the caller has no live-store index", () => {
+    const json = JSON.stringify([{ id: SID, title: "New chat", updatedAt: OLD }]);
+    expect(pruneEmptySessions(json, new Map(), [], null, NOW)).toBe(json);
   });
 });
 
@@ -313,6 +437,36 @@ describe("planSync", () => {
     expect(plan.toRemote[0].value).toBe(plan.toLocal[0].value);
   });
 
+  it("prunes abandoned empty sessions while merging the session list", () => {
+    const emptySid = "abcdef01-2345-4678-89ab-cdef01234567";
+    const liveSid = "abcdef01-2345-4678-89ab-cdef01234568";
+    const sessions = JSON.stringify([
+      { id: emptySid, title: "New chat", updatedAt: "2026-09-14T12:00:00Z" },
+      { id: liveSid, title: "Kept", updatedAt: "2026-09-14T12:00:00Z" },
+    ]);
+    const local = new Map([
+      ["chatui:sessions", sessions],
+      [`chatui:messages:${liveSid}`, JSON.stringify([{ id: "m1" }])],
+    ]);
+    const plan = planSync(
+      local,
+      [row("chatui:sessions", sessions, "2026-09-15T11:00:00Z")],
+      {},
+      NOW,
+      new Map(),
+      new Set([liveSid]),
+    );
+    const cleaned = JSON.parse(
+      plan.toLocal.find((t) => t.key === "chatui:sessions")!.value,
+    ) as Array<{ id: string }>;
+    expect(cleaned.map((s) => s.id)).toEqual([liveSid]);
+    expect(plan.toRemote.find((t) => t.key === "chatui:sessions")).toEqual({
+      key: "chatui:sessions",
+      value: expect.any(String),
+      deleted: false,
+    });
+  });
+
   it("deep-merges agents so agents from both sides survive", () => {
     const agent = (id: string, stamp: string) =>
       JSON.stringify([{ id, name: id, createdAt: stamp, updatedAt: stamp }]);
@@ -434,16 +588,21 @@ describe("syncNow with a fake backend", () => {
   });
 
   it("merges sessions on first link instead of picking a side", async () => {
+    // Message stores keep both sessions alive under the empty-session cleanup.
+    const store = (id: string) =>
+      JSON.stringify([{ id, role: "user", content: "hi", timestamp: "2026-09-15T11:00:00Z" }]);
     storage.set(
       "chatui:sessions",
       JSON.stringify([{ id: "a", title: "A", updatedAt: "2026-09-15T12:00:00Z" }]),
     );
+    storage.set("chatui:messages:a", store("ma"));
     const backend = fakeBackend([
       row(
         "chatui:sessions",
         JSON.stringify([{ id: "b", title: "B", updatedAt: "2026-09-15T11:00:00Z" }]),
         "2026-09-15T11:00:00Z",
       ),
+      row("chatui:messages:b", store("mb"), "2026-09-15T11:00:00Z"),
     ]);
     const result = await syncNow(backend);
     expect(result.error).toBeUndefined();

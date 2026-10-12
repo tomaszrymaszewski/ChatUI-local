@@ -229,6 +229,7 @@ export function useSessions(type: "chat" | "agent") {
         chat_mode?: SessionChatMode;
         reasoning_effort?: ReasoningEffort;
         agent_id?: string | null;
+        is_temporary?: boolean;
       },
     ) => {
       persistSessions((prev) =>
@@ -251,6 +252,10 @@ export function useSessions(type: "chat" | "agent") {
                   updates.agent_id !== undefined
                     ? updates.agent_id ?? undefined
                     : s.agentId,
+                isTemporary:
+                  updates.is_temporary !== undefined
+                    ? updates.is_temporary
+                    : s.isTemporary,
                 updatedAt: new Date(),
               }
             : s,
@@ -312,5 +317,18 @@ export function getSessionChatMode(id: string | null): SessionChatMode | undefin
     return loadSessions().find((s) => s.id === id)?.chatMode;
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Read one session's whole-chat temporary flag straight from storage — works
+ * for sessions of the other tab (the hook's `sessions` array is filtered).
+ */
+export function getSessionTemporary(id: string | null): boolean {
+  if (!id) return false;
+  try {
+    return loadSessions().find((s) => s.id === id)?.isTemporary ?? false;
+  } catch {
+    return false;
   }
 }

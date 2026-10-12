@@ -348,6 +348,31 @@ export function useMessages(sessionId: string | null) {
     });
   }, []);
 
+  /**
+   * Clear the temporary flags on every message — "save the chat as normal".
+   * Mirrors updateMessage's dual path: update in state when the session is
+   * loaded, otherwise patch the persisted list directly.
+   */
+  const markMessagesPermanent = useCallback((sessionId: string) => {
+    setMessages((prev) => {
+      if (prev.some((m) => m.is_temporary)) {
+        const next = prev.map((m) =>
+          m.is_temporary ? { ...m, is_temporary: false } : m,
+        );
+        saveMessages(sessionId, next);
+        return next;
+      }
+      const loaded = loadMessages(sessionId);
+      if (loaded.some((m) => m.is_temporary)) {
+        saveMessages(
+          sessionId,
+          loaded.map((m) => (m.is_temporary ? { ...m, is_temporary: false } : m)),
+        );
+      }
+      return prev;
+    });
+  }, []);
+
   const refetch = useCallback(() => {
     if (!sessionId) {
       setMessages([]);
@@ -363,6 +388,7 @@ export function useMessages(sessionId: string | null) {
     updateMessage,
     deleteMessage,
     deleteTemporaryMessages,
+    markMessagesPermanent,
     refetch,
   };
 }

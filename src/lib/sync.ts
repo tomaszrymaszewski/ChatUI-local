@@ -218,6 +218,31 @@ function recordTime(record: Record<string, unknown>, spec: MergeSpec): number {
   return 0;
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Swift's UUID.uuidString is uppercase while crypto.randomUUID() is lowercase,
+ * so the phone used to store the same session/message under two spellings
+ * (two sidebar rows, duplicated messages). Normalize UUID-shaped ids so both
+ * devices collapse to one record.
+ */
+function normalizeUuid(id: string): string {
+  return UUID_RE.test(id) ? id.toLowerCase() : id;
+}
+
+/** Rewrites a record's UUID id/session_id to lowercase when needed. */
+function normalizeRecord(record: Record<string, unknown>, spec: MergeSpec): Record<string, unknown> {
+  const id = record[spec.idKey];
+  const normalizedId = typeof id === "string" ? normalizeUuid(id) : id;
+  const sessionId = record.session_id;
+  const normalizedSessionId =
+    typeof sessionId === "string" ? normalizeUuid(sessionId) : sessionId;
+  if (normalizedId === id && normalizedSessionId === sessionId) return record;
+  const next = { ...record, [spec.idKey]: normalizedId };
+  if (sessionId !== undefined) next.session_id = normalizedSessionId;
+  return next;
+}
+
 /**
  * Union-merge two JSON arrays of records by id, per-record last-write-wins
  * (ties go local). Sessions merge by updatedAt, messages by timestamp,
@@ -225,6 +250,10 @@ function recordTime(record: Record<string, unknown>, spec: MergeSpec): number {
  * agent created on device A and one created on device B both survive linking.
  * Either side being unparseable keeps the local string (fail closed: never
  * delete local data on corrupt input).
+ *
+ * UUID ids are lowercased while merging, so case-variant duplicates written by
+ * older phone builds collapse into one record and the healed union is written
+ * back to both sides.
  */
 export function mergeRecordLists(localJson: string, remoteJson: string, spec: MergeSpec): string {
   let local: unknown;
@@ -245,12 +274,13 @@ export function mergeRecordLists(localJson: string, remoteJson: string, spec: Me
   const remoteById = new Map<string, Record<string, unknown>>();
   for (const r of remote) {
     if (r && typeof r === "object" && typeof (r as Record<string, unknown>)[spec.idKey] === "string") {
-      remoteById.set((r as Record<string, unknown>)[spec.idKey] as string, r as Record<string, unknown>);
+      const rec = normalizeRecord(r as Record<string, unknown>, spec);
+      remoteById.set(rec[spec.idKey] as string, rec);
     }
   }
   for (const r of local) {
     if (!r || typeof r !== "object") continue;
-    const rec = r as Record<string, unknown>;
+    const rec = normalizeRecord(r as Record<string, unknown>, spec);
     const id = rec[spec.idKey];
     if (typeof id !== "string" || seen.has(id)) continue;
     seen.add(id);
@@ -261,7 +291,7 @@ export function mergeRecordLists(localJson: string, remoteJson: string, spec: Me
   }
   for (const r of remote) {
     if (!r || typeof r !== "object") continue;
-    const rec = r as Record<string, unknown>;
+    const rec = normalizeRecord(r as Record<string, unknown>, spec);
     const id = rec[spec.idKey];
     if (typeof id !== "string" || seen.has(id)) continue;
     seen.add(id);
@@ -277,6 +307,44 @@ function mergeSpecFor(key: string): MergeSpec {
   return key === "chatui:sessions"
     ? { idKey: "id", timeKey: "updatedAt" }
     : { idKey: "id", timeKey: "timestamp" };
+}
+
+/** Local-only flag: the one-time case-variant UUID heal already ran. */
+const CASE_HEAL_FLAG = "chatui:sync:case-heal-v1";
+
+/**
+ * One-time repair for case-variant UUID records written by an older phone
+ * build (Swift's uppercase `uuidString` vs the desktop's lowercase
+ * `crypto.randomUUID`): merging each local session/message store with itself
+ * normalizes ids and collapses duplicates, and the write marks the key dirty
+ * so the next sync pushes the healed union to the cloud. Exported for tests.
+ */
+export function healCaseVariantRecords(): void {
+  try {
+    if (localStorage.getItem(CASE_HEAL_FLAG)) return;
+  } catch {
+    return; // storage unreadable — nothing to heal
+  }
+  const targets: string[] = ["chatui:sessions"];
+  for (const key of listBigKeys("chatui:messages:")) {
+    if (isSyncedKey(key)) targets.push(key);
+  }
+  try {
+    for (const key of targets) {
+      const value = readBigKey(key);
+      if (!value) continue;
+      const healed = mergeRecordLists(value, value, mergeSpecFor(key));
+      if (healed !== value) writeBigKey(key, healed);
+    }
+  } catch {
+    // Quota pressure — leave the flag unset so the next launch retries.
+    return;
+  }
+  try {
+    localStorage.setItem(CASE_HEAL_FLAG, new Date().toISOString());
+  } catch {
+    // best-effort — rerunning the heal is idempotent
+  }
 }
 
 // ─── Sync planning (pure — the unit-tested core) ───────────────────────────
@@ -313,6 +381,80 @@ export interface SyncPlan {
   meta: SyncMeta;
 }
 
+/** Abandoned empty sessions are pruned only after this grace period, so a
+ * freshly created chat survives long enough to receive its first message. */
+const SESSION_PRUNE_GRACE_MS = 15 * 60 * 1000;
+
+/** Whether a stored message-store value holds any messages. `null` = the
+ * value is absent, so only the live-store index can answer. */
+function storeHasMessages(value: string | undefined): boolean | null {
+  if (value === undefined) return null;
+  const t = value.trim();
+  if (t === "" || t === "[]" || t === "{}" || t === "null") return false;
+  if (isLegacyEnvelope(value)) return true; // unreadable ciphertext — assume content
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.length > 0 : true;
+  } catch {
+    return true; // unreadable — assume content
+  }
+}
+
+function sessionHasMessages(
+  id: string,
+  local: Map<string, string>,
+  remote: RemoteRow[],
+  liveMessageIds: Set<string>,
+): boolean {
+  const key = `chatui:messages:${id}`;
+  const localState = storeHasMessages(local.get(key));
+  if (localState === true) return true;
+  const row = remote.find((r) => r.key === key && !r.deleted);
+  const remoteState = storeHasMessages(row?.value);
+  if (remoteState === true) return true;
+  if (localState === false || remoteState === false) return false;
+  // No value evidence either way: a live cloud store means there is content we
+  // could not inspect (unchanged row, unreadable value) — keep the session.
+  return liveMessageIds.has(id);
+}
+
+/**
+ * Drops abandoned empty sessions from a merged `chatui:sessions` array: no
+ * message store with content, not a desktop agent-setup session, and older
+ * than the grace period. `liveMessageIds` is the full manifest's live
+ * message-store index; pass null when the caller has no full picture (realtime
+ * batches) to skip pruning. Exported for tests.
+ */
+export function pruneEmptySessions(
+  sessionsJson: string,
+  local: Map<string, string>,
+  remote: RemoteRow[],
+  liveMessageIds: Set<string> | null,
+  now: string,
+): string {
+  if (!liveMessageIds) return sessionsJson;
+  let list: unknown;
+  try {
+    list = JSON.parse(sessionsJson);
+  } catch {
+    return sessionsJson;
+  }
+  if (!Array.isArray(list)) return sessionsJson;
+  const nowMs = timeValue(now) || Date.now();
+  const cutoff = nowMs - SESSION_PRUNE_GRACE_MS;
+  const kept = list.filter((entry) => {
+    if (!entry || typeof entry !== "object") return true;
+    const record = entry as Record<string, unknown>;
+    if (record.isSetup === true) return true;
+    if (typeof record.id !== "string") return true;
+    const id = normalizeUuid(record.id);
+    const t = timeValue(record.updatedAt);
+    if (t === 0 || t > cutoff) return true; // no stamp or fresh — keep
+    return sessionHasMessages(id, local, remote, liveMessageIds);
+  });
+  return kept.length === list.length ? sessionsJson : JSON.stringify(kept);
+}
+
 /**
  * Reconcile local state with remote rows. Rules:
  * - deep-merge keys (sessions, messages:*, agents): union by record id,
@@ -332,6 +474,8 @@ export function planSync(
   meta: SyncMeta,
   now: string,
   localChangedAt: Map<string, string> = new Map(),
+  liveMessageIds: Set<string> | null = null,
+  pruneLocal: Map<string, string> | null = null,
 ): SyncPlan {
   const plan: SyncPlan = { toLocal: [], deleteLocal: [], toRemote: [], meta: { ...meta } };
   const remoteByKey = new Map(remote.map((r) => [r.key, r]));
@@ -358,7 +502,14 @@ export function planSync(
 
     // Deep-merge keys: union by record id whenever both sides hold data.
     if (isDeepMergeKey(key) && localVal !== null && row && !row.deleted) {
-      const merged = mergeRecordLists(localVal, row.value, mergeSpecFor(key));
+      let merged = mergeRecordLists(localVal, row.value, mergeSpecFor(key));
+      // Empty-session cleanup rides the sessions merge: union merges otherwise
+      // resurrect every abandoned "New chat" from either side forever.
+      // `pruneLocal` is the full local map — `local` here may be the
+      // include-filtered subset, which hides unchanged message stores.
+      if (key === "chatui:sessions") {
+        merged = pruneEmptySessions(merged, pruneLocal ?? local, remote, liveMessageIds, now);
+      }
       const localHash = hashValue(merged);
       if (merged !== localVal) plan.toLocal.push({ key, value: merged });
       if (merged !== row.value) plan.toRemote.push({ key, value: merged, deleted: false });
@@ -711,7 +862,14 @@ export async function syncNow(
     if (!local.has(key) && (m.hash !== MISSING || m.remoteDeleted)) include.add(key);
   }
   const now = new Date().toISOString();
-  return reconcile(backend, remote, local, meta, now, localChangedAt, include, legacyEncrypted);
+  // The full manifest tells us which sessions still have a live message store,
+  // so abandoned empty sessions can be pruned during this reconcile.
+  const liveMessageIds = new Set(
+    manifest
+      .filter((r) => r.key.startsWith("chatui:messages:") && !r.deleted)
+      .map((r) => normalizeUuid(r.key.slice("chatui:messages:".length))),
+  );
+  return reconcile(backend, remote, local, meta, now, localChangedAt, include, legacyEncrypted, liveMessageIds);
 }
 
 /**
@@ -755,13 +913,14 @@ async function reconcile(
   localChangedAt: Map<string, string>,
   include: Set<string>,
   legacyEncrypted: string[],
+  liveMessageIds: Set<string> | null = null,
 ): Promise<SyncResult & { error?: string }> {
   const localSub = new Map([...local].filter(([k]) => include.has(k)));
   const metaSub: SyncMeta = {};
   for (const key of include) {
     if (meta[key]) metaSub[key] = meta[key];
   }
-  const plan = planSync(localSub, remote, metaSub, now, localChangedAt);
+  const plan = planSync(localSub, remote, metaSub, now, localChangedAt, liveMessageIds, local);
 
   for (const { key, value } of plan.toLocal) {
     // trySetItem evicts rebuildable caches under quota pressure first.
@@ -1041,6 +1200,7 @@ export function startSyncManager(
 
   installStorageHook();
   currentSchedulePush = schedulePush;
+  healCaseVariantRecords();
   const interval = setInterval(() => void fullSync(true), PULL_INTERVAL_MS);
   const onFocus = () => void fullSync();
   window.addEventListener("focus", onFocus);

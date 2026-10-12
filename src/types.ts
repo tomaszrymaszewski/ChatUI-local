@@ -60,7 +60,9 @@ export interface Project {
   directory?: string | null;
 }
 
-/** Composer mode for a chat session; "none" is the plain chat (see ChatView). */
+/** Composer mode for a chat session; "none" is the plain chat (see ChatView).
+ *  "temporary" is legacy — temporary is a whole-chat flag (isTemporary) now,
+ *  orthogonal to the mode. Kept in the union so old stored sessions parse. */
 export type SessionChatMode =
   | "none"
   | "temporary"
@@ -71,9 +73,11 @@ export type SessionChatMode =
 
 /**
  * Reasoning effort sent as reasoning_effort on chat-completions requests for
- * reasoning-capable models. "default" sends nothing (provider default).
+ * reasoning-capable models. "default" sends nothing (provider default); the
+ * other values come from models.dev reasoning_options (e.g. none/low/high/
+ * xhigh/max) and are validated against the model's catalog entry before send.
  */
-export type ReasoningEffort = "default" | "low" | "medium" | "high";
+export type ReasoningEffort = "default" | (string & {});
 
 export interface ChatSession {
   id: string;
@@ -81,6 +85,7 @@ export interface ChatSession {
   updatedAt: Date;
   projectId?: string;
   type: "chat" | "agent";
+  /** Whole-chat temporary flag: the conversation is forgotten on leave. */
   isTemporary?: boolean;
   /** Composer mode persisted per chat — learn mode stays on until turned off. */
   chatMode?: SessionChatMode;
@@ -126,6 +131,8 @@ export interface AgentDefinition {
   name: string;
   /** One-line purpose shown in the sidebar. */
   purpose: string;
+  /** Face-circle color (hex) — picked at creation, unique among agents. */
+  color?: string;
   /** The agent's own system prompt — besides skills/connectors, all it knows. */
   systemPrompt: string;
   /** Installed skill names this agent may use. */

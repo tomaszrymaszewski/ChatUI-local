@@ -14,6 +14,11 @@ const FAKE_CATALOG = {
         modalities: { input: ["text", "image"] },
         limit: { context: 1048573, output: 131072 },
         cost: { input: 0.15, output: 0.5, cache_read: 0.03 },
+        reasoning: true,
+        reasoning_options: [
+          { type: "toggle" },
+          { type: "effort", values: ["low", "high", "max"] },
+        ],
       },
     },
   },
@@ -125,6 +130,85 @@ describe("getModelOutputLimit", () => {
   });
 });
 
+describe("model reasoning options", () => {
+  it("reads effort values and the toggle from the provider's catalog entry", async () => {
+    const mod = await load();
+    const support = await mod.getModelReasoning(
+      provider("fw", "https://api.fireworks.ai/inference/v1"),
+      "accounts/fireworks/models/glm-5p3-flash",
+    );
+    expect(support).toEqual({ reasoning: true, efforts: ["low", "high", "max"], toggle: true });
+  });
+
+  it("falls back to another provider's entry for unmapped endpoints", async () => {
+    const mod = await load();
+    const support = await mod.getModelReasoning(
+      provider("custom", "https://my-proxy.internal:8080/v1"),
+      "accounts/fireworks/models/glm-5p3-flash",
+    );
+    expect(support?.efforts).toEqual(["low", "high", "max"]);
+  });
+
+  it("returns null for models the catalog doesn't know", async () => {
+    const mod = await load();
+    const support = await mod.getModelReasoning(
+      provider("custom", "https://my-proxy.internal:8080/v1"),
+      "no-such-model-xyz",
+    );
+    expect(support).toBeNull();
+  });
+});
+
+describe("reasoning effort validation", () => {
+  const support = {
+    reasoning: true,
+    efforts: ["none", "low", "high", "xhigh", "max"],
+    toggle: false,
+  };
+
+  it("treats default and unknown models as always supported", async () => {
+    const mod = await load();
+    expect(mod.isReasoningEffortSupported(support, "default")).toBe(true);
+    expect(mod.isReasoningEffortSupported(support, "xhigh")).toBe(true);
+    expect(mod.isReasoningEffortSupported(support, "medium")).toBe(false);
+    expect(mod.isReasoningEffortSupported(null, "anything")).toBe(true);
+  });
+
+  it("accepts none on toggle-only models, rejects effort scales there", async () => {
+    const mod = await load();
+    const toggleOnly = { reasoning: true, efforts: [], toggle: true };
+    expect(mod.isReasoningEffortSupported(toggleOnly, "none")).toBe(true);
+    expect(mod.isReasoningEffortSupported(toggleOnly, "low")).toBe(false);
+  });
+
+  it("drops default and passes unknown support through verbatim", async () => {
+    const mod = await load();
+    expect(mod.sanitizeReasoningEffort("default", support)).toBeUndefined();
+    expect(mod.sanitizeReasoningEffort(undefined, support)).toBeUndefined();
+    expect(mod.sanitizeReasoningEffort("medium", null)).toBe("medium");
+  });
+
+  it("keeps valid values and clamps invalid ones to the nearest", async () => {
+    const mod = await load();
+    expect(mod.sanitizeReasoningEffort("xhigh", support)).toBe("xhigh");
+    // "medium" sits between low and high — ties prefer deeper thinking.
+    expect(mod.sanitizeReasoningEffort("medium", support)).toBe("high");
+    // "minimal" sits between none and low — ties prefer deeper thinking.
+    expect(mod.sanitizeReasoningEffort("minimal", support)).toBe("low");
+    // Unknown values sort last, so they clamp to the deepest effort.
+    expect(mod.sanitizeReasoningEffort("extreme", support)).toBe("max");
+  });
+
+  it("maps none onto toggles and drops unsupported scales", async () => {
+    const mod = await load();
+    const toggleOnly = { reasoning: true, efforts: [], toggle: true };
+    expect(mod.sanitizeReasoningEffort("none", toggleOnly)).toBe("none");
+    expect(mod.sanitizeReasoningEffort("high", toggleOnly)).toBeUndefined();
+    const alwaysOn = { reasoning: true, efforts: [], toggle: false };
+    expect(mod.sanitizeReasoningEffort("high", alwaysOn)).toBeUndefined();
+  });
+});
+
 describe("catalog slimming", () => {
   const FAT_CATALOG = {
     openrouter: {
@@ -136,6 +220,7 @@ describe("catalog slimming", () => {
           cost: { input: 1, output: 2 },
           modalities: { input: ["text"], output: ["text"] },
           limit: { context: 1310720, output: 131072 },
+          reasoning: true,
           reasoning_options: { effort: ["low"] },
         },
       },
@@ -155,13 +240,21 @@ describe("catalog slimming", () => {
     expect(tokens).toBe(1310720);
     const stored = JSON.parse(storage.get("chatui:modelsdev-cache") ?? "{}");
     const entry = stored.data.openrouter.models["z-ai/glm-5.3-flash"];
-    expect(Object.keys(entry).sort()).toEqual(["cost", "id", "limit", "modalities", "name"]);
+    expect(Object.keys(entry).sort()).toEqual([
+      "cost",
+      "id",
+      "limit",
+      "modalities",
+      "name",
+      "reasoning",
+      "reasoning_options",
+    ]);
   });
 
   it("re-slims a fat cache written before slimming existed", async () => {
     storage.set(
       "chatui:modelsdev-cache",
-      JSON.stringify({ data: FAT_CATALOG, ts: Date.now() }),
+      JSON.stringify({ v: 2, data: FAT_CATALOG, ts: Date.now() }),
     );
     vi.stubGlobal(
       "fetch",
@@ -177,7 +270,34 @@ describe("catalog slimming", () => {
     expect(tokens).toBe(1310720);
     const stored = JSON.parse(storage.get("chatui:modelsdev-cache") ?? "{}");
     const entry = stored.data.openrouter.models["z-ai/glm-5.3-flash"];
-    expect(Object.keys(entry).sort()).toEqual(["cost", "id", "limit", "modalities", "name"]);
+    expect(Object.keys(entry).sort()).toEqual([
+      "cost",
+      "id",
+      "limit",
+      "modalities",
+      "name",
+      "reasoning",
+      "reasoning_options",
+    ]);
+  });
+
+  it("ignores caches written by an older payload version", async () => {
+    // v1 caches lack reasoning fields — a lookup must not trust them.
+    storage.set(
+      "chatui:modelsdev-cache",
+      JSON.stringify({
+        data: {
+          openrouter: {
+            models: { "z-ai/glm-5.3-flash": { id: "z-ai/glm-5.3-flash" } },
+          },
+        },
+        ts: Date.now(),
+      }),
+    );
+    const mod = await load();
+    const p = provider("custom", "https://my-proxy.internal:8080/v1");
+    expect(mod.getModelDisplayNameSync(p, "z-ai/glm-5.3-flash")).toBeNull();
+    expect(mod.getModelReasoningSync(p, "z-ai/glm-5.3-flash")).toBeNull();
   });
 });
 
@@ -226,7 +346,7 @@ describe("catalog names", () => {
     const mod = await load();
     storage.set(
       "chatui:modelsdev-cache",
-      JSON.stringify({ data: FAKE_CATALOG, ts: Date.now() }),
+      JSON.stringify({ v: 2, data: FAKE_CATALOG, ts: Date.now() }),
     );
     expect(
       mod.getModelDisplayNameSync(
@@ -246,7 +366,7 @@ describe("catalog names", () => {
     const mod = await load();
     storage.set(
       "chatui:modelsdev-cache",
-      JSON.stringify({ data: FAKE_CATALOG, ts: Date.now() }),
+      JSON.stringify({ v: 2, data: FAKE_CATALOG, ts: Date.now() }),
     );
     expect(mod.getProviderCatalogName("https://api.fireworks.ai/inference/v1")).toBe(
       "Fireworks AI",
@@ -260,7 +380,7 @@ describe("input modalities", () => {
     const mod = await load();
     storage.set(
       "chatui:modelsdev-cache",
-      JSON.stringify({ data: FAKE_CATALOG, ts: Date.now() }),
+      JSON.stringify({ v: 2, data: FAKE_CATALOG, ts: Date.now() }),
     );
     const caps = mod.getModelCapabilitiesSync(
       provider("fw", "https://api.fireworks.ai/inference/v1"),
@@ -285,7 +405,7 @@ describe("getModelContextWindowSync", () => {
     const mod = await load();
     storage.set(
       "chatui:modelsdev-cache",
-      JSON.stringify({ data: FAKE_CATALOG, ts: Date.now() }),
+      JSON.stringify({ v: 2, data: FAKE_CATALOG, ts: Date.now() }),
     );
     vi.stubGlobal(
       "fetch",

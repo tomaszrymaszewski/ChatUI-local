@@ -1,7 +1,11 @@
 import { ChatOpenAI } from "@langchain/openai";
 import type { Provider, ReasoningEffort } from "@/types";
 import { getProviderApiKey } from "@/lib/llm";
-import { getModelOutputLimit } from "@/lib/model-capabilities";
+import {
+  getModelOutputLimit,
+  getModelReasoning,
+  sanitizeReasoningEffort,
+} from "@/lib/model-capabilities";
 
 /**
  * Fallback max_tokens when the models.dev catalog doesn't know the model.
@@ -26,11 +30,12 @@ const MAX_OUTPUT_TOKENS_CAP = 65536;
  * its depth is controlled by reasoning_effort, which the provider defaults to
  * "max" — by far the longest thinking. The provider only accepts low/high/max
  * for GLM-5.3, so map the app's effort onto that enum and always send an
- * explicit value: default and low → "low" (shortest thinking unless the user
- * asks for more), medium → "high", high → "max".
+ * explicit value: default and the low end → "low" (shortest thinking unless
+ * the user asks for more), medium → "high", xhigh/max → "max".
  */
-function glmReasoningEffort(effort: ReasoningEffort | undefined): "low" | "high" | "max" {
-  if (effort === "high") return "max";
+function glmReasoningEffort(effort: ReasoningEffort | undefined): string {
+  if (effort === "max" || effort === "xhigh") return "max";
+  if (effort === "high") return "high";
   if (effort === "medium") return "high";
   return "low";
 }
@@ -263,7 +268,14 @@ export async function createChatModel(
     outputLimit ?? (isGlm ? MAX_OUTPUT_TOKENS_CAP : FALLBACK_MAX_TOKENS),
     MAX_OUTPUT_TOKENS_CAP,
   );
-  const effort = isGlm ? glmReasoningEffort(reasoningEffort) : reasoningEffort;
+  // Validate the requested effort against the model's models.dev entry so the
+  // provider only ever sees values it accepts (e.g. deepseek-v4.1-flash takes
+  // none/low/high/xhigh/max, not "medium"); unknown models pass through.
+  const support = await getModelReasoning(provider, modelName).catch(() => null);
+  const effort = sanitizeReasoningEffort(
+    isGlm ? glmReasoningEffort(reasoningEffort) : reasoningEffort,
+    support,
+  );
   return new ChatOpenAI({
     model: modelName,
     apiKey: apiKey || "no-key",
@@ -278,9 +290,7 @@ export async function createChatModel(
     // spread verbatim into the chat-completions body, so every OpenAI-
     // compatible provider actually sees reasoning_effort (OpenRouter and z.ai
     // both accept it flat). Reasoning-capable models only; others ignore it.
-    ...(effort && effort !== "default"
-      ? { modelKwargs: { reasoning_effort: effort as "low" | "medium" | "high" | "max" } }
-      : {}),
+    ...(effort ? { modelKwargs: { reasoning_effort: effort } } : {}),
     maxRetries: 1,
     timeout: 300_000,
   });

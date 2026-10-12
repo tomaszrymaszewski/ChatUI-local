@@ -972,7 +972,11 @@ export function AgentConsole({
                     !composing && "pointer-events-none",
                   )}
                 >
-                  <AgentAvatar seed={agent.id} className="size-10" />
+                  <AgentAvatar
+                    seed={agent.id}
+                    className="size-16"
+                    lookingDown={inputText.trim().length > 0}
+                  />
                   <div className="flex flex-col gap-1">
                     <h2 className="text-base font-semibold">New session with {agent.name}</h2>
                     <p className="mx-auto max-w-sm text-xs text-muted-foreground">

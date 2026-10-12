@@ -41,8 +41,6 @@ import {
 import { ProviderForm } from "@/components/provider-form";
 import { ModelForm } from "@/components/model-form";
 import { ProviderLogo } from "@/components/provider-logos";
-import { SkillsPanel } from "@/components/skills-panel";
-import { ConnectorsPanel } from "@/components/connectors-panel";
 import { UpdatesPanel } from "@/components/updates-panel";
 import { ThemePreview, SystemPreview } from "@/components/onboarding/theme-step";
 import { BackgroundPatternPicker } from "@/components/background-pattern";
@@ -50,7 +48,6 @@ import { cn } from "@/lib/utils";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
 import { useProjects } from "@/hooks/use-projects";
-import { useOpencodeContext } from "@/lib/opencode-context";
 import { getTavilyApiKey, setTavilyApiKey } from "@/lib/llm";
 import {
   exportChatUiBackup,
@@ -60,7 +57,7 @@ import {
 } from "@/lib/data-transfer";
 import { ImportPanel } from "@/components/import-panel";
 import { getProviderMeta } from "@/lib/provider-meta";
-import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync, getContextOverride, setContextOverride, getModelContextWindowSync, getModelDisplayNameSync, getModelCostSync, formatModelPrices, getProviderCatalogName } from "@/lib/model-capabilities";
+import { getVisionOverride, setVisionOverride, getModelCapabilitiesSync, getContextOverride, setContextOverride, getModelContextWindowSync, getModelDisplayNameSync, getModelCostSync, formatModelPrices, getProviderCatalogName, getModelReasoningSync, reasoningEffortRank } from "@/lib/model-capabilities";
 import { loadMemory, addMemory, deleteMemory } from "@/lib/memory";
 import { EMBEDDING_MODELS, setEmbeddingModel } from "@/lib/embeddings";
 import {
@@ -74,7 +71,7 @@ import { modelLabel, modelLabelWithCatalog } from "@/lib/model-display";
 import { headroomStart, headroomStatus, type HeadroomStatus } from "@/lib/headroom-client";
 import type { Provider, ProviderModel, UserSettings, KnowledgeSourceToggles } from "@/types";
 
-export type SettingsTab = "general" | "memory" | "models" | "skills" | "connectors" | "updates";
+export type SettingsTab = "general" | "memory" | "models" | "updates";
 
 export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
   const { providers, loading, createProvider, updateProvider, deleteProvider, addModel, removeModel, updateModelDisplayName } =
@@ -82,7 +79,6 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
   const { projects } = useProjects();
   const { settings, updateSettings } = useUserSettings();
   const { theme, setTheme } = useTheme();
-  const oc = useOpencodeContext();
 
   const [showProviderForm, setShowProviderForm] = useState(false);
   const [editingProvider, setEditingProvider] = useState<Provider | null>(null);
@@ -1073,6 +1069,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                     const ctx = provider ? getModelContextWindowSync(provider, m.name) : null;
                     const catalogName = provider ? getModelDisplayNameSync(provider, m.name) : null;
                     const prices = provider ? getModelCostSync(provider, m.name) : null;
+                    const reasoning = provider ? getModelReasoningSync(provider, m.name) : null;
                     const cycleVision = () => {
                       if (override === undefined) setVisionOverride(m.providerId, m.name, true);
                       else if (override === true) setVisionOverride(m.providerId, m.name, false);
@@ -1093,8 +1090,19 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                           {ctx
                             ? ` · ${ctx.tokens.toLocaleString("en-US")} context`
                             : " · context unknown"}
-                          {caps?.source === "catalog" && caps.inputModalities.length > 0
+                          {caps && caps.source !== "heuristic" && caps.inputModalities.length > 0
                             ? ` · in: ${caps.inputModalities.join(", ")}`
+                            : ""}
+                          {reasoning
+                            ? reasoning.reasoning
+                              ? reasoning.efforts.length > 0
+                                ? ` · thinking: ${[...reasoning.efforts]
+                                    .sort((a, b) => reasoningEffortRank(a) - reasoningEffortRank(b))
+                                    .join(", ")}`
+                                : reasoning.toggle
+                                  ? " · thinking: on/off"
+                                  : " · thinking: always on"
+                              : " · no thinking"
                             : ""}
                           {prices ? ` · ${formatModelPrices(prices)}` : ""}
                           {settings.defaultModel === m.name && (
@@ -1158,16 +1166,6 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
               )}
             </div>
           </div>
-        )}
-
-        {/* ─── Skills Tab ─── */}
-        {activeTab === "skills" && (
-          <SkillsPanel activeDirectory={oc.activeDirectory} />
-        )}
-
-        {/* ─── Connectors Tab ─── */}
-        {activeTab === "connectors" && (
-          <ConnectorsPanel activeDirectory={oc.activeDirectory} />
         )}
 
         {/* ─── Updates Tab ─── */}
@@ -1272,7 +1270,18 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
         open={showModelForm}
         onOpenChange={(o) => !o && setShowModelForm(false)}
       >
-        <DialogContent>
+        <DialogContent
+          onInteractOutside={(e) => {
+            // The model search list is portaled to the body so it can
+            // overflow this dialog; interacting with it is not "outside".
+            if (
+              e.target instanceof Element &&
+              e.target.closest("[data-model-listbox]")
+            ) {
+              e.preventDefault();
+            }
+          }}
+        >
           <DialogHeader>
             <DialogTitle>Add Model</DialogTitle>
             <DialogDescription>

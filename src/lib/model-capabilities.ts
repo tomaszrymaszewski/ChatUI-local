@@ -3,6 +3,12 @@ import { setItemOrThrowFriendly } from "./storage-pressure";
 
 const CACHE_KEY = "chatui:modelsdev-cache";
 const CACHE_TTL = 24 * 60 * 60 * 1000; // 24h
+/**
+ * Cache payload version. Bump when the slim shape gains a field so older
+ * caches (which lack it) are refetched instead of silently missing data.
+ * v2 added reasoning/reasoning_options.
+ */
+const CACHE_VERSION = 2;
 const OVERRIDE_KEY = "chatui:vision-overrides";
 
 interface ModelsDevModel {
@@ -12,6 +18,10 @@ interface ModelsDevModel {
   limit?: { context?: number; output?: number };
   /** List prices in USD per million tokens (models.dev convention). */
   cost?: { input?: number; output?: number; cache_read?: number };
+  /** Whether the model can think/reason at all. */
+  reasoning?: boolean;
+  /** How thinking is controlled: a plain toggle and/or an effort scale. */
+  reasoning_options?: Array<{ type?: string; values?: string[] }>;
 }
 
 type ModelsDevCatalog = Record<string, {
@@ -27,6 +37,7 @@ function loadCached(): { data: ModelsDevCatalog; ts: number } | null {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
+    if (parsed.v !== CACHE_VERSION) return null;
     if (Date.now() - (parsed.ts ?? 0) > CACHE_TTL) return null;
     return parsed;
   } catch {
@@ -36,18 +47,18 @@ function loadCached(): { data: ModelsDevCatalog; ts: number } | null {
 
 function saveCached(data: ModelsDevCatalog) {
   try {
-    localStorage.setItem(CACHE_KEY, JSON.stringify({ data, ts: Date.now() }));
+    localStorage.setItem(CACHE_KEY, JSON.stringify({ v: CACHE_VERSION, data, ts: Date.now() }));
   } catch {
     // localStorage full or unavailable — skip caching
   }
 }
 
 /**
- * The lookups only read id/name/modalities/limit/cost, but a raw api.json
- * entry carries a dozen more fields (description, reasoning_options, …) that
- * bloat the cached payload to ~4.6MB — most of a ~5MB localStorage store.
- * Strip everything unread so the cache stays near ~1MB and leaves room for
- * chats. Returns a slimmed copy; the input is never mutated.
+ * The lookups only read id/name/modalities/limit/cost/reasoning, but a raw
+ * api.json entry carries a dozen more fields (description, …) that bloat the
+ * cached payload to ~4.6MB — most of a ~5MB localStorage store. Strip
+ * everything unread so the cache stays near ~1MB and leaves room for chats.
+ * Returns a slimmed copy; the input is never mutated.
  */
 function slimCatalog(data: ModelsDevCatalog): ModelsDevCatalog {
   const out: ModelsDevCatalog = {};
@@ -60,6 +71,8 @@ function slimCatalog(data: ModelsDevCatalog): ModelsDevCatalog {
         modalities: m.modalities,
         limit: m.limit,
         cost: m.cost,
+        reasoning: m.reasoning,
+        reasoning_options: m.reasoning_options,
       };
     }
     out[providerKey] = { ...provider, models };
@@ -78,7 +91,9 @@ function isFatCatalog(data: ModelsDevCatalog): boolean {
             k !== "name" &&
             k !== "modalities" &&
             k !== "limit" &&
-            k !== "cost",
+            k !== "cost" &&
+            k !== "reasoning" &&
+            k !== "reasoning_options",
         )
       ) {
         return true;
@@ -375,6 +390,129 @@ export function getModelCapabilitiesSync(provider: Provider, modelName: string):
     };
   }
   return { vision: heuristicVision(modelName), source: "heuristic", inputModalities: ["text"] };
+}
+
+// ─── Reasoning / thinking options ──────────────────────────────────────────
+
+export interface ModelReasoningSupport {
+  /** models.dev `reasoning` flag — false means the model can't think. */
+  reasoning: boolean;
+  /** Effort values the model accepts ("none", "low", "high", "xhigh", "max", …). */
+  efforts: string[];
+  /** A plain on/off toggle is supported (models.dev type "toggle"). */
+  toggle: boolean;
+}
+
+/** Canonical ordering of models.dev effort values; unknown values sort last. */
+const REASONING_RANK: Record<string, number> = {
+  none: 0,
+  minimal: 1,
+  low: 2,
+  medium: 3,
+  high: 4,
+  xhigh: 5,
+  max: 6,
+};
+
+export function reasoningEffortRank(effort: string): number {
+  return REASONING_RANK[effort] ?? 99;
+}
+
+function reasoningOf(entry: ModelsDevModel | undefined): ModelReasoningSupport | null {
+  if (!entry) return null;
+  const options = entry.reasoning_options ?? [];
+  const efforts = [
+    ...new Set(
+      options
+        .filter((o) => o?.type === "effort")
+        .flatMap((o) => o?.values ?? [])
+        .filter((v): v is string => typeof v === "string" && v.length > 0),
+    ),
+  ];
+  return {
+    reasoning: entry.reasoning === true,
+    efforts,
+    toggle: options.some((o) => o?.type === "toggle"),
+  };
+}
+
+function findReasoning(
+  catalog: ModelsDevCatalog,
+  providerKey: string | null,
+  modelName: string,
+): ModelReasoningSupport | null {
+  if (providerKey) {
+    const scoped = reasoningOf(findModelEntry(catalog[providerKey]?.models ?? {}, modelName));
+    if (scoped) return scoped;
+  }
+  for (const provider of Object.values(catalog)) {
+    const anywhere = reasoningOf(findModelEntry(provider?.models ?? {}, modelName));
+    if (anywhere) return anywhere;
+  }
+  return null;
+}
+
+/** Thinking support for a model: this provider's entry first, then any provider. */
+export async function getModelReasoning(
+  provider: Provider,
+  modelName: string,
+): Promise<ModelReasoningSupport | null> {
+  const catalog = await getModelsDevCatalog();
+  if (!catalog) return null;
+  return findReasoning(catalog, providerKeyForBaseUrl(provider.baseUrl), modelName);
+}
+
+/** Synchronous best-effort reasoning support (cached catalog only). */
+export function getModelReasoningSync(
+  provider: Provider,
+  modelName: string,
+): ModelReasoningSupport | null {
+  const cached = loadCached();
+  if (!cached) return null;
+  return findReasoning(cached.data, providerKeyForBaseUrl(provider.baseUrl), modelName);
+}
+
+/**
+ * True when the model accepts this effort value. "default" (send nothing) is
+ * always allowed; unknown support (catalog miss) is optimistically allowed.
+ */
+export function isReasoningEffortSupported(
+  support: ModelReasoningSupport | null,
+  effort: string,
+): boolean {
+  if (effort === "default") return true;
+  if (!support) return true;
+  if (support.efforts.includes(effort)) return true;
+  return effort === "none" && support.toggle;
+}
+
+/**
+ * Clamp a requested effort to what the model actually accepts:
+ * - "default"/unset → undefined (send nothing, provider default)
+ * - unknown support → verbatim (provider decides)
+ * - valid value → verbatim
+ * - invalid value → nearest valid value by rank (ties prefer deeper thinking)
+ * - no effort scale (toggle-only / always-on) → undefined for non-"none"
+ */
+export function sanitizeReasoningEffort(
+  effort: string | undefined,
+  support: ModelReasoningSupport | null,
+): string | undefined {
+  if (!effort || effort === "default") return undefined;
+  if (!support) return effort;
+  if (support.efforts.includes(effort)) return effort;
+  if (effort === "none" && support.toggle) return "none";
+  if (support.efforts.length === 0) return undefined;
+  const target = reasoningEffortRank(effort);
+  let best = support.efforts[0];
+  for (const candidate of support.efforts) {
+    const dist = Math.abs(reasoningEffortRank(candidate) - target);
+    const bestDist = Math.abs(reasoningEffortRank(best) - target);
+    if (dist < bestDist || (dist === bestDist && reasoningEffortRank(candidate) > reasoningEffortRank(best))) {
+      best = candidate;
+    }
+  }
+  return best;
 }
 
 /** Catalog display name for a model ("GLM 5.3 Flash"), any serving provider. */

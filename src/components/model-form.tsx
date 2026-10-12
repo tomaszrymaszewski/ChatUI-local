@@ -1,5 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
-import { Loader2, RefreshCw } from "lucide-react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { createPortal } from "react-dom";
+import { Check, Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -13,6 +14,7 @@ import {
 import type { Provider, ProviderModel } from "@/types";
 import { fetchModelsFromApi, fetchOllamaModels } from "@/lib/llm";
 import { formatModelName } from "@/lib/model-display";
+import { cn } from "@/lib/utils";
 
 interface ModelFormProps {
   providers: Provider[];
@@ -23,6 +25,15 @@ interface ModelFormProps {
 export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
   const [providerId, setProviderId] = useState("");
   const [modelId, setModelId] = useState("");
+  // Searchable model picker: the field itself holds what the user types and
+  // the list below filters to names containing it. The list is portaled to
+  // the body (fixed positioning) so it can overflow the Add Model dialog
+  // instead of being clipped by its scroll container.
+  const [modelQuery, setModelQuery] = useState("");
+  const [modelOpen, setModelOpen] = useState(false);
+  const modelBoxRef = useRef<HTMLDivElement>(null);
+  const modelListRef = useRef<HTMLDivElement>(null);
+  const [modelListStyle, setModelListStyle] = useState<React.CSSProperties | null>(null);
   const [displayName, setDisplayName] = useState("");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [loadingModels, setLoadingModels] = useState(false);
@@ -54,6 +65,8 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
   useEffect(() => {
     if (providerId) {
       setModelId("");
+      setModelQuery("");
+      setModelOpen(false);
       setDisplayName("");
       setAvailableModels([]);
       setFetchError(null);
@@ -61,9 +74,82 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
     }
   }, [providerId, fetchModels]);
 
-  const handleModelSelect = (value: string) => {
-    setModelId(value);
+  // Filter while typing — case-insensitive substring match.
+  const filteredModels = useMemo(() => {
+    const q = modelQuery.trim().toLowerCase();
+    if (!q) return availableModels;
+    return availableModels.filter((m) => m.toLowerCase().includes(q));
+  }, [availableModels, modelQuery]);
+  // Long catalogs (OpenRouter has hundreds) render a bounded window; the
+  // query narrows it quickly.
+  const visibleModels = filteredModels.slice(0, 100);
+
+  const handleQueryChange = (value: string) => {
+    setModelQuery(value);
+    setModelOpen(true);
+    // Typing an exact name selects it; anything else clears the selection so
+    // Add Model can't save a model the field no longer shows.
+    const exact = availableModels.find(
+      (m) => m.toLowerCase() === value.trim().toLowerCase(),
+    );
+    setModelId(exact ?? "");
   };
+
+  const selectModel = (value: string) => {
+    setModelId(value);
+    setModelQuery(value);
+    setModelOpen(false);
+  };
+
+  // Anchor the portaled list under the field, flipping above it when there
+  // is more room up top; the height shrinks to the available space so the
+  // list never runs off the window even though it overflows the dialog.
+  const updateModelListPosition = useCallback(() => {
+    const input = modelBoxRef.current?.querySelector("input");
+    if (!input) return;
+    const rect = input.getBoundingClientRect();
+    const gap = 4;
+    const spaceBelow = window.innerHeight - rect.bottom - gap - 8;
+    const spaceAbove = rect.top - gap - 8;
+    const openUp = spaceBelow < 160 && spaceAbove > spaceBelow;
+    setModelListStyle({
+      position: "fixed",
+      left: rect.left,
+      width: rect.width,
+      maxHeight: Math.max(96, Math.min(256, openUp ? spaceAbove : spaceBelow)),
+      ...(openUp
+        ? { bottom: window.innerHeight - rect.top + gap }
+        : { top: rect.bottom + gap }),
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!modelOpen) return;
+    updateModelListPosition();
+    const onMove = () => updateModelListPosition();
+    window.addEventListener("resize", onMove);
+    // Capture so scrolling any ancestor (the dialog's scroll container
+    // included) keeps the fixed list glued to the field.
+    document.addEventListener("scroll", onMove, true);
+    return () => {
+      window.removeEventListener("resize", onMove);
+      document.removeEventListener("scroll", onMove, true);
+    };
+  }, [modelOpen, updateModelListPosition]);
+
+  // Close the list when clicking anywhere outside the picker or its portaled
+  // list.
+  useEffect(() => {
+    if (!modelOpen) return;
+    const onMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (modelBoxRef.current?.contains(target)) return;
+      if (modelListRef.current?.contains(target)) return;
+      setModelOpen(false);
+    };
+    document.addEventListener("mousedown", onMouseDown);
+    return () => document.removeEventListener("mousedown", onMouseDown);
+  }, [modelOpen]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -148,18 +234,91 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
                     No models found. Check your API key and try refreshing.
                   </p>
                 ) : (
-                  <Select value={modelId} onValueChange={handleModelSelect}>
-                    <SelectTrigger id="model-id">
-                      <SelectValue placeholder="Select a model" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {availableModels.map((m) => (
-                        <SelectItem key={m} value={m}>
-                          {m}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
+                  <div ref={modelBoxRef} className="relative">
+                    <Input
+                      id="model-id"
+                      role="combobox"
+                      aria-expanded={modelOpen}
+                      aria-controls="model-listbox"
+                      autoComplete="off"
+                      spellCheck={false}
+                      placeholder="Search models…"
+                      value={modelQuery}
+                      onChange={(e) => handleQueryChange(e.target.value)}
+                      onFocus={() => setModelOpen(true)}
+                      // Focus stays in the input after a pick, so a plain
+                      // click must reopen the list too (focus won't refire).
+                      onClick={() => setModelOpen(true)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Escape") {
+                          setModelOpen(false);
+                          return;
+                        }
+                        // Enter with no selection yet picks the top match;
+                        // with one, the form submits as usual.
+                        if (
+                          e.key === "Enter" &&
+                          modelOpen &&
+                          !modelId &&
+                          visibleModels.length > 0
+                        ) {
+                          e.preventDefault();
+                          selectModel(visibleModels[0]);
+                        }
+                      }}
+                    />
+                    {modelOpen &&
+                      modelListStyle &&
+                      createPortal(
+                        <div
+                          ref={modelListRef}
+                          data-model-listbox=""
+                          id="model-listbox"
+                          role="listbox"
+                          style={modelListStyle}
+                          // pointer-events-auto: the modal dialog sets
+                          // pointer-events: none on the body, which this
+                          // body-portaled list would otherwise inherit —
+                          // clicks and hover would never reach the options.
+                          className="pointer-events-auto z-[80] overflow-y-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+                        >
+                          {visibleModels.length === 0 ? (
+                            <p className="px-2 py-1.5 text-sm text-muted-foreground">
+                              No models match “{modelQuery.trim()}”
+                            </p>
+                          ) : (
+                            visibleModels.map((m) => (
+                              <button
+                                key={m}
+                                type="button"
+                                role="option"
+                                aria-selected={m === modelId}
+                                // Keep focus in the input so the list stays open
+                                // until the click lands.
+                                onMouseDown={(e) => e.preventDefault()}
+                                onClick={() => selectModel(m)}
+                                className={cn(
+                                  "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm outline-none hover:bg-accent hover:text-accent-foreground",
+                                  m === modelId && "bg-accent/50",
+                                )}
+                              >
+                                <span className="min-w-0 flex-1 truncate">{m}</span>
+                                {m === modelId && (
+                                  <Check className="size-3.5 shrink-0" />
+                                )}
+                              </button>
+                            ))
+                          )}
+                          {filteredModels.length > visibleModels.length && (
+                            <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                              {filteredModels.length - visibleModels.length} more — keep
+                              typing to narrow
+                            </p>
+                          )}
+                        </div>,
+                        document.body,
+                      )}
+                  </div>
                 )}
               </div>
 

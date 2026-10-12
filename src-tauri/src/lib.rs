@@ -4870,12 +4870,48 @@ mod tests {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
+    // Temporary iOS crash diagnostics: write the panic message to the app
+    // container's Documents dir so it can be pulled off the device (the
+    // default panic hook's stderr is lost when a panic crosses the Obj-C
+    // delegate boundary and aborts).
+    #[cfg(mobile)]
+    {
+        let path = std::env::var("HOME")
+            .ok()
+            .map(|h| std::path::PathBuf::from(h).join("Documents").join("ios-panic.log"));
+        std::panic::set_hook(Box::new(move |info| {
+            use std::io::Write;
+            if let Some(path) = &path {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = writeln!(f, "PANIC: {info}");
+                    let _ = writeln!(f, "{}", std::backtrace::Backtrace::force_capture());
+                }
+            }
+        }));
+    }
+
+    // tauri-plugin-updater compiles reqwest's TLS with `rustls-no-provider`,
+    // so Tauri's webview client panics while building its reqwest Client
+    // ("No rustls crypto provider is configured") unless a process-wide
+    // provider is installed before the app is built. This must run first.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_notification::init());
+    // tauri-plugin-updater supports Windows/Linux/macOS only. Registering it
+    // on mobile panics during launch, so it stays desktop-only.
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+    let app = builder
         .setup(|_app| {
             // Must run before any command can open the vector index or read
             // OAuth tokens — both live in the (moved) base directory.

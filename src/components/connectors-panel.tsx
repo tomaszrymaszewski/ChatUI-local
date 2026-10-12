@@ -7,7 +7,6 @@ import {
   RefreshCw,
   ShieldCheck,
   Loader2,
-  ChevronDown,
   KeyRound,
   ExternalLink,
   Globe,
@@ -15,6 +14,8 @@ import {
   Workflow,
   Flame,
   Trash2,
+  ChevronRight,
+  ArrowLeft,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -22,17 +23,19 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import {
   NotionLogo,
@@ -74,6 +77,7 @@ import {
   type McpCatalogEntry,
   type McpCategory,
 } from "@/lib/mcp-catalog";
+import { useOpencodeContext } from "@/lib/opencode-context";
 
 type IconComponent = ComponentType<SVGProps<SVGSVGElement>>;
 
@@ -128,11 +132,24 @@ function authLabel(entry: McpCatalogEntry): string {
   }
 }
 
-export function ConnectorsPanel({
-  activeDirectory,
-}: {
-  activeDirectory: string | null;
-}) {
+/** A row in the app lists: catalog entry, or a manually added server. */
+interface DisplayRow {
+  id: string;
+  name: string;
+  tagline: string;
+  catalog: McpCatalogEntry | null;
+}
+
+/**
+ * Full-page connector browser (the composer chip's "Connect apps" page):
+ * search, an Installed section, then the catalog grouped by category —
+ * each category drills into its own page. Manage and Custom app live in the
+ * top-right; the back arrow top-left returns to chat (or up a level).
+ */
+export function ConnectorsPage({ onBack }: { onBack: () => void }) {
+  const oc = useOpencodeContext();
+  const activeDirectory = oc.activeDirectory;
+
   const [scope, setScope] = useState<"global" | "project">("global");
   const [mcpEntries, setMcpEntries] = useState<Record<string, McpServerEntry>>({});
   const [mcpAuth, setMcpAuth] = useState<McpAuthData>({});
@@ -141,7 +158,9 @@ export function ConnectorsPanel({
   const [uninstalling, setUninstalling] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
   const [query, setQuery] = useState("");
-  const [category, setCategory] = useState<McpCategory | "All">("All");
+  const [category, setCategory] = useState<McpCategory | null>(null);
+  const [manageOpen, setManageOpen] = useState(false);
+  const [customAppOpen, setCustomAppOpen] = useState(false);
 
   // API-key entry form
   const [apikeyTarget, setApikeyTarget] = useState<McpCatalogEntry | null>(null);
@@ -152,8 +171,7 @@ export function ConnectorsPanel({
   const [oauthClientId, setOauthClientId] = useState("");
   const [oauthClientSecret, setOauthClientSecret] = useState("");
 
-  // Advanced (manual + registry search)
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  // Custom app dialog: manual add + registry search
   const [registryQuery, setRegistryQuery] = useState("");
   const [registryResults, setRegistryResults] = useState<RegistryServer[]>([]);
   const [registrySearching, setRegistrySearching] = useState(false);
@@ -183,9 +201,9 @@ export function ConnectorsPanel({
     void refresh();
   }, [refresh, tick]);
 
-  // Debounced registry search (advanced only)
+  // Debounced registry search (custom app dialog only)
   useEffect(() => {
-    if (!advancedOpen || !registryQuery.trim()) {
+    if (!customAppOpen || !registryQuery.trim()) {
       setRegistryResults([]);
       return;
     }
@@ -196,8 +214,9 @@ export function ConnectorsPanel({
       setRegistrySearching(false);
     }, 400);
     return () => clearTimeout(timer);
-  }, [registryQuery, advancedOpen]);
+  }, [registryQuery, customAppOpen]);
 
+  const catalog = useMemo(() => listCachedConnectors(), [tick]);
   const installedIds = useMemo(() => new Set(Object.keys(mcpEntries)), [mcpEntries]);
 
   const addEntry = async (name: string, entry: McpServerEntry) => {
@@ -306,20 +325,20 @@ export function ConnectorsPanel({
     }
   };
 
-  const handleUninstall = async (cat: McpCatalogEntry) => {
-    setUninstalling(cat.id);
+  const handleUninstall = async (id: string, name: string) => {
+    setUninstalling(id);
     try {
       // Drop the stored entry (its tools leave the agent's set immediately)
       // and, best-effort, the sign-in tokens on disk.
-      removeMcpServer(cat.id);
+      removeMcpServer(id);
       try {
-        await clearMcpTokens(cat.id);
+        await clearMcpTokens(id);
       } catch {
         /* token cleanup is best-effort */
       }
-      toast.success(`Removed ${cat.name}`);
+      toast.success(`Removed ${name}`);
     } catch {
-      toast.error(`Failed to remove ${cat.name}`);
+      toast.error(`Failed to remove ${name}`);
     } finally {
       setUninstalling(null);
       setTick((t) => t + 1);
@@ -402,6 +421,7 @@ export function ConnectorsPanel({
       setMcpName("");
       setMcpUrl("");
       setMcpToken("");
+      setCustomAppOpen(false);
       setTick((t) => t + 1);
     } catch {
       toast.error("Failed to add MCP");
@@ -426,16 +446,45 @@ export function ConnectorsPanel({
         addedAt: new Date().toISOString(),
       });
       toast.success(`Added ${server.title || name}`);
+      setCustomAppOpen(false);
       setTick((t) => t + 1);
     } catch {
       toast.error("Failed to add MCP");
     }
   };
 
-  const filteredCatalog = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    return listCachedConnectors().filter((e) => {
-      if (category !== "All" && e.category !== category) return false;
+  const needsAuth = useCallback(
+    (id: string, cat: McpCatalogEntry | null) =>
+      !!cat && cat.auth === "oauth" && !hasToken(mcpAuth, id),
+    [mcpAuth],
+  );
+
+  // Installed rows: catalog entries that are installed, plus manually added
+  // servers that aren't in the catalog.
+  const installedRows = useMemo(() => {
+    const rows: DisplayRow[] = [];
+    for (const cat of catalog) {
+      if (installedIds.has(cat.id)) {
+        rows.push({ id: cat.id, name: cat.name, tagline: cat.tagline, catalog: cat });
+      }
+    }
+    for (const name of Object.keys(mcpEntries)) {
+      if (rows.some((r) => r.id === name)) continue;
+      const cat = catalog.find((c) => c.id === name) ?? null;
+      if (cat) continue;
+      rows.push({
+        id: name,
+        name,
+        tagline: mcpEntries[name].url,
+        catalog: null,
+      });
+    }
+    return rows;
+  }, [catalog, mcpEntries, installedIds]);
+
+  const matchesQuery = useCallback(
+    (e: McpCatalogEntry) => {
+      const q = query.trim().toLowerCase();
       if (!q) return true;
       return (
         e.name.toLowerCase().includes(q) ||
@@ -443,37 +492,252 @@ export function ConnectorsPanel({
         e.category.toLowerCase().includes(q) ||
         (e.keywords ?? []).some((k) => k.toLowerCase().includes(q))
       );
-    });
-  }, [query, category, tick]);
+    },
+    [query],
+  );
+
+  const searchResults = useMemo(
+    () => catalog.filter(matchesQuery),
+    [catalog, matchesQuery],
+  );
+
+  const categorySections = useMemo(
+    () =>
+      MCP_CATEGORIES.map((c) => ({
+        category: c,
+        entries: catalog.filter((e) => e.category === c),
+      })).filter((s) => s.entries.length > 0),
+    [catalog],
+  );
+
+  /** Row action: Add, Sign in, or a quiet "connected" check. */
+  const rowAction = (row: DisplayRow) => {
+    const installed = installedIds.has(row.id);
+    if (!installed) {
+      return (
+        <Button
+          size="icon-xs"
+          variant="ghost"
+          className="rounded-full text-muted-foreground hover:text-foreground"
+          title={`Add ${row.name}`}
+          disabled={adding === row.id}
+          onClick={() => row.catalog && handleAddCatalog(row.catalog)}
+        >
+          {adding === row.id ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <Plus className="size-3.5" />
+          )}
+        </Button>
+      );
+    }
+    if (needsAuth(row.id, row.catalog)) {
+      return (
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={authing === row.id}
+          onClick={() => handleAuth(row.id)}
+        >
+          {authing === row.id ? (
+            <Loader2 className="size-3 animate-spin" />
+          ) : (
+            <ExternalLink className="size-3" />
+          )}
+          Sign in
+        </Button>
+      );
+    }
+    return (
+      <span
+        title="Connected"
+        className="flex size-6 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+      >
+        <Check className="size-3.5" />
+      </span>
+    );
+  };
+
+  const connectorRow = (row: DisplayRow) => {
+    const { Icon, tile } = mcpIcon(row.id);
+    return (
+      <div
+        key={row.id}
+        className="group flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-muted/50"
+      >
+        <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-lg", tile)}>
+          <Icon className="size-4.5" />
+        </span>
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate text-sm font-medium">{row.name}</span>
+          <span className="truncate text-xs text-muted-foreground">{row.tagline}</span>
+        </div>
+        <div className="shrink-0">{rowAction(row)}</div>
+      </div>
+    );
+  };
+
+  const sectionHeader = (
+    title: string,
+    opts?: { onOpen?: () => void },
+  ) => (
+    <button
+      type="button"
+      onClick={opts?.onOpen}
+      disabled={!opts?.onOpen}
+      className={cn(
+        "group flex items-center gap-1 text-sm font-semibold",
+        opts?.onOpen && "transition-colors hover:text-foreground/70",
+      )}
+    >
+      {title}
+      {opts?.onOpen && (
+        <ChevronRight className="size-4 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
+      )}
+    </button>
+  );
+
+  const backTarget = category
+    ? () => setCategory(null)
+    : manageOpen
+      ? () => setManageOpen(false)
+      : onBack;
+
+  const title = category ?? (manageOpen ? "Manage connections" : "Connectors");
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-col gap-1">
-        <h2 className="flex items-center gap-2 text-xl font-semibold">
-          <Plug className="size-5" /> Connectors
-        </h2>
-        <p className="text-sm text-muted-foreground">
-          Connect the AI to your other apps — like Notion, GitHub, or Figma — so it can read
-          and update them for you. Add an app, sign in once in your browser, and you're done.
-          These are official connections from each app's maker.
-        </p>
+      {/* ─── Top bar: back left, Manage / Custom app right ─── */}
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-1">
+          <Button variant="ghost" size="icon-sm" onClick={backTarget} aria-label="Go back">
+            <ArrowLeft className="size-4" />
+          </Button>
+          <h1 className="text-xl font-semibold">{title}</h1>
+        </div>
+        {!category && !manageOpen && (
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setManageOpen(true)}>
+              Manage
+            </Button>
+            <Button size="sm" onClick={() => setCustomAppOpen(true)}>
+              <Plus className="size-3.5" />
+              Custom app
+            </Button>
+          </div>
+        )}
       </div>
 
-        <div className="flex flex-col gap-2.5">
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <div className="relative flex-1">
-              <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+      {!manageOpen && !category && (
+        <p className="text-sm text-muted-foreground">
+          Connect apps so the AI can read and update them for you. Add an app,
+          sign in once in your browser, and you're done.
+        </p>
+      )}
+
+      {/* ─── Search ─── */}
+      {!manageOpen && (
+        <div className="relative">
+          <Search className="absolute left-3.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+          <Input
+            placeholder="Search apps"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            className="h-11 rounded-full border-transparent bg-muted/50 pl-10"
+          />
+        </div>
+      )}
+
+      {/* ─── Entry forms (API key / Google OAuth client) ─── */}
+      {oauthTarget?.customOAuth && (
+        <div className="flex flex-col gap-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <KeyRound className="size-3.5" /> {oauthTarget.name} needs your Google client
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {oauthTarget.customOAuth.setupHint}{" "}
+            <button
+              className="underline underline-offset-2 hover:text-foreground"
+              onClick={() => void openUrl(oauthTarget.customOAuth!.setupUrl)}
+            >
+              Open Google Cloud console
+            </button>
+          </p>
+          <div className="flex flex-col gap-1">
+            <Label className="text-xs">OAuth client ID</Label>
+            <Input
+              value={oauthClientId}
+              onChange={(e) => setOauthClientId(e.target.value)}
+              placeholder="….apps.googleusercontent.com"
+            />
+          </div>
+          <div className="flex flex-col gap-1">
+            <Label className="text-xs">OAuth client secret</Label>
+            <Input
+              value={oauthClientSecret}
+              onChange={(e) => setOauthClientSecret(e.target.value)}
+              placeholder="Paste your client secret…"
+              type="password"
+            />
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            <Button size="sm" variant="ghost" onClick={() => setOauthTarget(null)}>
+              Cancel
+            </Button>
+            <Button size="sm" disabled={adding === oauthTarget.id} onClick={confirmOAuthAdd}>
+              {adding === oauthTarget.id ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Plus className="size-3.5" />
+              )}
+              Save & sign in
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {apikeyTarget && (
+        <div className="flex flex-col gap-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <KeyRound className="size-3.5" /> {apikeyTarget.name} needs a key
+          </div>
+          {apikeyTarget.envKeys?.map((k) => (
+            <div key={k} className="flex flex-col gap-1">
+              <Label className="text-xs">{k}</Label>
               <Input
-                placeholder="Search apps…"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                className="pl-9"
+                value={apikeyValues[k] ?? ""}
+                onChange={(e) =>
+                  setApikeyValues((prev) => ({ ...prev, [k]: e.target.value }))
+                }
+                placeholder={`Paste your ${k}…`}
+                type="password"
               />
             </div>
+          ))}
+          <div className="flex items-center justify-end gap-2">
+            <Button size="sm" variant="ghost" onClick={() => setApikeyTarget(null)}>
+              Cancel
+            </Button>
+            <Button size="sm" disabled={adding === apikeyTarget.id} onClick={confirmApikeyAdd}>
+              {adding === apikeyTarget.id ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Plus className="size-3.5" />
+              )}
+              Add
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* ─── Manage: scope + installed list ─── */}
+      {manageOpen && (
+        <div className="flex flex-col gap-4">
+          <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs">
-              <span className="text-muted-foreground">Save to:</span>
+              <span className="text-muted-foreground">New connections save to:</span>
               <Select value={scope} onValueChange={(v) => setScope(v as "global" | "project")}>
-                <SelectTrigger size="sm" className="w-44">
+                <SelectTrigger size="sm" className="w-60">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -491,332 +755,222 @@ export function ConnectorsPanel({
             </Button>
           </div>
 
-          <div className="flex flex-wrap items-center gap-1.5">
-            {(["All", ...MCP_CATEGORIES] as Array<McpCategory | "All">).map((c) => (
-              <button
-                key={c}
-                onClick={() => setCategory(c)}
-                className={cn(
-                  "rounded-full border px-3 py-1 text-xs font-medium transition-colors",
-                  category === c
-                    ? "border-foreground bg-foreground text-background"
-                    : "border-border text-muted-foreground hover:border-foreground/30 hover:text-foreground",
-                )}
-              >
-                {c}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-y-auto pr-1">
-
-          {/* ─── Directory ─── */}
-          <div className="flex flex-col gap-3 pt-4">
-            <span className="text-sm font-medium">Browse official apps</span>
-
-            {/* Bring-your-own-OAuth-client form (Google Workspace) */}
-            {oauthTarget?.customOAuth && (
-              <div className="flex flex-col gap-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
-                <div className="flex items-center gap-2 text-sm font-medium">
-                  <KeyRound className="size-3.5" /> {oauthTarget.name} needs your Google client
-                </div>
-                <p className="text-xs text-muted-foreground">
-                  {oauthTarget.customOAuth.setupHint}{" "}
-                  <button
-                    className="underline underline-offset-2 hover:text-foreground"
-                    onClick={() => void openUrl(oauthTarget.customOAuth!.setupUrl)}
-                  >
-                    Open Google Cloud console
-                  </button>
-                </p>
-                <div className="flex flex-col gap-1">
-                  <Label className="text-xs">OAuth client ID</Label>
-                  <Input
-                    value={oauthClientId}
-                    onChange={(e) => setOauthClientId(e.target.value)}
-                    placeholder="….apps.googleusercontent.com"
-                  />
-                </div>
-                <div className="flex flex-col gap-1">
-                  <Label className="text-xs">OAuth client secret</Label>
-                  <Input
-                    value={oauthClientSecret}
-                    onChange={(e) => setOauthClientSecret(e.target.value)}
-                    placeholder="Paste your client secret…"
-                    type="password"
-                  />
-                </div>
-                <div className="flex items-center justify-end gap-2">
-                  <Button size="sm" variant="ghost" onClick={() => setOauthTarget(null)}>
-                    Cancel
-                  </Button>
-                  <Button size="sm" disabled={adding === oauthTarget.id} onClick={confirmOAuthAdd}>
-                    {adding === oauthTarget.id ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Plus className="size-3.5" />
-                    )}
-                    Save & sign in
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            {/* API-key form */}
-            {apikeyTarget && (
-              <div className="flex flex-col gap-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
-                <div className="flex items-center gap-2 text-sm font-medium">
-                  <KeyRound className="size-3.5" /> {apikeyTarget.name} needs a key
-                </div>
-                {apikeyTarget.envKeys?.map((k) => (
-                  <div key={k} className="flex flex-col gap-1">
-                    <Label className="text-xs">{k}</Label>
-                    <Input
-                      value={apikeyValues[k] ?? ""}
-                      onChange={(e) =>
-                        setApikeyValues((prev) => ({ ...prev, [k]: e.target.value }))
-                      }
-                      placeholder={`Paste your ${k}…`}
-                      type="password"
-                    />
-                  </div>
-                ))}
-                <div className="flex items-center justify-end gap-2">
-                  <Button size="sm" variant="ghost" onClick={() => setApikeyTarget(null)}>
-                    Cancel
-                  </Button>
-                  <Button size="sm" disabled={adding === apikeyTarget.id} onClick={confirmApikeyAdd}>
-                    {adding === apikeyTarget.id ? (
-                      <Loader2 className="size-3.5 animate-spin" />
-                    ) : (
-                      <Plus className="size-3.5" />
-                    )}
-                    Add
-                  </Button>
-                </div>
-              </div>
-            )}
-
-            <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-4">
-              {filteredCatalog.map((cat) => {
-                const installed = installedIds.has(cat.id);
-                const needsAuth =
-                  cat.auth === "oauth" && !hasToken(mcpAuth, cat.id);
-                const { Icon, tile } = mcpIcon(cat.id);
+          {installedRows.length === 0 ? (
+            <p className="py-8 text-center text-sm text-muted-foreground">
+              No connectors added yet. Pick apps from the catalog to get started.
+            </p>
+          ) : (
+            <div className="flex flex-col gap-1">
+              {installedRows.map((row) => {
+                const { Icon, tile } = mcpIcon(row.id);
                 return (
                   <div
-                    key={cat.id}
-                    className={cn(
-                      "flex flex-col gap-3 rounded-xl border p-4 transition-colors",
-                      installed
-                        ? needsAuth
-                          ? "border-amber-500/40 bg-amber-500/5"
-                          : "border-emerald-500/30 bg-emerald-500/5"
-                        : "hover:border-foreground/20 hover:bg-muted/50",
-                    )}
+                    key={row.id}
+                    className="flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors hover:bg-muted/50"
                   >
-                    <div className="flex w-full items-start justify-between gap-2">
-                      <div
-                        className={cn(
-                          "flex size-10 shrink-0 items-center justify-center rounded-lg",
-                          tile,
-                        )}
-                      >
-                        <Icon className="size-5" />
-                      </div>
-                      {installed ? (
-                        needsAuth ? (
-                          <div className="flex items-center gap-1.5">
-                            <Button
-                              size="xs"
-                              variant="outline"
-                              disabled={authing === cat.id}
-                              onClick={() => handleAuth(cat.id)}
-                            >
-                              {authing === cat.id ? (
-                                <Loader2 className="size-3 animate-spin" />
-                              ) : (
-                                <ExternalLink className="size-3" />
-                              )}
-                              Sign in
-                            </Button>
-                            <Button
-                              size="icon-xs"
-                              variant="ghost"
-                              aria-label={`Remove ${cat.name}`}
-                              title="Remove"
-                              disabled={uninstalling === cat.id}
-                              onClick={() => handleUninstall(cat)}
-                              className="text-muted-foreground hover:text-destructive dark:hover:text-destructive"
-                            >
-                              {uninstalling === cat.id ? (
-                                <Loader2 className="size-3 animate-spin" />
-                              ) : (
-                                <Trash2 className="size-3" />
-                              )}
-                            </Button>
-                          </div>
-                        ) : (
-                          <button
-                            onClick={() => handleUninstall(cat)}
-                            disabled={uninstalling === cat.id}
-                            className={cn(
-                              "group inline-flex h-6 items-center gap-1 rounded-md border px-2 text-xs font-medium transition-colors",
-                              "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-                              "hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive dark:hover:text-destructive",
-                              "disabled:pointer-events-none disabled:opacity-50",
-                            )}
-                          >
-                            {uninstalling === cat.id ? (
-                              <Loader2 className="size-3 animate-spin" />
-                            ) : (
-                              <>
-                                <Check className="size-2.5 group-hover:hidden" />
-                                <Trash2 className="hidden size-2.5 group-hover:block" />
-                              </>
-                            )}
-                            <span className="group-hover:hidden">Added</span>
-                            <span className="hidden group-hover:inline">Remove</span>
-                          </button>
-                        )
-                      ) : (
+                    <span className={cn("flex size-9 shrink-0 items-center justify-center rounded-lg", tile)}>
+                      <Icon className="size-4.5" />
+                    </span>
+                    <div className="flex min-w-0 flex-1 flex-col">
+                      <span className="truncate text-sm font-medium">{row.name}</span>
+                      <span className="truncate text-xs text-muted-foreground">
+                        {row.catalog ? authLabel(row.catalog) : "Custom connection"}
+                        {mcpEntries[row.id]?.url ? ` · ${mcpEntries[row.id].url}` : ""}
+                      </span>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      {needsAuth(row.id, row.catalog) && (
                         <Button
                           size="xs"
                           variant="outline"
-                          disabled={adding === cat.id}
-                          onClick={() => handleAddCatalog(cat)}
+                          disabled={authing === row.id}
+                          onClick={() => handleAuth(row.id)}
                         >
-                          {adding === cat.id ? (
+                          {authing === row.id ? (
                             <Loader2 className="size-3 animate-spin" />
                           ) : (
-                            <Plus className="size-3" />
+                            <ExternalLink className="size-3" />
                           )}
-                          Add
+                          Sign in
                         </Button>
                       )}
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <span className="text-sm font-semibold leading-tight">{cat.name}</span>
-                      <span className="line-clamp-2 text-xs leading-relaxed text-muted-foreground">
-                        {cat.tagline}
-                      </span>
-                    </div>
-                    <div className="mt-auto flex items-center justify-between gap-2 pt-1 text-[10px] text-muted-foreground/70">
-                      <span className="truncate">{authLabel(cat)} · {cat.vendor}</span>
-                      <span className="shrink-0 rounded-full border px-2 py-0.5">{cat.category}</span>
+                      <Button
+                        size="icon-xs"
+                        variant="ghost"
+                        aria-label={`Remove ${row.name}`}
+                        title="Remove"
+                        disabled={uninstalling === row.id}
+                        onClick={() => handleUninstall(row.id, row.name)}
+                        className="text-muted-foreground hover:text-destructive dark:hover:text-destructive"
+                      >
+                        {uninstalling === row.id ? (
+                          <Loader2 className="size-3 animate-spin" />
+                        ) : (
+                          <Trash2 className="size-3.5" />
+                        )}
+                      </Button>
                     </div>
                   </div>
                 );
               })}
             </div>
-            {filteredCatalog.length === 0 && (
-              <p className="text-xs text-muted-foreground">No apps match your search.</p>
-            )}
+          )}
+        </div>
+      )}
+
+      {/* ─── Browse: search results, or Installed + category sections ─── */}
+      {!manageOpen && (
+        <div className="flex flex-col gap-6">
+          {query.trim() ? (
+            <div className="flex flex-col gap-1">
+              {sectionHeader("Results")}
+              {searchResults.length === 0 ? (
+                <p className="py-4 text-sm text-muted-foreground">
+                  No apps match “{query.trim()}”.
+                </p>
+              ) : (
+                <div className="grid grid-cols-1 gap-x-6 md:grid-cols-2">
+                  {searchResults.map((cat) =>
+                    connectorRow({ id: cat.id, name: cat.name, tagline: cat.tagline, catalog: cat }),
+                  )}
+                </div>
+              )}
+            </div>
+          ) : category ? (
+            <div className="flex flex-col gap-1">
+              <div className="grid grid-cols-1 gap-x-6 md:grid-cols-2">
+                {catalog
+                  .filter((e) => e.category === category)
+                  .map((cat) =>
+                    connectorRow({ id: cat.id, name: cat.name, tagline: cat.tagline, catalog: cat }),
+                  )}
+              </div>
+            </div>
+          ) : (
+            <>
+              {installedRows.length > 0 && (
+                <div className="flex flex-col gap-1">
+                  {sectionHeader("Installed")}
+                  <div className="grid grid-cols-1 gap-x-6 md:grid-cols-2">
+                    {installedRows.map(connectorRow)}
+                  </div>
+                </div>
+              )}
+
+              {categorySections.map((section) => (
+                <div key={section.category} className="flex flex-col gap-1">
+                  {sectionHeader(section.category, {
+                    onOpen: () => setCategory(section.category),
+                  })}
+                  <div className="grid grid-cols-1 gap-x-6 md:grid-cols-2">
+                    {section.entries.slice(0, 4).map((cat) =>
+                      connectorRow({ id: cat.id, name: cat.name, tagline: cat.tagline, catalog: cat }),
+                    )}
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+
+          <div className="flex items-center gap-2 rounded-lg bg-muted/50 p-2.5 text-xs text-muted-foreground">
+            <ShieldCheck className="size-3.5 shrink-0" />
+            <span>
+              Connections run locally through your AI engine and stay on your machine. Each app's
+              maker provides its own connection — you only grant access to what you choose.
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* ─── Custom app dialog: manual add + registry search ─── */}
+      <Dialog open={customAppOpen} onOpenChange={setCustomAppOpen}>
+        <DialogContent className="max-h-[85dvh] overflow-y-auto sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <Plug className="size-5" /> Custom app
+            </DialogTitle>
+            <DialogDescription>
+              Connect any remote MCP server by URL. Local stdio servers cannot
+              run in the app.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="flex flex-col gap-3">
+            <div className="grid grid-cols-2 gap-2">
+              <div className="flex flex-col gap-1">
+                <Label className="text-xs">Name</Label>
+                <Input
+                  value={mcpName}
+                  onChange={(e) => setMcpName(e.target.value)}
+                  placeholder="my-mcp"
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <Label className="text-xs">URL</Label>
+                <Input
+                  value={mcpUrl}
+                  onChange={(e) => setMcpUrl(e.target.value)}
+                  placeholder="https://mcp.example.com/mcp"
+                />
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <Label className="text-xs">Access token (optional)</Label>
+              <Input
+                value={mcpToken}
+                onChange={(e) => setMcpToken(e.target.value)}
+                placeholder="Paste a personal token if the provider gave you one…"
+                type="password"
+              />
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Use the token field when sign-in isn't offered, e.g. a Zapier
+              per-user MCP URL secret or any other personal access token.
+            </p>
+            <Button
+              size="sm"
+              disabled={!mcpName.trim() || !mcpUrl.trim()}
+              onClick={handleAddManual}
+            >
+              <Plus className="size-3.5" /> Add MCP
+            </Button>
           </div>
 
-          <Separator className="my-4" />
+          <Separator />
 
-          {/* ─── Advanced ─── */}
-          <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
-            <CollapsibleTrigger asChild>
-              <Button variant="ghost" size="sm" className="w-full justify-between">
-                <span>Advanced: search all & add manually</span>
-                <ChevronDown
-                  className={`size-4 transition-transform ${advancedOpen ? "rotate-180" : ""}`}
-                />
-              </Button>
-            </CollapsibleTrigger>
-            <CollapsibleContent className="pt-2">
-              <div className="flex flex-col gap-3">
-                <div className="flex flex-col gap-2">
-                  <span className="text-xs text-muted-foreground">
-                    Search the full public MCP registry (includes community servers).
+          <div className="flex flex-col gap-2">
+            <span className="text-xs font-medium">Or search the public MCP registry</span>
+            <div className="relative">
+              <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                placeholder="Search the registry (e.g. github, sentry)…"
+                value={registryQuery}
+                onChange={(e) => setRegistryQuery(e.target.value)}
+                className="pl-9"
+              />
+            </div>
+            {registrySearching && (
+              <p className="text-xs text-muted-foreground">Searching…</p>
+            )}
+            {registryResults.slice(0, 6).map((server) => (
+              <div
+                key={server.id}
+                className="flex items-center justify-between gap-2 rounded-lg border p-2.5"
+              >
+                <div className="flex min-w-0 flex-col">
+                  <span className="truncate text-sm font-medium">{server.title}</span>
+                  <span className="truncate text-xs text-muted-foreground">
+                    {server.description}
                   </span>
-                  <div className="relative">
-                    <Search className="absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
-                    <Input
-                      placeholder="Search the registry (e.g. github, sentry)…"
-                      value={registryQuery}
-                      onChange={(e) => setRegistryQuery(e.target.value)}
-                      className="pl-9"
-                    />
-                  </div>
-                  {registrySearching && <p className="text-xs text-muted-foreground">Searching…</p>}
-                  {registryResults.slice(0, 6).map((server) => (
-                    <div
-                      key={server.id}
-                      className="flex items-center justify-between gap-2 rounded-lg border p-2.5"
-                    >
-                      <div className="min-w-0 flex flex-col">
-                        <span className="truncate text-sm font-medium">{server.title}</span>
-                        <span className="truncate text-xs text-muted-foreground">
-                          {server.description}
-                        </span>
-                      </div>
-                      <Button size="xs" onClick={() => handleAddFromRegistry(server)}>
-                        <Plus className="size-3" /> Add
-                      </Button>
-                    </div>
-                  ))}
                 </div>
-
-                <Separator />
-
-                <div className="flex flex-col gap-2">
-                  <span className="text-xs font-medium">Add manually</span>
-                  <div className="grid grid-cols-2 gap-2">
-                    <div className="flex flex-col gap-1">
-                      <Label className="text-xs">Name</Label>
-                      <Input
-                        value={mcpName}
-                        onChange={(e) => setMcpName(e.target.value)}
-                        placeholder="my-mcp"
-                      />
-                    </div>
-                    <div className="flex flex-col gap-1">
-                      <Label className="text-xs">URL</Label>
-                      <Input
-                        value={mcpUrl}
-                        onChange={(e) => setMcpUrl(e.target.value)}
-                        placeholder="https://mcp.example.com/mcp"
-                      />
-                    </div>
-                  </div>
-                  <div className="flex flex-col gap-1">
-                    <Label className="text-xs">Access token (optional)</Label>
-                    <Input
-                      value={mcpToken}
-                      onChange={(e) => setMcpToken(e.target.value)}
-                      placeholder="Paste a personal token if the provider gave you one…"
-                      type="password"
-                    />
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    Remote (URL) servers only — local stdio servers cannot run in the app.
-                    Use the token field when sign-in isn't offered, e.g. a Zapier
-                    per-user MCP URL secret or any other personal access token.
-                  </p>
-                  <Button
-                    size="sm"
-                    disabled={!mcpName.trim() || !mcpUrl.trim()}
-                    onClick={handleAddManual}
-                  >
-                    <Plus className="size-3.5" /> Add MCP
-                  </Button>
-                </div>
+                <Button size="xs" onClick={() => handleAddFromRegistry(server)}>
+                  <Plus className="size-3" /> Add
+                </Button>
               </div>
-            </CollapsibleContent>
-          </Collapsible>
-        </div>
-
-        <div className="flex items-center gap-2 rounded-lg bg-muted/50 p-2.5 text-xs text-muted-foreground">
-          <ShieldCheck className="size-3.5 shrink-0" />
-          <span>
-            Connections run locally through your AI engine and stay on your machine. Each app's
-            maker provides its own connection — you only grant access to what you choose.
-          </span>
-        </div>
+            ))}
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

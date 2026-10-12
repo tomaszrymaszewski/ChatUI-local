@@ -11,6 +11,58 @@ const STORAGE_KEY = "chatui:agents";
 const AGENTS_EVENT = "chatui:agents-changed";
 const PATHS_REMAPPED_KEY = "chatui:agents:paths-remapped";
 
+/** Palette the agent face avatars draw from (see AgentAvatar). */
+export const AGENT_FACE_COLORS = [
+  "#f87171",
+  "#fb923c",
+  "#facc15",
+  "#4ade80",
+  "#2dd4bf",
+  "#38bdf8",
+  "#818cf8",
+  "#c084fc",
+  "#f472b6",
+  "#e879f9",
+];
+
+/**
+ * Pick a face color no existing agent uses, so every agent is visually
+ * distinct at creation. When the palette is exhausted (>10 agents), the
+ * least-used color wins so duplicates spread out.
+ */
+function pickAgentColor(agents: AgentDefinition[]): string {
+  const used = new Map<string, number>();
+  for (const a of agents) {
+    if (a.color) used.set(a.color, (used.get(a.color) ?? 0) + 1);
+  }
+  const free = AGENT_FACE_COLORS.filter((c) => !used.has(c));
+  const pool =
+    free.length > 0
+      ? free
+      : AGENT_FACE_COLORS.filter(
+          (c) => (used.get(c) ?? 0) === Math.min(...AGENT_FACE_COLORS.map((x) => used.get(x) ?? 0)),
+        );
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+/**
+ * The agent's stored face color, assigning (and persisting + syncing) one for
+ * agents created before colors existed. Idempotent; safe to call repeatedly.
+ */
+export function ensureAgentColor(id: string): string {
+  const agents = loadAgentDefinitions();
+  const found = agents.find((a) => a.id === id);
+  if (found?.color) return found.color;
+  const color = pickAgentColor(agents);
+  if (found) updateAgentDefinition(id, { color });
+  return color;
+}
+
+/** The agent's stored face color, or undefined when the id is unknown. */
+export function agentColor(id: string): string | undefined {
+  return loadAgentDefinitions().find((a) => a.id === id)?.color;
+}
+
 export function loadAgentDefinitions(): AgentDefinition[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -89,6 +141,8 @@ export function saveAgentDefinition(
   const now = new Date().toISOString();
   const full: AgentDefinition = {
     ...def,
+    // Distinct face color per agent, chosen at creation (callers may pin one).
+    color: def.color ?? pickAgentColor(agents),
     id: crypto.randomUUID(),
     createdAt: now,
     updatedAt: now,

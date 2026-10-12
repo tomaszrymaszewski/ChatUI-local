@@ -2,8 +2,17 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // models.ts pulls getProviderApiKey (localStorage-backed) and the models.dev
 // catalog (network) — replace both so the test runs hermetically in node.
+// The reasoning sanitizer stays real; the catalog lookup is stubbed to a miss
+// so efforts pass through verbatim unless the GLM mapping rewrites them.
 vi.mock("@/lib/llm", () => ({ getProviderApiKey: async () => "test-key" }));
-vi.mock("@/lib/model-capabilities", () => ({ getModelOutputLimit: async () => 8192 }));
+vi.mock("@/lib/model-capabilities", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/model-capabilities")>();
+  return {
+    ...actual,
+    getModelOutputLimit: async () => 8192,
+    getModelReasoning: async () => null,
+  };
+});
 
 import {
   createChatModel,
@@ -38,7 +47,9 @@ describe("createChatModel reasoning_effort", () => {
   it("maps GLM efforts onto the low/high/max enum the provider accepts", async () => {
     expect((await effortKwargs("glm-5.3", "low")).reasoning_effort).toBe("low");
     expect((await effortKwargs("glm-5.3", "medium")).reasoning_effort).toBe("high");
-    expect((await effortKwargs("glm-5.3", "high")).reasoning_effort).toBe("max");
+    expect((await effortKwargs("glm-5.3", "high")).reasoning_effort).toBe("high");
+    expect((await effortKwargs("glm-5.3", "xhigh")).reasoning_effort).toBe("max");
+    expect((await effortKwargs("glm-5.3", "max")).reasoning_effort).toBe("max");
     expect((await effortKwargs("glm-5.3")).reasoning_effort).toBe("low");
   });
 

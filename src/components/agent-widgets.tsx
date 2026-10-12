@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -83,7 +83,7 @@ export function ContextWidget({
           ? "bg-amber-500"
           : "bg-emerald-500";
   return (
-    <div className="pointer-events-auto overflow-hidden rounded-xl border bg-card shadow-lg">
+    <div className="pointer-events-auto overflow-hidden rounded-xl border bg-card/85 shadow-lg backdrop-blur-md">
       <button
         onClick={() => setOpen((p) => !p)}
         className="flex w-full items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors hover:bg-accent/50"
@@ -150,20 +150,52 @@ export function ContextWidget({
 }
 
 /**
- * Floating widget overlay for the agent view — cards pinned to the top-right
- * of the session area. While visible, the chat column reserves matching
- * right-hand space (see ChatView), so widgets never cover chat text. Toggling
- * `visible` slides the stack out of/into the right edge. New widgets slot in
- * as additional children of the stack (each card re-enables pointer events
- * itself).
+ * Floating widget overlay for the session view — cards pinned to the
+ * top-right. The chat column reserves space for the stack whenever that
+ * still leaves the chat at its minimum width (see ChatView); otherwise the
+ * stack floats over the chat text on a frosted background with a strong
+ * shadow behind it. Toggling `visible` slides the stack out of/into the
+ * right edge. When the expanded cards don't fit the available height, the
+ * stack auto-closes (slides out, `onFitChange(false)`) and comes back once
+ * it fits again. New widgets slot in as additional children of the stack
+ * (each card re-enables pointer events itself).
  */
-export function WidgetStack({ visible, children }: { visible: boolean; children: React.ReactNode }) {
+export function WidgetStack({
+  visible,
+  onFitChange,
+  children,
+}: {
+  visible: boolean;
+  /** Reports the vertical-fit state so the chat column can reserve space accordingly. */
+  onFitChange?: (fits: boolean) => void;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [fits, setFits] = useState(true);
+  useEffect(() => {
+    const el = ref.current;
+    const parent = el?.parentElement;
+    if (!el || !parent) return;
+    const measure = () => {
+      // top-3 (12px) plus breathing room at the bottom (12px).
+      const next = el.scrollHeight <= parent.clientHeight - 24;
+      setFits(next);
+      onFitChange?.(next);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    ro.observe(parent);
+    return () => ro.disconnect();
+  }, []);
+  const shown = visible && fits;
   return (
     <div
-      aria-hidden={!visible}
+      ref={ref}
+      aria-hidden={!shown}
       className={cn(
-        "pointer-events-none absolute top-3 right-3 z-30 flex w-72 flex-col gap-2 transition-[transform,opacity] duration-300 ease-out",
-        visible
+        "pointer-events-none absolute top-3 right-3 z-30 flex w-72 flex-col gap-2 drop-shadow-2xl transition-[transform,opacity] duration-300 ease-out",
+        shown
           ? "translate-x-0 opacity-100"
           : "pointer-events-none translate-x-[calc(100%+0.75rem)] opacity-0",
       )}
@@ -182,7 +214,7 @@ export function TasksWidget({ todos }: { todos: TodoItem[] }) {
   if (todos.length === 0) return null;
   const done = todos.filter((t) => t.status === "completed").length;
   return (
-    <div className="pointer-events-auto overflow-hidden rounded-xl border bg-card shadow-lg">
+    <div className="pointer-events-auto overflow-hidden rounded-xl border bg-card/85 shadow-lg backdrop-blur-md">
       <button
         onClick={() => setOpen((p) => !p)}
         className="flex w-full items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors hover:bg-accent/50"
@@ -243,7 +275,7 @@ export function FilesWidget({
   const [open, setOpen] = useState(true);
   if (files.length === 0) return null;
   return (
-    <div className="pointer-events-auto overflow-hidden rounded-xl border bg-card shadow-lg">
+    <div className="pointer-events-auto overflow-hidden rounded-xl border bg-card/85 shadow-lg backdrop-blur-md">
       <button
         onClick={() => setOpen((p) => !p)}
         className="flex w-full items-center gap-1.5 px-3 py-2 text-xs font-medium transition-colors hover:bg-accent/50"

@@ -17,10 +17,8 @@ import {
   MoreHorizontal,
   Pencil,
   Plus,
-  Plug,
   Settings,
   ShieldCheck,
-  Sparkles,
   Trash2,
   User,
   UserRound,
@@ -81,8 +79,6 @@ const SETTINGS_TABS: Array<[SettingsTab, string, React.ReactNode]> = [
   ["general", "General", <User className="size-4" />],
   ["memory", "Memory", <Brain className="size-4" />],
   ["models", "Models & Providers", <Cpu className="size-4" />],
-  ["skills", "Skills", <Sparkles className="size-4" />],
-  ["connectors", "Connectors", <Plug className="size-4" />],
   ["updates", "Updates", <ArrowDownToLine className="size-4" />],
 ]
 
@@ -139,7 +135,9 @@ function ModeSwitcher({
   return (
     <div className="mx-2 mt-1 flex items-center gap-1 rounded-lg bg-muted/70 p-1">
       {tabButton("chat", "Chat", <MessageCircle className="size-3.5" />)}
+      {/*{tabButton("chat", "Chat")}*/}
       {tabButton("agent", "Agents", <Bot className="size-3.5" />)}
+      {/*{tabButton("agent", "Agents")}*/}
     </div>
   )
 }
@@ -189,7 +187,7 @@ export function AppSidebar({
 }: React.ComponentProps<typeof Sidebar> & {
   sessions: ChatSession[]
   activeSessionId: string | null
-  view?: "chat" | "settings" | "account" | "projects" | "history"
+  view?: "chat" | "settings" | "account" | "projects" | "history" | "connectors"
   settingsTab?: SettingsTab
   accountTab?: AccountTab
   activeTab?: "chat" | "agent"

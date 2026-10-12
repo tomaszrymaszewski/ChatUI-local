@@ -5,6 +5,9 @@ import {
   updateAgentDefinition,
   deleteAgentDefinition,
   subscribeToAgents,
+  AGENT_FACE_COLORS,
+  ensureAgentColor,
+  agentColor,
   type AgentUpdatePatch,
 } from "@/lib/agents";
 
@@ -190,5 +193,39 @@ describe("agent definitions storage", () => {
     storage.set("chatui:agents", JSON.stringify([off]));
     expect(loadAgentDefinitions()[0].externalChats).toBeUndefined();
     expect(storage.get("chatui:agents")).toBe(JSON.stringify([off]));
+  });
+});
+
+describe("agent face colors", () => {
+  it("assigns every new agent a distinct color from the palette", () => {
+    const colors = new Set<string>();
+    for (let i = 0; i < AGENT_FACE_COLORS.length; i++) {
+      const saved = saveAgentDefinition({ ...sampleDef, name: `Agent ${i}` });
+      expect(saved.color).toBeTruthy();
+      colors.add(saved.color!);
+    }
+    expect(colors.size).toBe(AGENT_FACE_COLORS.length);
+    // Persisted with the definitions (so cloud sync carries them).
+    const all = loadAgentDefinitions();
+    expect(all.every((a) => AGENT_FACE_COLORS.includes(a.color!))).toBe(true);
+  });
+
+  it("keeps a caller-supplied color", () => {
+    const saved = saveAgentDefinition({ ...sampleDef, color: "#123456" });
+    expect(saved.color).toBe("#123456");
+    expect(agentColor(saved.id)).toBe("#123456");
+  });
+
+  it("ensureAgentColor backfills legacy agents once and stays stable", () => {
+    const saved = saveAgentDefinition({ ...sampleDef });
+    // Simulate a pre-color record.
+    updateAgentDefinition(saved.id, { color: undefined });
+    expect(agentColor(saved.id)).toBeUndefined();
+
+    const first = ensureAgentColor(saved.id);
+    expect(AGENT_FACE_COLORS).toContain(first);
+    expect(agentColor(saved.id)).toBe(first);
+    // Idempotent: a second call returns the stored color.
+    expect(ensureAgentColor(saved.id)).toBe(first);
   });
 });

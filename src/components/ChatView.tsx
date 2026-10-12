@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+  import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -16,7 +16,6 @@ import {
   MoreHorizontal,
   Pencil,
   Plus,
-  Puzzle,
   ScrollText,
   Search,
   FolderPlus,
@@ -27,7 +26,6 @@ import {
   RotateCcw,
   ChevronLeft,
   SquareTerminal,
-  Globe,
   GraduationCap,
   Workflow,
   Loader2,
@@ -40,6 +38,7 @@ import {
   File as FileIcon,
   FileSpreadsheet,
   ArrowDownToLine,
+  TriangleAlert,
   type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -92,6 +91,8 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
@@ -136,6 +137,7 @@ import {
 } from "@/components/ui/sidebar";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
+import { Switch } from "@/components/ui/switch";
 import type {
   Message as ChatMessage,
   MessageAttachment,
@@ -146,7 +148,7 @@ import type {
 } from "@/types";
 import { useAuth } from "@/hooks/use-auth";
 import { getAccountProfile } from "@/lib/account-profile";
-import { useSessions, getSessionChatMode, agentSessionIds, deleteStoredSessions } from "@/hooks/use-sessions";
+import { useSessions, getSessionChatMode, getSessionTemporary, agentSessionIds, deleteStoredSessions } from "@/hooks/use-sessions";
 import { useMessages, loadMessages } from "@/hooks/use-messages";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
@@ -163,6 +165,11 @@ import { useAgentController, getAgentController, useRunningSessionIds, disposeAg
 import { useScheduler } from "@/hooks/use-scheduler";
 import type { ActivityItem, AgentMode, AgentRunResult, SharedFile, TodoItem } from "@/lib/agent/types";
 import { WidgetStack, TasksWidget, FilesWidget, ContextWidget } from "@/components/agent-widgets";
+import { ConversationSearch } from "@/components/conversation-search";
+// Suggestion cards temporarily hidden.
+// import { PromptSuggestionChips, pickPromptSuggestions, type PromptSuggestion } from "@/components/prompt-suggestions";
+import { ConnectorsChip } from "@/components/connectors-chip";
+import { ConnectorsPage } from "@/components/connectors-panel";
 import { resolveWidgetsHidden, widgetsStorageKey } from "@/lib/widget-visibility";
 import type { AgentSandbox } from "@/lib/agent/sandbox";
 import { ensureAgentWorkspace, removeAgentWorkspace } from "@/lib/agent/sandbox";
@@ -195,7 +202,7 @@ import { prepareAttachmentContext, rebuildAttachmentContent, buildProjectFilesCo
 import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
 import { ensureDeliverablesDir } from "@/lib/deliverables";
-import { getModelCapabilities, getModelDisplayNameSync } from "@/lib/model-capabilities";
+import { getModelCapabilities, getModelCapabilitiesSync, getModelDisplayNameSync, getModelReasoningSync, getModelsDevCatalog, isReasoningEffortSupported, reasoningEffortRank, sanitizeReasoningEffort } from "@/lib/model-capabilities";
 import { buildMemoryContext, extractAndSaveMemory, loadMemory } from "@/lib/memory";
 
 function generateId() {
@@ -214,6 +221,39 @@ function formatBytes(bytes: number) {
   );
   const value = bytes / 1024 ** i;
   return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+/** models.dev input modality an attachment maps to (text is the universal one). */
+function fileModality(file: { type: string }): string {
+  const t = (file.type || "").toLowerCase();
+  if (t.startsWith("image/")) return "image";
+  if (t.startsWith("audio/")) return "audio";
+  if (t.startsWith("video/")) return "video";
+  if (t === "application/pdf") return "pdf";
+  return "text";
+}
+
+const MODALITY_LABELS: Record<string, string> = {
+  image: "images",
+  pdf: "PDFs",
+  audio: "audio",
+  video: "video",
+  text: "text",
+};
+
+/** Display label for a models.dev reasoning effort value. */
+function reasoningLabel(effort: string): string {
+  const known: Record<string, string> = {
+    default: "Default",
+    none: "None",
+    minimal: "Minimal",
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+    xhigh: "Extra high",
+    max: "Max",
+  };
+  return known[effort] ?? effort.charAt(0).toUpperCase() + effort.slice(1);
 }
 
 /**
@@ -236,11 +276,10 @@ function streamSaveSignature(ctrl: AgentControllerApi): string {
 type PendingFile = MessageAttachment & { file?: File };
 
 /**
- * Single chat mode — at most one active at a time. "temporary" is derived
- * from it (isTemporary below), so all existing temporary-message logic keeps
- * working untouched.
+ * Single chat mode — at most one active at a time. Temporary is NOT a mode:
+ * it's a whole-chat flag (temporary below) that can coexist with any mode.
  */
-type ChatMode = "none" | "temporary" | "learn" | "research" | "council" | "task";
+type ChatMode = "none" | "learn" | "research" | "council" | "task";
 
 const WELCOME_PROMPTS = [
   "What do you want to know?",
@@ -274,10 +313,10 @@ const CHAT_MIN_WIDTH_PX = 600;
 const ARTIFACT_ROW_OVERHEAD_PX = 22;
 /** The session container's p-2 padding (2 × 8px). */
 const CONTAINER_PADDING_PX = 16;
-/** The sidebar's expanded width (SIDEBAR_WIDTH = 16rem in ui/sidebar.tsx). */
-const SIDEBAR_EXPANDED_PX = 256;
-/** Right-hand space the widget stack reserves (18rem widget + 2 × 0.75rem). */
+/** Right-hand space the widget stack needs when it reserves room (18rem widget + 2 × 0.75rem). */
 const WIDGETS_RESERVED_PX = 312;
+/** Composer rows before it stops growing and scrolls instead. */
+const MAX_COMPOSER_LINES = 12;
 
 // Which chat/agent session was open, per tab — local-only UI state (never
 // synced) so a real reload (e.g. macOS reclaiming the webview) reopens where
@@ -341,7 +380,7 @@ export function ChatView() {
       setActiveSessionByTab((prev) => ({ ...prev, [activeTab]: id })),
     [activeTab],
   );
-  const { messages, addMessage, updateMessage, deleteMessage, deleteTemporaryMessages } = useMessages(activeSessionId);
+  const { messages, addMessage, updateMessage, deleteMessage, deleteTemporaryMessages, markMessagesPermanent } = useMessages(activeSessionId);
   const agent = useAgentController(activeSessionId);
   const runningIds = useRunningSessionIds();
   // Fires due agent schedules (scheduler/workflows) while the app is open.
@@ -351,6 +390,42 @@ export function ChatView() {
   const inProgressMsgIds = useRef<Map<string, string>>(new Map());
   const [inputText, setInputText] = useState("");
   const sessionTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const emptyTextareaRef = useRef<HTMLTextAreaElement>(null);
+  // The composers grow with their content up to MAX_COMPOSER_LINES lines,
+  // then scroll. `field-sizing` is unreliable in the Tauri webview, so the
+  // height is derived from scrollHeight on every change; the line height is
+  // read from computed style so it holds at both the text-base (mobile) and
+  // text-sm breakpoints.
+  const resizeComposerEl = useCallback((el: HTMLTextAreaElement | null) => {
+    if (!el) return;
+    const style = getComputedStyle(el);
+    const lineHeight = parseFloat(style.lineHeight) || 20;
+    const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+    const maxHeight = lineHeight * MAX_COMPOSER_LINES + padding;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+    el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
+  }, []);
+  const resizeComposer = useCallback(() => {
+    resizeComposerEl(sessionTextareaRef.current);
+    resizeComposerEl(emptyTextareaRef.current);
+  }, [resizeComposerEl]);
+  useEffect(() => {
+    resizeComposer();
+  }, [inputText, resizeComposer]);
+  useEffect(() => {
+    window.addEventListener("resize", resizeComposer);
+    return () => window.removeEventListener("resize", resizeComposer);
+  }, [resizeComposer]);
+  // Warm the models.dev catalog once so the Thinking menu and the model
+  // capability disclaimers can read real options synchronously; the tick
+  // re-renders them once the (possibly cached) catalog resolves.
+  const [, setCatalogTick] = useState(0);
+  useEffect(() => {
+    void getModelsDevCatalog()
+      .then(() => setCatalogTick((t) => t + 1))
+      .catch(() => {});
+  }, []);
   // Follow-up ghost text in the session composer: which suggestion was
   // taken or dismissed (keyed by session + last assistant message so a
   // fresh exchange brings a fresh ghost).
@@ -427,14 +502,19 @@ export function ChatView() {
   // Full-screen drag & drop overlay shown while files hover over the window.
   const [fileDropOverlay, setFileDropOverlay] = useState(false);
   const fileDropCounter = useRef(0);
-  const [webFetchEnabled, setWebFetchEnabled] = useState(true);
+  // Web fetch toggle — its UI (the + menu's Skills submenu) is removed for
+  // now; the flag still drives runs. Re-add a control to let users change it.
+  const [webFetchEnabled] = useState(true);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [welcomePrompt, setWelcomePrompt] = useState(
     () => WELCOME_PROMPTS[Math.floor(Math.random() * WELCOME_PROMPTS.length)],
   );
   const [chatMode, setChatMode] = useState<ChatMode>("none");
-  const isTemporary = chatMode === "temporary";
+  // Whole-chat temporary flag — orthogonal to the mode (a chat can be both
+  // temporary and research). Locked once the conversation has messages.
+  const [temporary, setTemporary] = useState(false);
+  const isTemporary = temporary;
   const [learnLevel] = useState<LearnLevel>(() => loadLearnPreferences().level);
   const [learnSubject] = useState<LearnSubject>(() => loadLearnPreferences().subject);
   const [pendingProjectId, setPendingProjectId] = useState<string | null>(null);
@@ -458,7 +538,7 @@ export function ChatView() {
   // The Agents tab's default view: the fleet dashboard (agent grid + smart
   // composer). "New Task"/"New Agent" swap it for the plain composer.
   const [agentDashboardOpen, setAgentDashboardOpen] = useState(true);
-  const [view, setView] = useState<"chat" | "settings" | "account" | "projects" | "history">("chat");
+  const [view, setView] = useState<"chat" | "settings" | "account" | "projects" | "history" | "connectors">("chat");
   const [settingsTab, setSettingsTab] = useState<SettingsTab>("general");
   const [accountTab, setAccountTab] = useState<AccountTab>("profile");
   const { user: accountUser, signOut: signAccountOut } = useAuth();
@@ -490,10 +570,19 @@ export function ChatView() {
   const [historyRenameDraft, setHistoryRenameDraft] = useState("");
   // Session id for the "this conversation moved to the Agents tab" notice.
   const [movedNoticeId, setMovedNoticeId] = useState<string | null>(null);
+  // Interrupted navigation away from a temporary chat: the leave warning is
+  // showing and this holds where the user was headed.
+  const [pendingLeave, setPendingLeave] = useState<{ sessionId: string; proceed: () => void } | null>(null);
   // After an agent-builder run creates an agent, offer to delete the setup chat.
   const [deleteSetupDialog, setDeleteSetupDialog] = useState<{ sessionId: string; agentName: string } | null>(null);
   const [projectInputText, setProjectInputText] = useState("");
   const [selectedModel, setSelectedModel] = useState<string>("");
+  // Starter-prompt chips for the empty chat screen: three of the pool at a
+  // time, reshuffled every time the welcome screen comes back.
+  // Suggestion cards temporarily hidden.
+  // const [promptPicks, setPromptPicks] = useState<PromptSuggestion[]>(() =>
+  //   pickPromptSuggestions(3),
+  // );
   // Reasoning effort for the current session ("default" sends nothing).
   // Seeded from the active session when switching chats; changes persist to
   // the session so they survive reloads.
@@ -504,7 +593,10 @@ export function ChatView() {
     Map<string | null, string>
   >(new Map());
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
-  const [editText, setEditText] = useState("");
+  // Composer draft stashed when an edit starts and restored on save/cancel,
+  // so editing a message never eats an in-progress draft.
+  const editDraftRef = useRef<{ text: string; files: PendingFile[] } | null>(null);
+  const editSessionRef = useRef<string | null>(null);
   const [showRawOutput, setShowRawOutput] = useState<Set<string>>(new Set());
   const projectFileInputRef = useRef<HTMLInputElement>(null);
   const projectImageInputRef = useRef<HTMLInputElement>(null);
@@ -534,33 +626,44 @@ export function ChatView() {
       localStorage.setItem(widgetsStorageKey(activeTab), next[activeTab] ? "1" : "0");
       return next;
     });
-  // Sidebar open state is controlled so opening the widgets can auto-collapse
-  // it when the widgets, sidebar, and chat text cannot fit width-wise.
+  // Sidebar open state (user-controlled; the widget stack floats over the
+  // chat and never squeezes the layout, so it no longer auto-collapses it).
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const [windowWidth, setWindowWidth] = useState(() => window.innerWidth);
-  useEffect(() => {
-    const onResize = () => setWindowWidth(window.innerWidth);
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-  // How the sidebar last came to be collapsed while widgets show: "auto"
-  // (by the fit check — reverted when space returns or widgets close) or
-  // "user" (manual toggle — always wins, never auto-reverted).
-  const sidebarAutoRef = useRef<"auto" | "user" | null>(null);
   // Session id currently being compacted (context widget's Compact button).
   const [compactingSessionId, setCompactingSessionId] = useState<string | null>(null);
   // Bumped whenever the active session's compaction record changes, so the
   // divider re-reads it from storage (records live in localStorage, not state).
   const [compactionTick, setCompactionTick] = useState(0);
+  // Find-in-conversation bar (⌘F), browser-style.
+  const [findOpen, setFindOpen] = useState(false);
   const sessionContainerRef = useRef<HTMLDivElement>(null);
   const autoOpenedArtifacts = useRef<Set<string>>(new Set());
   const autoModeRef = useRef<ChatMode>("none");
 
   useEffect(() => {
     if (settings.temporaryByDefault) {
-      setChatMode((prev) => (prev === "none" ? "temporary" : prev));
+      setTemporary(true);
     }
   }, [settings.temporaryByDefault]);
+
+  // ⌘F opens the find-in-conversation bar over the open chat. Browser find
+  // stays native everywhere else (settings, welcome screen, …).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+        if (!activeSessionId || view !== "chat") return;
+        e.preventDefault();
+        setFindOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [activeSessionId, view]);
+
+  // Leaving the conversation closes the find bar.
+  useEffect(() => {
+    setFindOpen(false);
+  }, [activeSessionId, view]);
 
   // Knowledge index: first sweep shortly after launch (debounced triggers in
   // use-deep-agent re-index after each run). Bundled skills install at launch
@@ -785,8 +888,8 @@ export function ChatView() {
       ? `Message ${currentAgentDef.name}…`
       : "Describe the task and the agent will start working..."
     : isTemporary
-      ? "This message and response will be forgotten when you close the chat"
-      : "Ask anything";
+      ? "This whole chat will be forgotten when you leave it"
+      : "Ask anything...";
   const emptyComposerPlaceholder = isAgentTab
     ? pendingSetup
       ? "Describe what this agent should do…"
@@ -794,8 +897,8 @@ export function ChatView() {
         ? `Message ${pendingAgentName}…`
         : "Describe the task and the agent will start working..."
     : isTemporary
-      ? "This message and response will be forgotten when you close the chat"
-      : "Ask anything";
+      ? "This whole chat will be forgotten when you leave it"
+      : "Ask anything...";
   const emptyStateHeading = !isAgentTab
     ? welcomePrompt
     : pendingSetup
@@ -865,6 +968,8 @@ export function ChatView() {
     followUpGhostKey &&
     dismissedGhostKey !== followUpGhostKey &&
     inputText === "" &&
+    files.length === 0 &&
+    !editingMessageId &&
     !agent?.isRunning
       ? (llmGhost ?? followUpGhost)
       : null;
@@ -908,36 +1013,39 @@ export function ChatView() {
     return mergeSessionFiles(sources);
   })();
 
-  // Widgets shown = stack slid in; the chat column reserves matching
-  // right-hand space (widget 18rem + 0.75rem offset + 0.75rem gap) so no
-  // chat text is ever covered. Every open session gets the stack — regular
-  // tasks included; cards that have nothing to show render nothing.
+  // Widgets shown = stack slid in. The stack itself auto-closes when the
+  // cards don't fit the available height (reported via onFitChange), and the
+  // chat column reserves right-hand space for it whenever that still leaves
+  // the chat at its minimum width — the widgets only float over the text
+  // when the two genuinely cannot fit side by side.
   const sessionViewActive = !!activeSession && (!isAgentTab || agentConsoleFocus === "session");
   const widgetsVisible = sessionViewActive && !artifactPanel && !widgetsHidden;
-
-  // Auto-collapse the sidebar while the widgets are open and the three
-  // columns (sidebar 16rem + widgets 19.5rem + chat minimum) cannot fit
-  // width-wise. A manually collapsed/expanded sidebar always wins: only a
-  // fit-driven collapse is reverted when space returns or widgets close.
+  const [widgetsFit, setWidgetsFit] = useState(true);
+  const [sessionWidth, setSessionWidth] = useState(0);
   useEffect(() => {
-    if (!widgetsVisible) {
-      // Widgets closed: revert a fit-driven collapse; a user collapse stays.
-      // Either way the ref resets so the next widgets-open re-checks the fit.
-      if (sidebarAutoRef.current === "auto") setSidebarOpen(true);
-      sidebarAutoRef.current = null;
-      return;
-    }
-    const fits = windowWidth >= SIDEBAR_EXPANDED_PX + WIDGETS_RESERVED_PX + CHAT_MIN_WIDTH_PX;
-    if (!fits && sidebarOpen && sidebarAutoRef.current === null) {
-      sidebarAutoRef.current = "auto";
-      setSidebarOpen(false);
-    } else if (fits && !sidebarOpen && sidebarAutoRef.current === "auto") {
-      sidebarAutoRef.current = null;
-      setSidebarOpen(true);
-    }
-  }, [widgetsVisible, windowWidth, sidebarOpen]);
+    const el = sessionContainerRef.current;
+    if (!el) return;
+    const update = () => setSessionWidth(el.clientWidth);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [sessionViewActive]);
+  const reserveWidgetsSpace =
+    widgetsVisible &&
+    widgetsFit &&
+    sessionWidth > 0 &&
+    sessionWidth - CONTAINER_PADDING_PX - WIDGETS_RESERVED_PX >= CHAT_MIN_WIDTH_PX;
 
   useEffect(() => {
+    // Leaving a session mid-edit cancels it and brings back the stashed draft.
+    if (editSessionRef.current) {
+      const draft = editDraftRef.current;
+      editDraftRef.current = null;
+      editSessionRef.current = null;
+      setInputText(draft?.text ?? "");
+      setFiles(draft?.files ?? []);
+    }
     setSelectedChildMap(new Map());
     setEditingMessageId(null);
     setShowRawOutput(new Set());
@@ -945,6 +1053,25 @@ export function ChatView() {
     setArtifactWindowMode("open");
     autoOpenedArtifacts.current = new Set();
   }, [activeSessionId]);
+
+  // Escape leaves edit mode from anywhere (the textarea handler only fires
+  // while the composer has focus; popups that consume Escape win).
+  useEffect(() => {
+    if (!editingMessageId) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      e.preventDefault();
+      handleCancelEdit();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [editingMessageId]);
+
+  // Fresh starter-prompt chips whenever the empty chat screen appears.
+  // Suggestion cards temporarily hidden.
+  // useEffect(() => {
+  //   if (!activeSessionId) setPromptPicks(pickPromptSuggestions(3));
+  // }, [activeSessionId]);
 
   // Auto-open the artifact panel the moment a new artifact is emitted during a
   // run (create_artifact mid-run, or research/discuss synthesis at the end).
@@ -1242,7 +1369,9 @@ export function ChatView() {
       if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
       return prev.filter((file) => file.id !== id);
     });
-    void deleteFileBlob(id);
+    // While editing, the blob still belongs to the message on the branch
+    // (and to the original branch sibling) — keep it.
+    if (!editingMessageId) void deleteFileBlob(id);
   };
 
   const findProviderForModel = (modelName: string) => {
@@ -1372,7 +1501,7 @@ export function ChatView() {
         isTemporary,
       );
 
-      updateSession(sessionId, { chat_mode: chatMode });
+      updateSession(sessionId, { chat_mode: chatMode, is_temporary: isTemporary });
 
       const modelLabelStr = selectedModelLabel
         ? modelLabel(selectedModelLabel)
@@ -1636,10 +1765,15 @@ export function ChatView() {
 
   // Sending while a structured-input form is pending switches back to free
   // text: the interrupted run is cancelled, the typed message waits for the
-  // next send click.
+  // next send click. While editing a message, the send action saves the edit.
   const handleModeSend = () => {
     if (agent?.pendingInput) {
       agent?.skipInput();
+      return;
+    }
+    if (editingMessageId) {
+      const msg = activePath.find((n) => n.message.id === editingMessageId)?.message;
+      if (msg) void handleSaveEdit(msg);
       return;
     }
     handleSend();
@@ -1658,21 +1792,64 @@ export function ChatView() {
     }
   };
 
-  const handleStartEdit = (msg: ChatMessage) => {
+  /**
+   * Editing happens in the regular composer: the message's text and
+   * attachments move into the composer, the rest of the conversation fades
+   * (see renderMessage), and the bubble mirrors the composer live. The
+   * draft that was in the composer is stashed and restored afterwards.
+   */
+  const handleStartEdit = async (msg: ChatMessage) => {
+    // The composer must be the regular textarea for an edit (not a pending
+    // approval/input card), and only one run may be in flight.
+    if (
+      agent?.isRunning ||
+      !!agent?.pendingInput ||
+      (agent?.pendingApprovals.length ?? 0) > 0 ||
+      !!agent?.pendingSuggestion
+    ) {
+      return;
+    }
+    editDraftRef.current = { text: inputText, files };
+    editSessionRef.current = msg.id;
     setEditingMessageId(msg.id);
-    setEditText(msg.content);
+    setInputText(msg.content);
+    requestAnimationFrame(() => sessionTextareaRef.current?.focus());
+    // Rehydrate stored attachments into real Files so the edit re-run can
+    // prepare them exactly like a fresh send (cached previews are reused).
+    const rehydrated: PendingFile[] = [];
+    for (const a of msg.attachments ?? []) {
+      const storageId = a.storageId ?? a.id;
+      let file: File | undefined;
+      try {
+        const blob = await getFileBlob(storageId);
+        if (blob) file = new File([blob], a.name, { type: a.type || blob.type });
+      } catch {
+        // Blob missing (evicted) — keep the chip, save will skip its bytes.
+      }
+      rehydrated.push({
+        ...a,
+        storageId,
+        previewUrl: a.previewUrl ?? attachmentPreviews.get(a.id),
+        file,
+      });
+    }
+    if (editSessionRef.current !== msg.id) return;
+    setFiles(rehydrated);
   };
 
   const handleCancelEdit = () => {
+    const draft = editDraftRef.current;
+    editDraftRef.current = null;
+    editSessionRef.current = null;
     setEditingMessageId(null);
-    setEditText("");
+    setInputText(draft?.text ?? "");
+    setFiles(draft?.files ?? []);
   };
 
   const handleSaveEdit = async (msg: ChatMessage) => {
-    const text = editText.trim();
+    const text = inputText.trim();
     if (!text || !activeSessionId) return;
-    setEditingMessageId(null);
-    setEditText("");
+    const editedFiles = files;
 
     const arc = isAgentTab
       ? await agentRunContext({
@@ -1690,6 +1867,43 @@ export function ChatView() {
       return;
     }
 
+    // Attachment context for the re-run, prepared like a fresh send.
+    const attachments = editedFiles.length > 0 ? editedFiles : undefined;
+    const modelLabelStr = selectedModelLabel
+      ? modelLabel(selectedModelLabel)
+      : runModelName;
+    const agentFilesDir = arc?.taskProfile
+      ? await ensureDeliverablesDir(activeSessionId)
+      : undefined;
+    const prep = await prepareAttachmentContext(
+      attachments ?? [],
+      text,
+      provider,
+      runModelName,
+      modelLabelStr,
+      { filePathsDir: agentFilesDir },
+    );
+    if (prep.blocked) {
+      toast.error(prep.warning ?? "This model doesn't support images.");
+      return;
+    }
+    const userAttachments = attachments?.map((a) => ({
+      id: a.id,
+      name: a.name,
+      size: a.size,
+      type: a.type,
+      storageId: a.storageId ?? a.id,
+    }));
+
+    // Commit: the composer contents become the edited message and the
+    // stashed draft returns; the conversation unfades.
+    const draft = editDraftRef.current;
+    editDraftRef.current = null;
+    editSessionRef.current = null;
+    setEditingMessageId(null);
+    setInputText(draft?.text ?? "");
+    setFiles(draft?.files ?? []);
+
     try {
       const parentId = msg.parent_id ?? null;
       const userMsg = await addMessage(
@@ -1697,12 +1911,12 @@ export function ChatView() {
         "user",
         text,
         undefined,
-        undefined,
+        userAttachments,
         parentId,
         isTemporary,
       );
 
-      updateSession(activeSessionId, { chat_mode: chatMode });
+      updateSession(activeSessionId, { chat_mode: chatMode, is_temporary: isTemporary });
 
       const completionMessages: AgentMessage[] = [];
       const pathToParent = activePath.slice(
@@ -1722,7 +1936,7 @@ export function ChatView() {
         completionMessages,
         loadSessionCompaction(activeSessionId),
       );
-      runHistory.push({ role: "user" as const, content: text });
+      runHistory.push({ role: "user" as const, content: prep.content });
 
       const ctrl = getAgentController(activeSessionId!);
       const assistantMsg = await addMessage(
@@ -1939,13 +2153,62 @@ export function ChatView() {
   // session inside handleSend can never race the restore.
   const applySessionChatMode = (sessionId: string | null) => {
     const stored = getSessionChatMode(sessionId);
-    setChatMode(
-      stored ?? (settings.temporaryByDefault && !sessionId ? "temporary" : "none"),
-    );
+    // "temporary" used to be stored as the chat mode; it's a whole-chat flag
+    // now, orthogonal to the mode.
+    setTemporary(stored === "temporary" || getSessionTemporary(sessionId));
+    setChatMode(stored && stored !== "temporary" ? stored : "none");
+    // New empty chat: honor "temporary chats by default".
+    if (!sessionId && settings.temporaryByDefault) setTemporary(true);
     autoModeRef.current = "none";
   };
 
+  // Whole-chat temporary flag (the + composer menu switch). Only settable
+  // while the chat has no messages — it locks once the conversation starts.
+  const toggleTemporary = (on: boolean) => {
+    setTemporary(on);
+    if (activeSessionId) {
+      void updateSession(activeSessionId, { is_temporary: on });
+    }
+  };
+
+  // ── Leaving a temporary chat ─────────────────────────────────────────────
+  // Temporary is a whole-chat property: the toggle locks once the
+  // conversation starts, and leaving the conversation forgets it unless it's
+  // explicitly saved as a normal chat. Every navigation away from the active
+  // session goes through this gate.
+
+  const withTemporaryLeaveWarning = (proceed: () => void) => {
+    if (activeSessionId && messages.some((m) => m.is_temporary)) {
+      setPendingLeave({ sessionId: activeSessionId, proceed });
+      return;
+    }
+    proceed();
+  };
+
+  const stayInTemporaryChat = () => setPendingLeave(null);
+
+  const saveChatAndLeave = () => {
+    if (!pendingLeave) return;
+    const { sessionId, proceed } = pendingLeave;
+    // Keep every message (clear the temporary flags) and store the chat as a
+    // normal one, then continue the interrupted navigation. The navigation's
+    // own deleteTemporaryMessages becomes a no-op.
+    markMessagesPermanent(sessionId);
+    updateSession(sessionId, { chat_mode: "none", is_temporary: false });
+    setPendingLeave(null);
+    proceed();
+  };
+
+  const discardChatAndLeave = () => {
+    if (!pendingLeave) return;
+    const { proceed } = pendingLeave;
+    setPendingLeave(null);
+    // The navigation itself deletes the temporary messages.
+    proceed();
+  };
+
   const handleNewChat = () => {
+    withTemporaryLeaveWarning(() => {
     if (activeSessionId) {
       deleteTemporaryMessages(activeSessionId);
     }
@@ -1957,6 +2220,7 @@ export function ChatView() {
     setWelcomePrompt(
       WELCOME_PROMPTS[Math.floor(Math.random() * WELCOME_PROMPTS.length)],
     );
+    });
   };
 
   const selectSession = (id: string) => {
@@ -1969,19 +2233,21 @@ export function ChatView() {
         return;
       }
     }
-    if (activeSessionId && activeSessionId !== id) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionId(id);
-    setActiveProjectId(null);
-    // A selected session defines its own agent context — drop any pending
-    // one (e.g. from an open agent console or "New session").
-    setPendingAgentId(null);
-    setPendingSetup(false);
-    setAgentConsoleComposing(false);
-    setAgentConsoleFocus("session");
-    applySessionChatMode(id);
-    setView("chat");
+    withTemporaryLeaveWarning(() => {
+      if (activeSessionId && activeSessionId !== id) {
+        deleteTemporaryMessages(activeSessionId);
+      }
+      setActiveSessionId(id);
+      setActiveProjectId(null);
+      // A selected session defines its own agent context — drop any pending
+      // one (e.g. from an open agent console or "New session").
+      setPendingAgentId(null);
+      setPendingSetup(false);
+      setAgentConsoleComposing(false);
+      setAgentConsoleFocus("session");
+      applySessionChatMode(id);
+      setView("chat");
+    });
   };
 
   const handleDeleteSession = async (id: string) => {
@@ -2046,36 +2312,40 @@ export function ChatView() {
 
   /** Open a moved session from the chat-tab redirect notice. */
   const openMovedSession = (id: string) => {
-    if (activeSessionId && activeSessionId !== id) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionByTab((prev) => ({
-      chat: prev.chat === id ? null : prev.chat,
-      agent: id,
-    }));
-    setPendingProjectId(null);
-    setPendingAgentId(null);
-    setPendingSetup(false);
-    setActiveTab("agent");
-    setAgentConsoleFocus("session");
-    setChatMode("none");
-    autoModeRef.current = "none";
-    setView("chat");
+    withTemporaryLeaveWarning(() => {
+      if (activeSessionId && activeSessionId !== id) {
+        deleteTemporaryMessages(activeSessionId);
+      }
+      setActiveSessionByTab((prev) => ({
+        chat: prev.chat === id ? null : prev.chat,
+        agent: id,
+      }));
+      setPendingProjectId(null);
+      setPendingAgentId(null);
+      setPendingSetup(false);
+      setActiveTab("agent");
+      setAgentConsoleFocus("session");
+      setChatMode("none");
+      autoModeRef.current = "none";
+      setView("chat");
+    });
   };
 
   const switchTab = (tab: "chat" | "agent") => {
     if (tab === activeTab) return;
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setPendingAgentId(null);
-    setPendingSetup(false);
-    setActiveTab(tab);
-    setAgentConsoleFocus("session");
-    setAgentDashboardOpen(tab === "agent");
-    // Each tab keeps its own active session; restore that session's mode.
-    applySessionChatMode(activeSessionByTab[tab] ?? null);
-    setView("chat");
+    withTemporaryLeaveWarning(() => {
+      if (activeSessionId) {
+        deleteTemporaryMessages(activeSessionId);
+      }
+      setPendingAgentId(null);
+      setPendingSetup(false);
+      setActiveTab(tab);
+      setAgentConsoleFocus("session");
+      setAgentDashboardOpen(tab === "agent");
+      // Each tab keeps its own active session; restore that session's mode.
+      applySessionChatMode(activeSessionByTab[tab] ?? null);
+      setView("chat");
+    });
   };
 
   /**
@@ -2100,15 +2370,17 @@ export function ChatView() {
     // lookup and the dashboard opens instead of the new-session page.
     const agentId = activeAgentConsole?.id ?? activeSession?.agentId;
     if (!agentId || !agents.some((a) => a.id === agentId)) return;
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionId(null);
-    setActiveAgentConsoleId(agentId);
-    setPendingAgentId(agentId);
-    setPendingSetup(false);
-    setAgentDashboardOpen(false);
-    setAgentConsoleComposing(true);
+    withTemporaryLeaveWarning(() => {
+      if (activeSessionId) {
+        deleteTemporaryMessages(activeSessionId);
+      }
+      setActiveSessionId(null);
+      setActiveAgentConsoleId(agentId);
+      setPendingAgentId(agentId);
+      setPendingSetup(false);
+      setAgentDashboardOpen(false);
+      setAgentConsoleComposing(true);
+    });
   };
 
   /**
@@ -2118,21 +2390,23 @@ export function ChatView() {
    * The composer sends with this agent, so the first send opens a session.
    */
   const handleOpenAgentConsole = (agentId: string) => {
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionId(null);
-    setActiveProjectId(null);
-    setPendingProjectId(null);
-    setPendingAgentId(agentId);
-    setPendingSetup(false);
-    setActiveAgentConsoleId(agentId);
-    setAgentDashboardOpen(false);
-    setAgentConsoleTab("general");
-    setAgentConsoleComposing(false);
-    setAgentConsoleFocus("panel");
-    applySessionChatMode(null);
-    setView("chat");
+    withTemporaryLeaveWarning(() => {
+      if (activeSessionId) {
+        deleteTemporaryMessages(activeSessionId);
+      }
+      setActiveSessionId(null);
+      setActiveProjectId(null);
+      setPendingProjectId(null);
+      setPendingAgentId(agentId);
+      setPendingSetup(false);
+      setActiveAgentConsoleId(agentId);
+      setAgentDashboardOpen(false);
+      setAgentConsoleTab("general");
+      setAgentConsoleComposing(false);
+      setAgentConsoleFocus("panel");
+      applySessionChatMode(null);
+      setView("chat");
+    });
   };
 
   /**
@@ -2141,34 +2415,38 @@ export function ChatView() {
    * session, since agent sessions only live inside their console.
    */
   const closeAgentConsole = () => {
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionId(null);
-    setActiveAgentConsoleId(null);
-    setPendingAgentId(null);
-    setPendingSetup(false);
-    setAgentConsoleComposing(false);
-    setAgentConsoleFocus("session");
-    setAgentDashboardOpen(true);
-    applySessionChatMode(null);
-    setView("chat");
+    withTemporaryLeaveWarning(() => {
+      if (activeSessionId) {
+        deleteTemporaryMessages(activeSessionId);
+      }
+      setActiveSessionId(null);
+      setActiveAgentConsoleId(null);
+      setPendingAgentId(null);
+      setPendingSetup(false);
+      setAgentConsoleComposing(false);
+      setAgentConsoleFocus("session");
+      setAgentDashboardOpen(true);
+      applySessionChatMode(null);
+      setView("chat");
+    });
   };
 
   /** Return to the fleet dashboard from wherever we are on the Agents tab. */
   const handleOpenDashboard = () => {
-    if (activeSessionId) {
-      deleteTemporaryMessages(activeSessionId);
-    }
-    setActiveSessionId(null);
-    setActiveProjectId(null);
-    setPendingProjectId(null);
-    setPendingAgentId(null);
-    setPendingSetup(false);
-    setActiveAgentConsoleId(null);
-    setAgentDashboardOpen(true);
-    applySessionChatMode(null);
-    setView("chat");
+    withTemporaryLeaveWarning(() => {
+      if (activeSessionId) {
+        deleteTemporaryMessages(activeSessionId);
+      }
+      setActiveSessionId(null);
+      setActiveProjectId(null);
+      setPendingProjectId(null);
+      setPendingAgentId(null);
+      setPendingSetup(false);
+      setActiveAgentConsoleId(null);
+      setAgentDashboardOpen(true);
+      applySessionChatMode(null);
+      setView("chat");
+    });
   };
 
   const handleDeleteAgent = (id: string) => {
@@ -2260,6 +2538,28 @@ export function ChatView() {
   }, []);
 
   const selectedModelLabel = allModels.find((m) => m.name === selectedModel);
+  const selectedModelProvider = selectedModelLabel
+    ? providers.find((p) => p.id === selectedModelLabel.providerId)
+    : undefined;
+  // models.dev thinking support for the selected model (cached catalog; the
+  // warm-up effect above re-renders once the catalog resolves).
+  const reasoningSupport =
+    selectedModelLabel && selectedModelProvider
+      ? getModelReasoningSync(selectedModelProvider, selectedModelLabel.name)
+      : null;
+
+  /** Attached files whose type the selected model can't read (models.dev). */
+  const unsupportedAttachments = useMemo(() => {
+    if (!selectedModelLabel || !selectedModelProvider || files.length === 0) return [];
+    const caps = getModelCapabilitiesSync(selectedModelProvider, selectedModelLabel.name);
+    // Heuristic-only detection would produce false warnings — stay quiet.
+    if (caps.source === "heuristic") return [];
+    return files
+      .map((f) => ({ name: f.name, modality: fileModality(f) }))
+      .filter(({ modality }) =>
+        modality === "image" ? !caps.vision : !caps.inputModalities.includes(modality),
+      );
+  }, [files, selectedModelLabel, selectedModelProvider]);
 
   const logoKeyFor = (m: (typeof allModels)[number]) =>
     getProviderMeta(m.builtinKey ?? "custom")?.logoKey ?? "custom";
@@ -2273,12 +2573,74 @@ export function ChatView() {
     );
   };
 
-  const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = [
-    { value: "default", label: "Default" },
-    { value: "low", label: "Low" },
-    { value: "medium", label: "Medium" },
-    { value: "high", label: "High" },
-  ];
+  // The model's real thinking options (models.dev reasoning_options): a
+  // Default (send nothing) plus the effort values it accepts, with "None"
+  // added for toggle-capable models when the scale doesn't include it.
+  const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = (() => {
+    if (!reasoningSupport) {
+      // Catalog miss (e.g. offline first launch): keep the legacy generic list.
+      return [
+        { value: "default", label: "Default" },
+        { value: "low", label: "Low" },
+        { value: "medium", label: "Medium" },
+        { value: "high", label: "High" },
+      ];
+    }
+    const opts: Array<{ value: ReasoningEffort; label: string }> = [
+      { value: "default", label: "Default" },
+    ];
+    const values = [...reasoningSupport.efforts];
+    if (reasoningSupport.toggle && !values.includes("none")) values.push("none");
+    values.sort((a, b) => reasoningEffortRank(a) - reasoningEffortRank(b));
+    for (const v of values) opts.push({ value: v, label: reasoningLabel(v) });
+    // A value carried over from another model stays visible (marked) so the
+    // user can see what the session holds — and fix it.
+    if (reasoningEffort !== "default" && !opts.some((o) => o.value === reasoningEffort)) {
+      opts.push({
+        value: reasoningEffort,
+        label: `${reasoningLabel(reasoningEffort)} (unsupported)`,
+      });
+    }
+    return opts;
+  })();
+
+  const thinkingDisclaimer =
+    reasoningSupport && !isReasoningEffortSupported(reasoningSupport, reasoningEffort) ? (
+      <div className="mb-2 flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+        <TriangleAlert className="mt-px size-3.5 shrink-0" />
+        <span>
+          Thinking "{reasoningLabel(reasoningEffort)}" isn't supported by{" "}
+          {selectedModelLabel ? modelNameFor(selectedModelLabel) : "this model"} — the run will
+          use{" "}
+          {(() => {
+            const fallback = sanitizeReasoningEffort(reasoningEffort, reasoningSupport);
+            return fallback ? `"${reasoningLabel(fallback)}"` : "the provider default";
+          })()}
+          .
+        </span>
+      </div>
+    ) : null;
+
+  const attachmentDisclaimer = unsupportedAttachments.length > 0 ? (
+    <div className="mb-2 flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+      <TriangleAlert className="mt-px size-3.5 shrink-0" />
+      <span>
+        {unsupportedAttachments.map((u) => `"${u.name}"`).join(", ")} —{" "}
+        {selectedModelLabel ? modelNameFor(selectedModelLabel) : "this model"} can't take{" "}
+        {[...new Set(unsupportedAttachments.map((u) => u.modality))]
+          .map((mod) => MODALITY_LABELS[mod] ?? mod)
+          .join(" or ")}{" "}
+        input. Remove {unsupportedAttachments.length === 1 ? "it" : "them"} or switch models.
+      </span>
+    </div>
+  ) : null;
+
+  const composerDisclaimers = (
+    <>
+      {attachmentDisclaimer}
+      {thinkingDisclaimer}
+    </>
+  );
 
   const modelSelect = () => (
     <DropdownMenu>
@@ -2299,13 +2661,13 @@ export function ChatView() {
               ? modelNameFor(selectedModelLabel)
               : "Select model"}
           </span>
-          {reasoningEffort === "high" && (
+          {["high", "xhigh", "max"].includes(reasoningEffort) && (
             <SignalHigh className="size-3.5 shrink-0 text-red-500" />
           )}
           {reasoningEffort === "medium" && (
             <SignalMedium className="size-3.5 shrink-0 text-yellow-500" />
           )}
-          {reasoningEffort === "low" && (
+          {["low", "minimal"].includes(reasoningEffort) && (
             <SignalLow className="size-3.5 shrink-0 text-green-500" />
           )}
         </button>
@@ -2335,22 +2697,30 @@ export function ChatView() {
             <span>Thinking</span>
           </DropdownMenuSubTrigger>
           <DropdownMenuSubContent>
-            {reasoningOptions.map((opt) => (
-              <DropdownMenuItem
-                key={opt.value}
-                onSelect={() => {
-                  setReasoningEffort(opt.value);
-                  if (activeSessionId) {
-                    void updateSession(activeSessionId, { reasoning_effort: opt.value });
-                  }
-                }}
-              >
-                <span>{opt.label}</span>
-                {reasoningEffort === opt.value && (
-                  <Check className="ml-auto size-3.5" />
-                )}
-              </DropdownMenuItem>
-            ))}
+            {reasoningSupport && !reasoningSupport.reasoning ? (
+              <DropdownMenuItem disabled>No thinking options for this model</DropdownMenuItem>
+            ) : reasoningSupport &&
+              reasoningSupport.efforts.length === 0 &&
+              !reasoningSupport.toggle ? (
+              <DropdownMenuItem disabled>Thinking is always on</DropdownMenuItem>
+            ) : (
+              reasoningOptions.map((opt) => (
+                <DropdownMenuItem
+                  key={opt.value}
+                  onSelect={() => {
+                    setReasoningEffort(opt.value);
+                    if (activeSessionId) {
+                      void updateSession(activeSessionId, { reasoning_effort: opt.value });
+                    }
+                  }}
+                >
+                  <span>{opt.label}</span>
+                  {reasoningEffort === opt.value && (
+                    <Check className="ml-auto size-3.5" />
+                  )}
+                </DropdownMenuItem>
+              ))
+            )}
           </DropdownMenuSubContent>
         </DropdownMenuSub>
       </DropdownMenuContent>
@@ -2363,6 +2733,7 @@ export function ChatView() {
     title: string,
     icon: React.ReactNode,
     activeClass: string,
+    disabled = false,
   ) => {
     const active = chatMode === mode;
     const artifactOpen = !!artifactPanel;
@@ -2372,6 +2743,7 @@ export function ChatView() {
         variant="ghost"
         aria-label={`Toggle ${label} mode`}
         title={title}
+        disabled={disabled}
         onClick={() => {
           // Manual toggle: wins over auto-detection and persists to the
           // session so the mode survives reloads (learn stays on until off).
@@ -2390,13 +2762,6 @@ export function ChatView() {
 
   const modeToggles = !isAgentTab && (
     <>
-      {modeToggle(
-        "temporary",
-        "Temporary",
-        "Temporary message - will be deleted when you close the chat",
-        <ClockFading className={chatMode === "temporary" ? "fill-blue-500/30" : ""} />,
-        "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
-      )}
       {modeToggle(
         "learn",
         "Learn",
@@ -2432,7 +2797,14 @@ export function ChatView() {
     const { siblings, currentIndex } = getSiblings(nodeMap, msg, roots);
     const hasBranches = siblings.length > 1;
     const isEditing = editingMessageId === msg.id;
+    const isDimmed = editingMessageId !== null && !isEditing;
     const isRaw = showRawOutput.has(msg.id);
+    // While editing, the bubble mirrors the composer: live text and the
+    // composer's attachment chips (which start as the message's own).
+    const shownAttachments: Array<
+      Pick<MessageAttachment, "id" | "name" | "size" | "previewUrl">
+    > = isEditing ? files : (msg.attachments ?? []);
+    const bubbleContent = isEditing ? inputText : msg.content;
     // Tappable answers for a clarifying question: only under the latest
     // assistant message, never in research mode (its flow stays as-is).
     const questionOptions =
@@ -2452,11 +2824,15 @@ export function ChatView() {
         key={msg.id}
         messageId={msg.id}
         scrollAnchor={msg.role === "user"}
+        className={cn(
+          "transition-opacity duration-300",
+          isDimmed && "pointer-events-none opacity-30",
+        )}
       >
         {msg.role === "user" ? (
           <Message align="end">
             <MessageContent>
-              {msg.attachments?.map((attachment) => (
+              {shownAttachments.map((attachment) => (
                 <Attachment key={attachment.id} size="sm">
                   <AttachmentMedia
                     variant={
@@ -2482,46 +2858,17 @@ export function ChatView() {
                   </AttachmentContent>
                 </Attachment>
               ))}
-              {isEditing ? (
-                <div className="flex w-full max-w-[80%] flex-col gap-2 self-end">
-                  <Textarea
-                    value={editText}
-                    onChange={(e) => setEditText(e.currentTarget.value)}
-                    className="min-h-20 resize-none text-sm"
-                    autoFocus
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter" && !e.shiftKey) {
-                        e.preventDefault();
-                        handleSaveEdit(msg);
-                      }
-                      if (e.key === "Escape") handleCancelEdit();
-                    }}
-                  />
-                  <div className="flex justify-end gap-2">
-                    <Button
-                      size="xs"
-                      variant="ghost"
-                      onClick={handleCancelEdit}
-                    >
-                      Cancel
-                    </Button>
-                    <Button
-                      size="xs"
-                      onClick={() => handleSaveEdit(msg)}
-                      disabled={!editText.trim()}
-                    >
-                      Send
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                msg.content && (
-                  <Bubble>
-                    <BubbleContent>
-                      <MarkdownRenderer content={msg.content} onOpenArtifact={handleOpenArtifactFromContent} />
-                    </BubbleContent>
-                  </Bubble>
-                )
+              {bubbleContent && (
+                <Bubble
+                  className={cn(
+                    isEditing &&
+                      "rounded-xl ring-2 ring-ring/50 ring-offset-2 ring-offset-background",
+                  )}
+                >
+                  <BubbleContent>
+                    <MarkdownRenderer content={bubbleContent} onOpenArtifact={handleOpenArtifactFromContent} />
+                  </BubbleContent>
+                </Bubble>
               )}
               {!isEditing && (
                 <MessageFooter className="gap-0.5 [&_button]:size-5 [&_button]:p-0 opacity-0 transition-opacity group-hover/message:opacity-100">
@@ -2552,6 +2899,12 @@ export function ChatView() {
                     variant="ghost"
                     size="icon-xs"
                     onClick={() => handleStartEdit(msg)}
+                    disabled={
+                      agent?.isRunning ||
+                      !!agent?.pendingInput ||
+                      (agent?.pendingApprovals.length ?? 0) > 0 ||
+                      !!agent?.pendingSuggestion
+                    }
                     aria-label="Edit message"
                     title="Edit"
                   >
@@ -2757,13 +3110,18 @@ export function ChatView() {
     <SidebarProvider
       open={sidebarOpen}
       onOpenChange={setSidebarOpen}
-      className="relative h-dvh min-h-0 overflow-hidden"
+      className="relative h-dvh min-h-0 overflow-hidden bg-sidebar"
       style={{ "--sidebar-width-icon": "3rem" } as React.CSSProperties}
     >
       <AppSidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
         view={view}
+        // The connectors page dims the sidebar so the page reads as focused.
+        className={cn(
+          "transition-[left,right,width,opacity] duration-200 ease-linear",
+          view === "connectors" && "opacity-40",
+        )}
         settingsTab={settingsTab}
         activeTab={activeTab}
         onSelectSession={selectSession}
@@ -2815,13 +3173,27 @@ export function ChatView() {
           if (artifactPanel && artifactWindowMode !== "minimized") {
             setArtifactWindowMode("minimized");
           }
-          // A manual sidebar toggle wins over the widgets fit check.
-          if (widgetsVisible) sidebarAutoRef.current = "user";
         }}
       />
 
-      <SidebarInset>
-        {view === "settings" ? (
+      <SidebarInset className="mt-2 mr-2 mb-2 overflow-hidden rounded-md shadow-sm border-1">
+        {view === "connectors" ? (
+          <div
+            key="connectors-view"
+            className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-right-3 duration-300"
+          >
+            <header
+              data-tauri-drag-region
+              onMouseDown={startDrag}
+              className="h-10 shrink-0 select-none"
+            />
+            <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-2 sm:px-8">
+              <div className="mx-auto w-[90%] pb-16">
+                <ConnectorsPage onBack={() => setView("chat")} />
+              </div>
+            </div>
+          </div>
+        ) : view === "settings" ? (
           <div
             key="settings-view"
             className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-right-3 duration-300"
@@ -3317,10 +3689,15 @@ export function ChatView() {
         <div className="flex min-h-0 flex-1 flex-col">
         {(activeSession && (!isAgentTab || agentConsoleFocus === "session")) ? (
           <div ref={sessionContainerRef} className="relative flex min-h-0 flex-1 gap-2 overflow-hidden p-2">
+            <ConversationSearch
+              open={findOpen}
+              onOpenChange={setFindOpen}
+              rootRef={sessionContainerRef}
+            />
             <div
               className={cn(
                 "relative flex min-h-0 min-w-0 flex-1 flex-col transition-[flex,margin] duration-300 ease-out",
-                widgetsVisible && "mr-[19.5rem]",
+                reserveWidgetsSpace && "mr-[19.5rem]",
                 artifactWindowMode === "expanded" && "hidden",
               )}
             >
@@ -3470,8 +3847,7 @@ export function ChatView() {
                      onDismiss={() => agent?.dismissSuggestion()}
                      onInstallSkill={installSkillByName}
                      onOpenConnectors={() => {
-                       setSettingsTab("connectors");
-                       setView("settings");
+                       setView("connectors");
                      }}
                       onEnableMode={(mode) => {
                         setChatMode(mode);
@@ -3481,11 +3857,47 @@ export function ChatView() {
                       onApplyAgentConfig={handleApplyAgentConfig}
                     />
                  ) : (
+                 <>
+                 {composerDisclaimers}
+                 {editingMessageId && (
+                   <div className="mb-2 flex items-center gap-2 rounded-xl border border-ring/50 bg-accent/60 px-3 py-2 text-xs shadow-sm animate-in fade-in duration-200">
+                     <Pencil className="size-3.5 shrink-0" />
+                     <span className="min-w-0 flex-1 truncate text-muted-foreground">
+                       Editing message
+                       {files.length > 0
+                         ? ` · ${files.length} attachment${files.length === 1 ? "" : "s"}`
+                         : ""}
+                       {" — attachments, active modes and model below apply to the new response."}
+                     </span>
+                     <Button size="xs" variant="ghost" onClick={handleCancelEdit}>
+                       Cancel
+                     </Button>
+                   </div>
+                 )}
                  <InputGroup
                    className={cn(
                      isTemporary && "border-dashed",
                      draggingFiles && "border-ring ring-[3px] ring-ring/50",
                    )}
+                   onPaste={(e) => {
+                     // Cmd+V / right-click paste of files (Finder copies,
+                     // screenshots) attaches them instead of dropping the
+                     // text/ignoring the paste. Plain text pastes pass
+                     // through to the textarea.
+                     const dt = e.clipboardData;
+                     if (!dt) return;
+                     const pasted = Array.from(dt.files);
+                     if (pasted.length === 0) {
+                       for (const item of Array.from(dt.items)) {
+                         if (item.kind !== "file") continue;
+                         const file = item.getAsFile();
+                         if (file) pasted.push(file);
+                       }
+                     }
+                     if (pasted.length === 0) return;
+                     e.preventDefault();
+                     addFiles(pasted);
+                   }}
                    {...composerDropHandlers}
                  >
                    {files.length > 0 && (
@@ -3522,10 +3934,21 @@ export function ChatView() {
                     </InputGroupAddon>
                   )}
                   <InputGroupTextarea
-                    ref={sessionTextareaRef}
+                    rows={1}
+                    ref={(el) => {
+                      sessionTextareaRef.current = el;
+                      // Re-measure on (re)mount so a multi-line draft keeps
+                      // its grown height when the composer returns to view.
+                      if (el) resizeComposer();
+                    }}
                     value={inputText}
                     onChange={(e) => setInputText(e.currentTarget.value)}
                     onKeyDown={(e) => {
+                      if (e.key === "Escape" && editingMessageId) {
+                        e.preventDefault();
+                        handleCancelEdit();
+                        return;
+                      }
                       // Ghost suggestion: Tab accepts it into the box (it
                       // comes back if the text is deleted), Escape dismisses
                       // it until the next reply.
@@ -3545,7 +3968,7 @@ export function ChatView() {
                       }
                     }}
                     placeholder={ghostSuggestion ? "" : chatComposerPlaceholder}
-                    className="max-h-40 min-h-12"
+                    className="min-h-12 basis-auto [field-sizing:fixed]!"
                   />
                   {ghostSuggestion && (
                     <div
@@ -3587,19 +4010,24 @@ export function ChatView() {
                             ))}
                           </DropdownMenuSubContent>
                         </DropdownMenuSub>
-                        <DropdownMenuSub>
-                          <DropdownMenuSubTrigger>
-                            <Puzzle />
-                            Skills
-                          </DropdownMenuSubTrigger>
-                          <DropdownMenuSubContent>
-                            <DropdownMenuItem onClick={() => setWebFetchEnabled((prev) => !prev)}>
-                              <Globe />
-                              Web Fetch
-                              {webFetchEnabled ? <Check className="ml-auto" /> : <span className="ml-auto size-4" />}
-                            </DropdownMenuItem>
-                          </DropdownMenuSubContent>
-                        </DropdownMenuSub>
+                        {!isAgentTab && (
+                          <div
+                            className="flex items-center justify-between gap-2 px-2 py-1.5 text-sm"
+                            data-disabled={messages.length > 0 ? "" : undefined}
+                          >
+                            <span className="flex items-center gap-2">
+                              <ClockFading className="size-4" />
+                              Temporary chat
+                            </span>
+                            <Switch
+                              size="sm"
+                              aria-label="Temporary chat"
+                              checked={isTemporary}
+                              disabled={messages.length > 0}
+                              onCheckedChange={toggleTemporary}
+                            />
+                          </div>
+                        )}
                         <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
                           <Paperclip />
                           Add files
@@ -3655,15 +4083,18 @@ export function ChatView() {
                         className="rounded-lg"
                         onClick={handleModeSend}
                         disabled={
-                          (!inputText.trim() && files.length === 0) || agent?.isRunning
+                          editingMessageId
+                            ? !inputText.trim()
+                            : (!inputText.trim() && files.length === 0) || agent?.isRunning
                         }
-                        aria-label="Send message"
+                        aria-label={editingMessageId ? "Save edit" : "Send message"}
                       >
                         <ArrowUp />
                       </InputGroupButton>
                     )}
                   </InputGroupAddon>
                 </InputGroup>
+                </>
                 )}
 
                 <p className="mt-2 text-center text-xs text-muted-foreground">
@@ -3672,11 +4103,12 @@ export function ChatView() {
               </div>
             </div>
             </div>
-            {/* Session floating widgets (top-right). Stays mounted while
-                hidden so it can slide out of the right edge; the chat column
-                reserves matching space while visible, so nothing is covered. */}
+            {/* Session floating widgets (top-right), floating over the chat
+                text with a strong shadow. Stays mounted while hidden so it
+                can slide out of the right edge; auto-closes when it can't
+                fit the available height (see WidgetStack). */}
             {!artifactPanel && (
-              <WidgetStack visible={!widgetsHidden}>
+              <WidgetStack visible={!widgetsHidden} onFitChange={setWidgetsFit}>
                 <ContextWidget
                   usage={agent?.usage ?? { inputTokens: 0, cachedTokens: 0, outputTokens: 0, contextTokens: 0, costDollars: 0 }}
                   contextLimit={agent?.contextLimit ?? null}
@@ -3764,7 +4196,7 @@ export function ChatView() {
                           handleProjectModeSend(text);
                         }
                       }}
-                      placeholder={isTemporary ? "This message and response will be forgotten when you close the chat" : "Ask anything about this project..."}
+                      placeholder={isTemporary ? "This whole chat will be forgotten when you leave it" : "Ask anything about this project..."}
                       className="max-h-40 min-h-12"
                     />
                     <InputGroupAddon align="block-end">
@@ -4085,8 +4517,7 @@ export function ChatView() {
                   onDismiss={() => agent?.dismissSuggestion()}
                   onInstallSkill={installSkillByName}
                   onOpenConnectors={() => {
-                    setSettingsTab("connectors");
-                    setView("settings");
+                    setView("connectors");
                   }}
                     onEnableMode={(mode) => {
                       setChatMode(mode);
@@ -4096,12 +4527,32 @@ export function ChatView() {
                     onApplyAgentConfig={handleApplyAgentConfig}
                   />
               ) : (
+              <>
+              {composerDisclaimers}
+              {!isAgentTab && (
+                <ConnectorsChip onClick={() => setView("connectors")} />
+              )}
               <InputGroup
                 className={cn(
                   "bg-card/60 backdrop-blur-sm",
                   isTemporary && "border-dashed",
                   draggingFiles && "border-ring ring-[3px] ring-ring/50",
                 )}
+                onPaste={(e) => {
+                  const dt = e.clipboardData;
+                  if (!dt) return;
+                  const pasted = Array.from(dt.files);
+                  if (pasted.length === 0) {
+                    for (const item of Array.from(dt.items)) {
+                      if (item.kind !== "file") continue;
+                      const file = item.getAsFile();
+                      if (file) pasted.push(file);
+                    }
+                  }
+                  if (pasted.length === 0) return;
+                  e.preventDefault();
+                  addFiles(pasted);
+                }}
                 {...composerDropHandlers}
               >
                 {files.length > 0 && (
@@ -4138,6 +4589,11 @@ export function ChatView() {
                   </InputGroupAddon>
                 )}
                 <InputGroupTextarea
+                  rows={1}
+                  ref={(el) => {
+                    emptyTextareaRef.current = el;
+                    if (el) resizeComposerEl(el);
+                  }}
                   value={inputText}
                   onChange={(e) => setInputText(e.currentTarget.value)}
                   onKeyDown={(e) => {
@@ -4147,7 +4603,7 @@ export function ChatView() {
                     }
                   }}
                   placeholder={emptyComposerPlaceholder}
-                  className="max-h-40 min-h-12 placeholder:text-muted-foreground/60"
+                  className="min-h-12 basis-auto [field-sizing:fixed]! placeholder:text-muted-foreground/60"
                 />
                 <InputGroupAddon align="block-end">
                   <DropdownMenu>
@@ -4176,19 +4632,21 @@ export function ChatView() {
                           ))}
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
-                      <DropdownMenuSub>
-                        <DropdownMenuSubTrigger>
-                          <Puzzle />
-                          Skills
-                        </DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent>
-                          <DropdownMenuItem onClick={() => setWebFetchEnabled((prev) => !prev)}>
-                            <Globe />
-                            Web Fetch
-                            {webFetchEnabled ? <Check className="ml-auto" /> : <span className="ml-auto size-4" />}
-                          </DropdownMenuItem>
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
+                      {!isAgentTab && (
+                        <div className="flex items-center justify-between gap-2 px-2 py-1.5 text-sm">
+                          <span className="flex items-center gap-2">
+                            <ClockFading className="size-4" />
+                            Temporary chat
+                          </span>
+                          <Switch
+                            size="sm"
+                            aria-label="Temporary chat"
+                            checked={isTemporary}
+                            disabled={messages.length > 0}
+                            onCheckedChange={toggleTemporary}
+                          />
+                        </div>
+                      )}
                       <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
                         <Paperclip />
                         Add files
@@ -4253,6 +4711,25 @@ export function ChatView() {
                   )}
                 </InputGroupAddon>
               </InputGroup>
+              {/* Suggestion cards temporarily hidden.
+              {!isAgentTab &&
+                settings.promptSuggestions &&
+                inputText === "" &&
+                files.length === 0 && (
+                  // Absolute so appearing/disappearing never shifts the
+                  // centered composer — the chips float below it.
+                  <div className="absolute inset-x-0 top-full">
+                    <PromptSuggestionChips
+                      suggestions={promptPicks}
+                      onPick={(prompt) => {
+                        setInputText(prompt);
+                        emptyTextareaRef.current?.focus();
+                      }}
+                    />
+                  </div>
+                )}
+              */}
+              </>
               )}
 
               <p className="mt-2 text-center text-xs text-foreground opacity-40 bg-background w-fit mx-auto">
@@ -4308,6 +4785,38 @@ export function ChatView() {
               </Button>
             </div>
           </div>
+        </DialogContent>
+      </Dialog>
+
+      {/* Temporary chats are forgotten on leave — offer to save or delete. */}
+      <Dialog
+        open={!!pendingLeave}
+        onOpenChange={(open) => {
+          if (!open) setPendingLeave(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2">
+              <ClockFading className="size-5" />
+              Leave temporary chat?
+            </DialogTitle>
+            <DialogDescription>
+              This conversation will be forgotten when you leave. Save it as a
+              normal chat to keep it.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={stayInTemporaryChat}>
+              Stay
+            </Button>
+            <Button variant="outline" onClick={saveChatAndLeave}>
+              Save as normal chat
+            </Button>
+            <Button variant="destructive" onClick={discardChatAndLeave}>
+              Leave and delete
+            </Button>
+          </DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -4447,7 +4956,7 @@ export function ChatView() {
       await newSession.persisted;
       const userMsg = await addMessage(newSession.id, "user", text, undefined, undefined, undefined, isTemporary);
 
-      updateSession(newSession.id, { chat_mode: chatMode });
+      updateSession(newSession.id, { chat_mode: chatMode, is_temporary: isTemporary });
 
       const memoryContext = !arc && settings.autoMemory ? await buildMemoryContext(activeProject?.id ?? null, text) : "";
       const learnContext = !arc && chatMode === "learn" ? buildLearnSystemPrompt(learnLevel, learnSubject) : "";
