@@ -35,6 +35,7 @@ const provider: Provider = {
 /** Builds a model and returns its modelKwargs — where reasoning_effort must land. */
 async function effortKwargs(modelName: string, effort?: ReasoningEffort): Promise<Record<string, unknown>> {
   const model = await createChatModel(provider, modelName, effort);
+  if (!("modelKwargs" in model)) throw new Error("Expected an OpenAI-compatible model");
   return model.modelKwargs ?? {};
 }
 

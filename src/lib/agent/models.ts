@@ -1,9 +1,13 @@
 import { ChatOpenAI } from "@langchain/openai";
+import { ChatAnthropic } from "@langchain/anthropic";
 import type { Provider, ReasoningEffort } from "@/types";
 import { getProviderApiKey } from "@/lib/llm";
+import { isAnthropicProvider } from "@/lib/providers/anthropic";
 import {
   getModelOutputLimit,
   getModelReasoning,
+  reasoningEffortRank,
+  reasoningToggleProtocolForBaseUrl,
   sanitizeReasoningEffort,
 } from "@/lib/model-capabilities";
 
@@ -25,19 +29,58 @@ const FALLBACK_MAX_TOKENS = 16384;
  */
 const MAX_OUTPUT_TOKENS_CAP = 65536;
 
-/**
- * GLM models (z.ai): thinking is forced (GLM-5.3 cannot even disable it) and
- * its depth is controlled by reasoning_effort, which the provider defaults to
- * "max" — by far the longest thinking. The provider only accepts low/high/max
- * for GLM-5.3, so map the app's effort onto that enum and always send an
- * explicit value: default and the low end → "low" (shortest thinking unless
- * the user asks for more), medium → "high", xhigh/max → "max".
- */
-function glmReasoningEffort(effort: ReasoningEffort | undefined): string {
-  if (effort === "max" || effort === "xhigh") return "max";
-  if (effort === "high") return "high";
-  if (effort === "medium") return "high";
-  return "low";
+/** Build only the reasoning fields supported by this model and API dialect. */
+function reasoningRequestFields(
+  provider: Provider,
+  modelName: string,
+  requestedEffort: ReasoningEffort | undefined,
+  support: Awaited<ReturnType<typeof getModelReasoning>>,
+): Record<string, unknown> {
+  if (!support?.reasoning) return {};
+
+  let effort = sanitizeReasoningEffort(requestedEffort, support);
+  // GLM providers default to the deepest setting. For a fresh session, start
+  // at the model's actual lowest thinking level rather than inventing an enum.
+  if (
+    /glm/i.test(modelName) &&
+    (!requestedEffort || requestedEffort === "default") &&
+    support.efforts.length > 0
+  ) {
+    effort = support.efforts
+      .filter((value) => value !== "none")
+      .sort((a, b) => reasoningEffortRank(a) - reasoningEffortRank(b))[0];
+  }
+  const budget = effort?.match(/^budget:(\d+)$/);
+  if (budget && support.thinkingBudget) {
+    const protocol = reasoningToggleProtocolForBaseUrl(provider.baseUrl, modelName);
+    const tokens = Number(budget[1]);
+    if (protocol === "google" && tokens >= support.thinkingBudget.min && tokens <= support.thinkingBudget.max) {
+      // Google documents this extension for models that expose a thinking
+      // token budget. It must not be sent alongside reasoning_effort.
+      return {
+        extra_body: {
+          google: { thinking_config: { thinking_budget: tokens } },
+        },
+      };
+    }
+    return {};
+  }
+  if (!effort) return {};
+
+  if (effort === "none" && support.toggle) {
+    const protocol = reasoningToggleProtocolForBaseUrl(provider.baseUrl, modelName);
+    if (protocol === "deepseek") return { thinking: { type: "disabled" } };
+    if (protocol === "openrouter") return { reasoning: { enabled: false } };
+    if (protocol === "google" || protocol === "openai-compatible") {
+      return { reasoning_effort: "none" };
+    }
+    // A catalog toggle alone doesn't identify its wire format. Send `none`
+    // only when models.dev lists it as an accepted effort for this model.
+    if (!support.efforts.includes("none")) return {};
+  }
+
+  if (!support.efforts.includes(effort)) return {};
+  return { reasoning_effort: effort };
 }
 
 /**
@@ -251,16 +294,15 @@ export const corsSafeFetch: typeof fetch = async (input, init) => {
 };
 
 /**
- * Build a LangChain chat model for one of the user's OpenAI-compatible
- * providers. Every provider in this app speaks the OpenAI chat-completions
- * wire format, so ChatOpenAI with a custom baseURL covers them all
- * (OpenRouter, LM Studio, Ollama /v1, vLLM, Fireworks, …).
+ * Build a LangChain chat model for the selected provider. OpenAI-compatible
+ * endpoints use ChatOpenAI; Claude uses ChatAnthropic and its native Messages
+ * API so tool calls and streaming work with Anthropic's request format.
  */
 export async function createChatModel(
   provider: Provider,
   modelName: string,
   reasoningEffort?: ReasoningEffort,
-): Promise<ChatOpenAI> {
+): Promise<ChatOpenAI | ChatAnthropic> {
   const apiKey = await getProviderApiKey(provider.id);
   const outputLimit = await getModelOutputLimit(provider, modelName).catch(() => null);
   const isGlm = /glm/i.test(modelName);
@@ -268,14 +310,44 @@ export async function createChatModel(
     outputLimit ?? (isGlm ? MAX_OUTPUT_TOKENS_CAP : FALLBACK_MAX_TOKENS),
     MAX_OUTPUT_TOKENS_CAP,
   );
-  // Validate the requested effort against the model's models.dev entry so the
-  // provider only ever sees values it accepts (e.g. deepseek-v4.1-flash takes
-  // none/low/high/xhigh/max, not "medium"); unknown models pass through.
+  // Validate against the provider-scoped models.dev entry. Unknown capabilities
+  // use the provider default instead of sending a possibly invalid value.
   const support = await getModelReasoning(provider, modelName).catch(() => null);
-  const effort = sanitizeReasoningEffort(
-    isGlm ? glmReasoningEffort(reasoningEffort) : reasoningEffort,
-    support,
-  );
+  if (isAnthropicProvider(provider.baseUrl)) {
+    const effort = sanitizeReasoningEffort(reasoningEffort, support);
+    const budget = effort?.match(/^budget:(\d+)$/);
+    const model = modelName.toLowerCase();
+    const supportsAdaptiveThinking =
+      /(?:^|-)4-(?:6|7|8)(?:-|$)/.test(model) || /(?:^|-)5(?:-|$)/.test(model);
+    const thinking = budget && support?.thinkingBudget
+      ? { type: "enabled" as const, budget_tokens: Number(budget[1]) }
+      : effort && support?.efforts.includes(effort) && supportsAdaptiveThinking
+        ? { type: "adaptive" as const }
+        : undefined;
+    const anthropicEffort = ["low", "medium", "high", "xhigh", "max"].find(
+      (value) => value === effort && support?.efforts.includes(value),
+    );
+    const outputConfig = anthropicEffort
+      ? { effort: anthropicEffort as "low" | "medium" | "high" | "xhigh" | "max" }
+      : undefined;
+    // Anthropic's API is Messages-based. Use its LangChain adapter so agent
+    // tool binding, structured output, streaming, and conversation history
+    // all use the native protocol instead of `/chat/completions`.
+    return new ChatAnthropic({
+      model: modelName,
+      apiKey,
+      anthropicApiUrl: provider.baseUrl.replace(/\/v1\/?$/, ""),
+      maxTokens,
+      ...(thinking ? { thinking } : {}),
+      ...(outputConfig ? { outputConfig } : {}),
+      clientOptions: {
+        fetch: corsSafeFetch,
+        timeout: 300_000,
+      },
+      maxRetries: 1,
+    });
+  }
+  const reasoningFields = reasoningRequestFields(provider, modelName, reasoningEffort, support);
   return new ChatOpenAI({
     model: modelName,
     apiKey: apiKey || "no-key",
@@ -284,13 +356,9 @@ export async function createChatModel(
       fetch: corsSafeFetch,
     },
     maxTokens,
-    // ChatOpenAI's own reasoningEffort field is dead weight here: LangChain
-    // only serializes it for OpenAI reasoning models (o-series, gpt-5*) and
-    // reads the per-call option, never the constructor field. modelKwargs is
-    // spread verbatim into the chat-completions body, so every OpenAI-
-    // compatible provider actually sees reasoning_effort (OpenRouter and z.ai
-    // both accept it flat). Reasoning-capable models only; others ignore it.
-    ...(effort ? { modelKwargs: { reasoning_effort: effort } } : {}),
+    // ChatOpenAI spreads modelKwargs into the OpenAI-compatible request body.
+    // Providers with a separate toggle get their documented field instead.
+    ...(Object.keys(reasoningFields).length > 0 ? { modelKwargs: reasoningFields } : {}),
     maxRetries: 1,
     timeout: 300_000,
   });

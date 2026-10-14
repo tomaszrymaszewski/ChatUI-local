@@ -41,3 +41,25 @@ create policy "users manage own rows"
   for all
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
+
+-- One duration row per agent run. Message content remains in the existing
+-- local-first user_data sync; this table records timing metadata only.
+create table if not exists public.agent_work_logs (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  session_id text not null,
+  agent_id text,
+  started_at timestamptz not null,
+  ended_at timestamptz not null,
+  duration_ms bigint not null check (duration_ms >= 0),
+  created_at timestamptz not null default now()
+);
+
+alter table public.agent_work_logs enable row level security;
+
+drop policy if exists "users manage own agent work logs" on public.agent_work_logs;
+create policy "users manage own agent work logs"
+  on public.agent_work_logs
+  for all
+  using (auth.uid() = user_id)
+  with check (auth.uid() = user_id);

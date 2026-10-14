@@ -95,6 +95,13 @@ jobs:
           tagName: ${{ github.ref_name }}
           releaseName: "AI Studio ${{ github.ref_name }}"
           releaseBody: |
+            ## Highlights
+
+            - Provider-aware thinking controls, with supported effort levels and native Claude API support.
+            - A live agent work timeline with elapsed-time tracking and saved work-duration logs.
+            - Sidebar conversation sorting, grouping, filtering, rename, and delete controls.
+            - Refined startup skeleton, chat transitions, composer sizing, and model selector.
+
             See the assets below to download and install this version.
 
             **macOS note:** if macOS says AI Studio is "damaged" (happens with unsigned builds),

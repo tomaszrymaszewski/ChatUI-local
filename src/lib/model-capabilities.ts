@@ -1,4 +1,6 @@
 import type { Provider } from "@/types";
+import { getProviderApiKey } from "@/lib/llm";
+import { fetchAnthropicModels, isAnthropicProvider, type AnthropicModelInfo } from "@/lib/providers/anthropic";
 import { setItemOrThrowFriendly } from "./storage-pressure";
 
 const CACHE_KEY = "chatui:modelsdev-cache";
@@ -21,7 +23,7 @@ interface ModelsDevModel {
   /** Whether the model can think/reason at all. */
   reasoning?: boolean;
   /** How thinking is controlled: a plain toggle and/or an effort scale. */
-  reasoning_options?: Array<{ type?: string; values?: string[] }>;
+  reasoning_options?: unknown;
 }
 
 type ModelsDevCatalog = Record<string, {
@@ -37,8 +39,12 @@ function loadCached(): { data: ModelsDevCatalog; ts: number } | null {
     const raw = localStorage.getItem(CACHE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (parsed.v !== CACHE_VERSION) return null;
-    if (Date.now() - (parsed.ts ?? 0) > CACHE_TTL) return null;
+    if (
+      parsed.v !== CACHE_VERSION ||
+      typeof parsed.ts !== "number" ||
+      !parsed.data ||
+      typeof parsed.data !== "object"
+    ) return null;
     return parsed;
   } catch {
     return null;
@@ -107,21 +113,34 @@ export async function getModelsDevCatalog(): Promise<ModelsDevCatalog | null> {
   const cached = loadCached();
   // Re-slim a fat cache written before slimming existed: this reclaims ~3.5MB
   // on the next lookup instead of waiting out the 24h TTL.
-  if (cached) {
-    if (!isFatCatalog(cached.data)) return cached.data;
-    const slim = slimCatalog(cached.data);
-    saveCached(slim);
-    return slim;
+  const fresh = cached && Date.now() - cached.ts <= CACHE_TTL;
+  const staleCatalog = cached
+    ? isFatCatalog(cached.data)
+      ? slimCatalog(cached.data)
+      : cached.data
+    : null;
+  if (cached && staleCatalog && staleCatalog !== cached.data) saveCached(staleCatalog);
+  if (cached && fresh) {
+    return staleCatalog;
   }
   if (!catalogPromise) {
     catalogPromise = fetch("https://models.dev/api.json")
-      .then((r) => r.json() as Promise<ModelsDevCatalog>)
+      .then((r) => {
+        if (!r.ok) throw new Error(`models.dev returned ${r.status}`);
+        return r.json() as Promise<ModelsDevCatalog>;
+      })
       .then((data) => {
+        if (!data || typeof data !== "object" || Array.isArray(data)) {
+          throw new Error("models.dev returned an invalid catalog");
+        }
         const slim = slimCatalog(data);
         saveCached(slim);
         return slim;
       })
-      .catch(() => null);
+      .catch(() => staleCatalog)
+      .finally(() => {
+        catalogPromise = null;
+      });
   }
   return catalogPromise;
 }
@@ -238,6 +257,40 @@ function modelNameCandidates(modelName: string): string[] {
   return [...out];
 }
 
+/**
+ * Provider catalogs often use a canonical model name while their public API
+ * uses an alias (Gemini's `-latest`, or dated DeepSeek V4 releases). Keep
+ * alias matching deliberately narrow so similarly named model families do
+ * not inherit each other's controls.
+ */
+function canonicalModelName(value: string): string {
+  let name = value.trim().toLowerCase().split("/").filter(Boolean).pop() ?? "";
+  name = name.replace(/_/g, "-").replace(/-latest$/, "");
+  if (name.startsWith("gemini-")) {
+    name = name.replace(/^gemini-\d+(?:\.\d+)*-/, "gemini-");
+  }
+  if (/^deepseek-v4(?:\.\d+)?-/.test(name)) {
+    name = name.replace(/-\d{4,8}$/, "");
+  }
+  return name;
+}
+
+function versionOfCatalogModel(key: string, entry: ModelsDevModel): number[] {
+  const name = `${entry.id ?? ""} ${key}`.toLowerCase();
+  const gemini = name.match(/gemini-(\d+(?:\.\d+)*)-/)?.[1];
+  if (gemini) return gemini.split(".").map(Number);
+  const deepseekDate = name.match(/^.*deepseek-v4(?:\.\d+)?-.*?-(\d{4,8})(?:\s|$)/)?.[1];
+  return deepseekDate ? [Number(deepseekDate)] : [];
+}
+
+function compareVersionsDescending(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.max(a.length, b.length); i += 1) {
+    const diff = (b[i] ?? 0) - (a[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
 /** Find a model entry by key, id, or name (case-insensitive, prefix-tolerant). */
 function findModelEntry(
   models: Record<string, ModelsDevModel>,
@@ -249,7 +302,21 @@ function findModelEntry(
     if (entry.id && candidates.has(entry.id.toLowerCase())) return entry;
     if (entry.name && candidates.has(entry.name.toLowerCase())) return entry;
   }
-  return undefined;
+  const canonical = canonicalModelName(modelName);
+  if (!canonical) return undefined;
+  const matches = Object.entries(models).filter(([key, entry]) =>
+    [key, entry.id, entry.name]
+      .filter((value): value is string => typeof value === "string")
+      .some((value) => canonicalModelName(value) === canonical),
+  );
+  if (matches.length === 0) return undefined;
+  // `latest` aliases should resolve to the newest catalog version within the
+  // same family (e.g. Gemini Flash-Lite), while exact IDs above stay exact.
+  matches.sort(([keyA, a], [keyB, b]) => {
+    const version = compareVersionsDescending(versionOfCatalogModel(keyA, a), versionOfCatalogModel(keyB, b));
+    return version || keyA.localeCompare(keyB);
+  });
+  return matches[0][1];
 }
 
 /**
@@ -401,6 +468,107 @@ export interface ModelReasoningSupport {
   efforts: string[];
   /** A plain on/off toggle is supported (models.dev type "toggle"). */
   toggle: boolean;
+  /** A budget_tokens control exists, even if the catalog omits safe bounds. */
+  budgetTokens?: true;
+  /** Inclusive token-budget bounds from models.dev type "budget_tokens". */
+  thinkingBudget?: { min: number; max: number };
+}
+
+const ANTHROPIC_MODEL_CACHE_TTL = 24 * 60 * 60 * 1000;
+const anthropicCatalogRequests = new Map<string, Promise<AnthropicModelInfo[] | null>>();
+
+function anthropicCacheKey(providerId: string): string {
+  return `chatui:anthropic-model-capabilities:${providerId}`;
+}
+
+function readAnthropicModelCache(providerId: string): { ts: number; models: AnthropicModelInfo[] } | null {
+  try {
+    const value = JSON.parse(localStorage.getItem(anthropicCacheKey(providerId)) ?? "null");
+    if (typeof value?.ts !== "number" || !Array.isArray(value.models)) return null;
+    return value as { ts: number; models: AnthropicModelInfo[] };
+  } catch {
+    return null;
+  }
+}
+
+function findAnthropicModel(models: AnthropicModelInfo[], modelName: string): AnthropicModelInfo | undefined {
+  const candidates = new Set(modelNameCandidates(modelName).map((candidate) => candidate.toLowerCase()));
+  const exact = models.find((model) => candidates.has(model.id.toLowerCase()));
+  if (exact) return exact;
+  const normalized = (value: string) => value.toLowerCase().replace(/-\d{8}$/, "");
+  const target = normalized(modelName.split("/").filter(Boolean).pop() ?? modelName);
+  return models.find((model) => {
+    const id = normalized(model.id);
+    return id === target || id.startsWith(`${target}-`);
+  });
+}
+
+function anthropicReasoningOf(model: AnthropicModelInfo | undefined): ModelReasoningSupport | null {
+  const effortCapabilities = model?.capabilities?.effort;
+  if (!effortCapabilities) return null;
+  const efforts = ["low", "medium", "high", "xhigh", "max"].filter(
+    (effort) => effortCapabilities[effort]?.supported === true,
+  );
+  return { reasoning: efforts.length > 0, efforts, toggle: false };
+}
+
+function cachedAnthropicReasoning(providerId: string, modelName: string): ModelReasoningSupport | null {
+  const cached = readAnthropicModelCache(providerId);
+  return cached ? anthropicReasoningOf(findAnthropicModel(cached.models, modelName)) : null;
+}
+
+async function loadAnthropicModels(provider: Provider): Promise<AnthropicModelInfo[] | null> {
+  const cached = readAnthropicModelCache(provider.id);
+  if (cached && Date.now() - cached.ts <= ANTHROPIC_MODEL_CACHE_TTL) return cached.models;
+  const pending = anthropicCatalogRequests.get(provider.id);
+  if (pending) return pending;
+
+  const request = (async () => {
+    try {
+      const apiKey = await getProviderApiKey(provider.id);
+      const models = await fetchAnthropicModels(apiKey, provider.baseUrl);
+      try {
+        localStorage.setItem(anthropicCacheKey(provider.id), JSON.stringify({ ts: Date.now(), models }));
+      } catch {
+        // Keep the in-memory result when local storage is full or unavailable.
+      }
+      return models;
+    } catch {
+      return cached?.models ?? null;
+    } finally {
+      anthropicCatalogRequests.delete(provider.id);
+    }
+  })();
+  anthropicCatalogRequests.set(provider.id, request);
+  return request;
+}
+
+async function getAnthropicReasoning(
+  provider: Provider,
+  modelName: string,
+): Promise<ModelReasoningSupport | null> {
+  const models = await loadAnthropicModels(provider);
+  return models ? anthropicReasoningOf(findAnthropicModel(models, modelName)) : null;
+}
+
+/** API dialect used when a provider exposes a separate reasoning on/off toggle. */
+export type ReasoningToggleProtocol = "deepseek" | "openrouter" | "google" | "openai-compatible";
+
+export function reasoningToggleProtocolForBaseUrl(
+  baseUrl: string,
+  modelName = "",
+): ReasoningToggleProtocol | null {
+  const providerKey = providerKeyForBaseUrl(baseUrl);
+  if (providerKey === "deepseek") return "deepseek";
+  if (providerKey === "openrouter") return "openrouter";
+  if (providerKey === "google") return "google";
+  if (providerKey === "deepinfra" || providerKey === "fireworks-ai") {
+    // Both hosts serve DeepSeek V4's OpenAI-compatible `thinking` toggle for
+    // the same model family; their other models use reasoning_effort=none
+    // when the host catalog advertises a toggle.
+    return /deepseek-v4/i.test(modelName) ? "deepseek" : "openai-compatible";
+  }
+  return null;
 }
 
 /** Canonical ordering of models.dev effort values; unknown values sort last. */
@@ -420,19 +588,48 @@ export function reasoningEffortRank(effort: string): number {
 
 function reasoningOf(entry: ModelsDevModel | undefined): ModelReasoningSupport | null {
   if (!entry) return null;
-  const options = entry.reasoning_options ?? [];
-  const efforts = [
-    ...new Set(
-      options
-        .filter((o) => o?.type === "effort")
-        .flatMap((o) => o?.values ?? [])
-        .filter((v): v is string => typeof v === "string" && v.length > 0),
-    ),
+  const rawOptions = entry.reasoning_options;
+  if (entry.reasoning === undefined && rawOptions === undefined) return null;
+  const options = Array.isArray(rawOptions) ? rawOptions : [];
+  const objectOptions =
+    rawOptions && typeof rawOptions === "object" && !Array.isArray(rawOptions)
+      ? rawOptions as Record<string, unknown>
+      : null;
+  const effortValues = [
+    ...options
+      .filter((o): o is { type?: string; values?: unknown[] } => !!o && typeof o === "object")
+      .filter((o) => o.type === "effort")
+      .flatMap((o) => Array.isArray(o.values) ? o.values : []),
+    ...(Array.isArray(objectOptions?.effort) ? objectOptions.effort : []),
+    ...(objectOptions?.type === "effort" && Array.isArray(objectOptions.values)
+      ? objectOptions.values
+      : []),
   ];
+  const efforts = [...new Set(
+    effortValues.filter((v): v is string => typeof v === "string" && v.length > 0),
+  )];
+  const budgetOption = [
+    ...options.filter((o) => !!o && typeof o === "object" && (o as { type?: unknown }).type === "budget_tokens"),
+    ...(objectOptions?.type === "budget_tokens" ? [objectOptions] : []),
+  ][0] as { min?: unknown; max?: unknown } | undefined;
+  const budgetMin = typeof budgetOption?.min === "number" ? budgetOption.min : undefined;
+  const budgetMax = typeof budgetOption?.max === "number" ? budgetOption.max : undefined;
+  const thinkingBudget =
+    budgetMin !== undefined && budgetMax !== undefined && budgetMax > budgetMin
+      ? { min: budgetMin, max: budgetMax }
+      : undefined;
+  const hasBudgetTokens = budgetOption !== undefined;
+  const toggle =
+    options.some((o) => !!o && typeof o === "object" && (o as { type?: unknown }).type === "toggle") ||
+    objectOptions?.toggle === true;
   return {
-    reasoning: entry.reasoning === true,
+    reasoning: entry.reasoning === false
+      ? false
+      : entry.reasoning === true || efforts.length > 0 || toggle || hasBudgetTokens,
     efforts,
-    toggle: options.some((o) => o?.type === "toggle"),
+    toggle,
+    ...(hasBudgetTokens ? { budgetTokens: true as const } : {}),
+    thinkingBudget,
   };
 }
 
@@ -441,25 +638,85 @@ function findReasoning(
   providerKey: string | null,
   modelName: string,
 ): ModelReasoningSupport | null {
+  let scopedWithoutControls: ModelReasoningSupport | null = null;
   if (providerKey) {
-    const scoped = reasoningOf(findModelEntry(catalog[providerKey]?.models ?? {}, modelName));
-    if (scoped) return scoped;
+    const scopedEntry = findModelEntry(catalog[providerKey]?.models ?? {}, modelName);
+    const scoped = reasoningOf(scopedEntry);
+    if (scoped && (!scoped.reasoning || scoped.efforts.length > 0 || scoped.toggle || scoped.thinkingBudget)) {
+      return scoped;
+    }
+    scopedWithoutControls = scoped;
+    // A host entry can say a model reasons but omit its controls. In that case
+    // keep searching for the same model's actual effort list; explicit
+    // reasoning=false above remains authoritative.
   }
+  let catalogWithoutControls: ModelReasoningSupport | null = null;
   for (const provider of Object.values(catalog)) {
     const anywhere = reasoningOf(findModelEntry(provider?.models ?? {}, modelName));
-    if (anywhere) return anywhere;
+    if (!anywhere?.reasoning) continue;
+    if (anywhere.efforts.length > 0 || anywhere.toggle || anywhere.thinkingBudget) {
+      return anywhere;
+    }
+    catalogWithoutControls ??= anywhere;
   }
-  return null;
+  return scopedWithoutControls ?? catalogWithoutControls;
 }
 
-/** Thinking support for a model: this provider's entry first, then any provider. */
+/**
+ * Small, documented fallbacks for the three providers' onboarding models.
+ * models.dev remains the live source of truth; these keep the first-run
+ * controls available if its catalog is offline or omits a provider alias.
+ */
+const DEFAULT_REASONING_FALLBACKS: Record<string, Array<{
+  model: string;
+  support: ModelReasoningSupport;
+}>> = {
+  "fireworks-ai": [{
+    model: "accounts/fireworks/models/deepseek-v4-flash-0731",
+    support: { reasoning: true, efforts: ["low", "high", "max"], toggle: true },
+  }],
+  deepinfra: [{
+    model: "deepseek-ai/DeepSeek-V4-Flash",
+    support: { reasoning: true, efforts: ["low", "high", "max"], toggle: true },
+  }],
+  google: [{
+    model: "gemini-flash-lite-latest",
+    support: { reasoning: true, efforts: ["minimal", "low", "medium", "high"], toggle: false },
+  }],
+};
+
+function findReasoningFallback(
+  providerKey: string | null,
+  modelName: string,
+): ModelReasoningSupport | null {
+  if (!providerKey) return null;
+  const candidates = new Set(modelNameCandidates(modelName).map((candidate) => candidate.toLowerCase()));
+  const match = DEFAULT_REASONING_FALLBACKS[providerKey]?.find((fallback) =>
+    [...modelNameCandidates(fallback.model)].some((candidate) => candidates.has(candidate.toLowerCase())),
+  );
+  return match?.support ?? null;
+}
+
+/** Thinking support from the selected provider's entry (custom endpoints use a catalog-wide match). */
 export async function getModelReasoning(
   provider: Provider,
   modelName: string,
 ): Promise<ModelReasoningSupport | null> {
+  if (isAnthropicProvider(provider.baseUrl)) {
+    const native = await getAnthropicReasoning(provider, modelName);
+    if (native) return native;
+  }
   const catalog = await getModelsDevCatalog();
-  if (!catalog) return null;
-  return findReasoning(catalog, providerKeyForBaseUrl(provider.baseUrl), modelName);
+  const providerKey = providerKeyForBaseUrl(provider.baseUrl);
+  const discovered = catalog ? findReasoning(catalog, providerKey, modelName) : null;
+  const fallback = findReasoningFallback(providerKey, modelName);
+  if (
+    discovered &&
+    (!discovered.reasoning || discovered.efforts.length > 0 || discovered.toggle || discovered.thinkingBudget)
+  ) {
+    return discovered;
+  }
+  return fallback ?? discovered;
 }
 
 /** Synchronous best-effort reasoning support (cached catalog only). */
@@ -467,29 +724,46 @@ export function getModelReasoningSync(
   provider: Provider,
   modelName: string,
 ): ModelReasoningSupport | null {
+  if (isAnthropicProvider(provider.baseUrl)) {
+    const native = cachedAnthropicReasoning(provider.id, modelName);
+    if (native) return native;
+  }
   const cached = loadCached();
-  if (!cached) return null;
-  return findReasoning(cached.data, providerKeyForBaseUrl(provider.baseUrl), modelName);
+  const providerKey = providerKeyForBaseUrl(provider.baseUrl);
+  const discovered = cached ? findReasoning(cached.data, providerKey, modelName) : null;
+  const fallback = findReasoningFallback(providerKey, modelName);
+  if (
+    discovered &&
+    (!discovered.reasoning || discovered.efforts.length > 0 || discovered.toggle || discovered.thinkingBudget)
+  ) {
+    return discovered;
+  }
+  return fallback ?? discovered;
 }
 
 /**
- * True when the model accepts this effort value. "default" (send nothing) is
- * always allowed; unknown support (catalog miss) is optimistically allowed.
+ * True when the catalog confirms the model accepts this value. Unknown support
+ * stays unavailable instead of guessing at a provider's accepted values.
  */
 export function isReasoningEffortSupported(
   support: ModelReasoningSupport | null,
   effort: string,
 ): boolean {
   if (effort === "default") return true;
-  if (!support) return true;
+  if (!support || !support.reasoning) return false;
   if (support.efforts.includes(effort)) return true;
+  const budget = effort.match(/^budget:(\d+)$/);
+  if (budget && support.thinkingBudget) {
+    const tokens = Number(budget[1]);
+    return tokens >= support.thinkingBudget.min && tokens <= support.thinkingBudget.max;
+  }
   return effort === "none" && support.toggle;
 }
 
 /**
  * Clamp a requested effort to what the model actually accepts:
  * - "default"/unset → undefined (send nothing, provider default)
- * - unknown support → verbatim (provider decides)
+ * - unknown/unsupported model → undefined (use provider default)
  * - valid value → verbatim
  * - invalid value → nearest valid value by rank (ties prefer deeper thinking)
  * - no effort scale (toggle-only / always-on) → undefined for non-"none"
@@ -499,7 +773,16 @@ export function sanitizeReasoningEffort(
   support: ModelReasoningSupport | null,
 ): string | undefined {
   if (!effort || effort === "default") return undefined;
-  if (!support) return effort;
+  if (!support || !support.reasoning) return undefined;
+  const budget = effort.match(/^budget:(\d+)$/);
+  if (budget && support.thinkingBudget) {
+    const tokens = Number(budget[1]);
+    const clamped = Math.max(
+      support.thinkingBudget.min,
+      Math.min(support.thinkingBudget.max, tokens),
+    );
+    return `budget:${clamped}`;
+  }
   if (support.efforts.includes(effort)) return effort;
   if (effort === "none" && support.toggle) return "none";
   if (support.efforts.length === 0) return undefined;

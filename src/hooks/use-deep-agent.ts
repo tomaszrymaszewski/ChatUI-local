@@ -15,6 +15,7 @@ import { notifyIfBackground } from "@/lib/notify";
 import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
 import { retrieveKnowledgeContext } from "@/lib/knowledge-retrieval";
 import { estimateTokens, recordAgentUsage } from "@/lib/agent-usage";
+import { recordAgentWorkLog } from "@/lib/agent-work-log";
 import type {
   ActivityItem,
   AgentEvent,
@@ -26,6 +27,7 @@ import type {
   SuggestionRequest,
   StructuredInputRequest,
   TodoItem,
+  WorkSegment,
 } from "@/lib/agent/types";
 
 export interface DeepAgentRunOptions {
@@ -237,6 +239,10 @@ export interface AgentControllerApi {
   /** All local actions awaiting a decision — one approve/deny card each. */
   pendingApprovals: PendingApproval[];
   reasoningStreams: ReasoningStream[];
+  workStartedAt?: number;
+  workEndedAt?: number;
+  workDurationMs?: number;
+  workSegments: WorkSegment[];
   /** Agent created during the most recent run (agent-builder setup), if any. */
   createdAgent: { agentId: string; agentName: string } | null;
   /** Cumulative token usage for this session — feeds the context widget. */
@@ -266,6 +272,10 @@ class AgentController implements AgentControllerApi {
   pendingSuggestion: SuggestionRequest | null = null;
   pendingApprovals: PendingApproval[] = [];
   reasoningStreams: ReasoningStream[] = [];
+  workStartedAt: number | undefined;
+  workEndedAt: number | undefined;
+  workDurationMs: number | undefined;
+  workSegments: WorkSegment[] = [];
   createdAgent: { agentId: string; agentName: string } | null = null;
   /** Cumulative token usage for this session — feeds the context widget. */
   usage: SessionUsage;
@@ -303,7 +313,10 @@ class AgentController implements AgentControllerApi {
   inProgressMessageId: string | null = null;
   private reasoningStartRef: number | null = null;
   private reasoningMsRef = 0;
-  private reasoningStreamsRef = new Map<string, { text: string; label: string; startTime: number; endTime?: number; seq: number }>();
+  private reasoningStreamsRef = new Map<string, { text: string; label: string; startTime: number; endTime?: number; seq: number; workSegmentId: string }>();
+  private workSegmentsRef: WorkSegment[] = [];
+  private workSegmentCounter = 0;
+  private activeLegacyThinkingSegmentId: string | null = null;
   /** Shared monotonic counter so activities and reasoning streams can be
    *  interleaved chronologically in the UI. */
   private seqCounter = 0;
@@ -350,8 +363,65 @@ class AgentController implements AgentControllerApi {
       text: s.text,
       ms: s.endTime ? s.endTime - s.startTime : undefined,
       seq: s.seq,
+      workSegmentId: s.workSegmentId,
     }));
     this.notify();
+  }
+
+  private publishWorkSegments(notify = true) {
+    this.workSegments = this.workSegmentsRef.map((segment) => ({ ...segment }));
+    if (notify) this.notify();
+  }
+
+  private finishLegacyThinking(at = Date.now()) {
+    if (this.reasoningStartRef === null) return;
+    const duration = Math.max(0, at - this.reasoningStartRef);
+    this.reasoningMsRef = duration;
+    const segment = this.workSegmentsRef.find((item) => item.id === this.activeLegacyThinkingSegmentId);
+    if (segment) segment.thinkingMs = (segment.thinkingMs ?? 0) + duration;
+    this.reasoningStartRef = null;
+    this.activeLegacyThinkingSegmentId = null;
+    this.publishWorkSegments(false);
+  }
+
+  /** Start a new work block after assistant text has appeared in the current one. */
+  private startWorkEvent(at = Date.now()): WorkSegment {
+    this.finishLegacyThinking(at);
+    let current = this.workSegmentsRef[this.workSegmentsRef.length - 1];
+    if (current && this.contentRef.length > current.textOffset) {
+      current.endedAt = at;
+      current.endTextOffset = this.contentRef.length;
+      const segment: WorkSegment = {
+        id: `work-${++this.workSegmentCounter}`,
+        startedAt: at,
+        textOffset: this.contentRef.length,
+      };
+      this.workSegmentsRef.push(segment);
+      current = segment;
+      this.publishWorkSegments(false);
+    } else if (!current) {
+      current = {
+        id: `work-${++this.workSegmentCounter}`,
+        startedAt: at,
+        textOffset: this.contentRef.length,
+      };
+      this.workSegmentsRef.push(current);
+      this.publishWorkSegments(false);
+    }
+    return current;
+  }
+
+  private finishWork(at = Date.now()) {
+    if (this.workStartedAt === undefined) return;
+    this.finishLegacyThinking(at);
+    const current = this.workSegmentsRef[this.workSegmentsRef.length - 1];
+    if (current && current.endedAt === undefined) {
+      current.endedAt = at;
+      current.endTextOffset = this.contentRef.length;
+    }
+    this.workEndedAt = at;
+    this.workDurationMs = Math.max(0, at - this.workStartedAt);
+    this.publishWorkSegments(false);
   }
 
   private reasoningStreamsNotifyQueued = false;
@@ -371,8 +441,7 @@ class AgentController implements AgentControllerApi {
     switch (event.type) {
       case "token":
         if (this.reasoningStartRef !== null) {
-          this.reasoningMsRef = Date.now() - this.reasoningStartRef;
-          this.reasoningStartRef = null;
+          this.finishLegacyThinking();
         }
         this.contentRef += event.text;
         this.streamingContent = this.contentRef;
@@ -382,11 +451,13 @@ class AgentController implements AgentControllerApi {
         if (event.id) {
           const existing = this.reasoningStreamsRef.get(event.id);
           if (!existing) {
+            const workSegment = this.startWorkEvent();
             this.reasoningStreamsRef.set(event.id, {
               text: event.text,
               label: event.label ?? event.id,
               startTime: Date.now(),
               seq: ++this.seqCounter,
+              workSegmentId: workSegment.id,
             });
           } else {
             existing.text += event.text;
@@ -394,9 +465,15 @@ class AgentController implements AgentControllerApi {
           this.schedulePublishReasoningStreams();
         } else {
           if (this.reasoningStartRef === null) {
-            this.reasoningStartRef = Date.now();
+            const startedAt = Date.now();
+            const workSegment = this.startWorkEvent(startedAt);
+            this.reasoningStartRef = startedAt;
+            this.activeLegacyThinkingSegmentId = workSegment.id;
           }
           this.reasoningRef += event.text;
+          const segment = this.workSegmentsRef.find((item) => item.id === this.activeLegacyThinkingSegmentId);
+          if (segment) segment.thinking = (segment.thinking ?? "") + event.text;
+          this.publishWorkSegments(false);
           this.streamingReasoning = this.reasoningRef;
           this.scheduleNotify();
         }
@@ -405,10 +482,12 @@ class AgentController implements AgentControllerApi {
       case "activity": {
         const existing = this.activitiesRef.get(event.activity.id);
         if (!existing) {
+          const workSegment = this.startWorkEvent();
           this.activitiesRef.set(event.activity.id, {
             ...event.activity,
             textOffset: this.contentRef.length,
             seq: ++this.seqCounter,
+            workSegmentId: workSegment.id,
           });
         } else {
           this.activitiesRef.set(event.activity.id, {
@@ -416,6 +495,7 @@ class AgentController implements AgentControllerApi {
             textOffset: existing.textOffset,
             seq: existing.seq,
             label: event.activity.label ?? existing.label,
+            workSegmentId: existing.workSegmentId,
           });
         }
         if (event.activity.status === "done" || event.activity.status === "error") {
@@ -484,6 +564,13 @@ class AgentController implements AgentControllerApi {
     this.reasoningStartRef = null;
     this.reasoningMsRef = 0;
     this.reasoningStreamsRef = new Map();
+    this.workSegmentsRef = [];
+    this.workSegmentCounter = 0;
+    this.activeLegacyThinkingSegmentId = null;
+    this.workStartedAt = undefined;
+    this.workEndedAt = undefined;
+    this.workDurationMs = undefined;
+    this.workSegments = [];
     this.seqCounter = 0;
     this.streamingContent = "";
     this.streamingReasoning = "";
@@ -644,7 +731,13 @@ class AgentController implements AgentControllerApi {
 
   run = async (opts: DeepAgentRunOptions): Promise<AgentRunResult> => {
     this.resetState();
+    const workStartedAt = Date.now();
+    this.workStartedAt = workStartedAt;
+    this.workSegmentCounter = 1;
+    this.workSegmentsRef = [{ id: "work-1", startedAt: workStartedAt, textOffset: 0 }];
+    this.publishWorkSegments(false);
     this.isRunning = true;
+    this.notify();
     this.unattended = opts.unattended ?? false;
     registryNotify();
     // Resolve the model's context window for the usage widget (async, best-effort).
@@ -831,6 +924,16 @@ class AgentController implements AgentControllerApi {
     } finally {
       const wasUnattended = this.unattended;
       this.normalizeOnEnd();
+      this.finishWork();
+      if (this.workStartedAt !== undefined && this.workEndedAt !== undefined && this.workDurationMs !== undefined) {
+        void recordAgentWorkLog({
+          sessionId: this.sessionId,
+          agentId: opts.taskProfile?.sandbox?.agentId,
+          startedAt: this.workStartedAt,
+          endedAt: this.workEndedAt,
+          durationMs: this.workDurationMs,
+        });
+      }
       if (session) {
         try { await session.dispose(); } catch { /* best-effort */ }
       }
@@ -867,6 +970,7 @@ class AgentController implements AgentControllerApi {
         text: s.text,
         ms: s.endTime ? s.endTime - s.startTime : undefined,
         seq: s.seq,
+        workSegmentId: s.workSegmentId,
       }));
     const todoActivities: ActivityItem[] = this.todosRef.map((t, i) => ({
       id: `todo-${i}`,
@@ -892,6 +996,10 @@ class AgentController implements AgentControllerApi {
       reasoning: this.reasoningRef,
       reasoningMs: this.reasoningMsRef || undefined,
       reasoningStreams: finalReasoningStreams.length > 0 ? finalReasoningStreams : undefined,
+      workStartedAt: this.workStartedAt,
+      workEndedAt: this.workEndedAt,
+      workDurationMs: this.workDurationMs,
+      workSegments: this.workSegments.length > 0 ? this.workSegments.map((segment) => ({ ...segment })) : undefined,
       cancelled,
       interrupted: false,
       activities: [...finalActivities, ...todoActivities],

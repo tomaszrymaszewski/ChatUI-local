@@ -131,6 +131,10 @@ export async function runHeadlessTask(opts: {
       reasoning: ctrl.streamingReasoning || undefined,
       activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
       reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+      workStartedAt: ctrl.workStartedAt,
+      workEndedAt: ctrl.workEndedAt,
+      workDurationMs: ctrl.workDurationMs,
+      workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
     });
   }, 2500);
 
@@ -168,6 +172,13 @@ export async function runHeadlessTask(opts: {
     const message = flattenAgentError(err) || String(err);
     updateMessageHeadless(sessionId, assistantMsg.id, {
       content: `⚠️ Run failed: ${message}`,
+      reasoning: ctrl.streamingReasoning || undefined,
+      activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+      reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+      workStartedAt: ctrl.workStartedAt,
+      workEndedAt: ctrl.workEndedAt,
+      workDurationMs: ctrl.workDurationMs,
+      workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
     });
     return { sessionId, content: "", cancelled: false, error: message };
   }
@@ -179,6 +190,10 @@ export async function runHeadlessTask(opts: {
     reasoning: result.reasoning || undefined,
     activities: result.activities,
     reasoningStreams: result.reasoningStreams,
+    workStartedAt: result.workStartedAt,
+    workEndedAt: result.workEndedAt,
+    workDurationMs: result.workDurationMs,
+    workSegments: result.workSegments,
     artifacts: result.artifacts,
     files: result.files?.length ? result.files : undefined,
   });

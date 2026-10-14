@@ -2,7 +2,7 @@ import type { Provider, ProviderModel, UserSettings } from "@/types";
 import { setItemOrThrowFriendly } from "./storage-pressure";
 import type { ToolDefinition, ToolCall } from "@/lib/tools";
 import { executeTool } from "@/lib/tools";
-import { streamAnthropicCompletion, isAnthropicProvider } from "@/lib/providers/anthropic";
+import { completeAnthropicMessage, fetchAnthropicModels, streamAnthropicCompletion, isAnthropicProvider } from "@/lib/providers/anthropic";
 
 const STORAGE_KEY = "chatui:providers";
 
@@ -118,6 +118,10 @@ export async function getProviderApiKey(
 export async function fetchModelsFromApi(provider: Provider): Promise<string[]> {
   const apiKey = await getProviderApiKey(provider.id);
   const baseUrl = provider.baseUrl.replace(/\/$/, "");
+  if (isAnthropicProvider(provider.baseUrl)) {
+    const models = await fetchAnthropicModels(apiKey, baseUrl);
+    return models.map((model) => model.id).sort();
+  }
   const url = `${baseUrl}/models`;
 
   const headers: Record<string, string> = {
@@ -510,6 +514,20 @@ export async function generateChatTitle(
     titleMessages.unshift({ role: "system", content: systemPrompt });
   }
 
+  if (isAnthropicProvider(provider.baseUrl)) {
+    try {
+      const raw = await completeAnthropicMessage(apiKey, baseUrl, model, titleMessages, 500);
+      const title = raw
+        .replace(/["'\n]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .replace(/[.,;:!?]+$/, "");
+      return !title || isTitleLeak(title) ? "" : title.slice(0, 50);
+    } catch {
+      return "";
+    }
+  }
+
   const baseBody: Record<string, unknown> = {
     model,
     stream: false,
@@ -733,6 +751,20 @@ export async function generateQuestionOptions(
   const baseUrl = provider.baseUrl.replace(/\/$/, "");
   const url = `${baseUrl}/chat/completions`;
   const { system, user } = buildQuestionOptionsPrompt(question, transcript);
+  if (isAnthropicProvider(provider.baseUrl)) {
+    try {
+      const raw = await completeAnthropicMessage(
+        apiKey,
+        baseUrl,
+        model,
+        [{ role: "system", content: system }, { role: "user", content: user }],
+        300,
+      );
+      return parseQuestionOptions(raw);
+    } catch {
+      return [];
+    }
+  }
   const baseBody: Record<string, unknown> = {
     model,
     stream: false,
@@ -792,6 +824,20 @@ export async function generateFollowUpSuggestion(
     return "";
   }
   const baseUrl = provider.baseUrl.replace(/\/$/, "");
+  if (isAnthropicProvider(provider.baseUrl)) {
+    try {
+      const raw = await completeAnthropicMessage(
+        apiKey,
+        baseUrl,
+        model,
+        [{ role: "system", content: system }, { role: "user", content: user }],
+        300,
+      );
+      return cleanFollowUpSuggestion(raw);
+    } catch {
+      return "";
+    }
+  }
   const url = `${baseUrl}/chat/completions`;
   const baseBody: Record<string, unknown> = {
     model,

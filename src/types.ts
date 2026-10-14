@@ -1,4 +1,4 @@
-import type { ActivityItem, ReasoningStream, SharedFile } from "@/lib/agent/types";
+import type { ActivityItem, ReasoningStream, SharedFile, WorkSegment } from "@/lib/agent/types";
 import type { Artifact } from "@/lib/artifacts";
 
 export type MessageRole = "user" | "assistant" | "system";
@@ -26,6 +26,10 @@ export interface Message {
   is_temporary?: boolean;
   reasoning?: string;
   reasoningStreams?: ReasoningStream[];
+  workStartedAt?: number;
+  workEndedAt?: number;
+  workDurationMs?: number;
+  workSegments?: WorkSegment[];
   activities?: ActivityItem[];
   artifacts?: Artifact[];
   /** Files the agent shared for download (share_files tool). */
@@ -82,6 +86,8 @@ export type ReasoningEffort = "default" | (string & {});
 export interface ChatSession {
   id: string;
   title: string;
+  /** Creation timestamp; older stored chats may only have updatedAt. */
+  createdAt?: Date;
   updatedAt: Date;
   projectId?: string;
   type: "chat" | "agent";

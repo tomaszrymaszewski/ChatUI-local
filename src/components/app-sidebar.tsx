@@ -262,7 +262,7 @@ export function AppSidebar({
       )}
 
       {!inPrefsView && activeAgentConsole ? (
-        <div key="agent-detail" className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
+        <div key="agent-detail" className="flex min-h-0 flex-1 flex-col animate-in fade-in duration-200">
           <SidebarHeader>
             <SidebarMenu>
               <SidebarMenuItem>
@@ -425,7 +425,7 @@ export function AppSidebar({
         </div>
       ) : !inPrefsView ? (
         activeTab === "agent" ? (
-          <div key="agent" className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
+          <div key="agent" className="flex min-h-0 flex-1 flex-col animate-in fade-in duration-200">
             <SidebarHeader>
               <SidebarMenu>
                 <SidebarMenuItem>
@@ -455,7 +455,7 @@ export function AppSidebar({
             </SidebarContent>
           </div>
         ) : (
-        <div key="chat" className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
+        <div key="chat" className="flex min-h-0 flex-1 flex-col animate-in fade-in duration-200">
           <SidebarHeader>
             <SidebarMenu>
               <SidebarMenuItem>
@@ -494,7 +494,7 @@ export function AppSidebar({
         </div>
         )
       ) : (
-        <div key={view} className="flex min-h-0 flex-1 flex-col animate-in fade-in slide-in-from-left-3 duration-300">
+        <div key={view} className="flex min-h-0 flex-1 flex-col animate-in fade-in duration-200">
           <SidebarHeader>
             <SidebarMenu>
               <SidebarMenuItem>

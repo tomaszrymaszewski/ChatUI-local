@@ -1,4 +1,4 @@
-  import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
@@ -6,6 +6,8 @@ import {
   ArrowUp,
   ArrowLeft,
   Bot,
+  ChevronDown,
+  MessageCircle,
   Paperclip,
   Check,
   ClockFading,
@@ -16,6 +18,7 @@ import {
   MoreHorizontal,
   Pencil,
   Plus,
+  SquarePen,
   ScrollText,
   Search,
   FolderPlus,
@@ -28,7 +31,6 @@ import {
   SquareTerminal,
   GraduationCap,
   Workflow,
-  Loader2,
   Menu,
   UsersRound,
   SignalHigh,
@@ -116,7 +118,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Marker, MarkerContent, MarkerIcon } from "@/components/ui/marker";
 import {
   Message,
   MessageContent,
@@ -135,7 +136,6 @@ import {
   SidebarProvider,
   SidebarTrigger,
 } from "@/components/ui/sidebar";
-import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
 import type {
@@ -202,7 +202,7 @@ import { prepareAttachmentContext, rebuildAttachmentContent, buildProjectFilesCo
 import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
 import { ensureDeliverablesDir } from "@/lib/deliverables";
-import { getModelCapabilities, getModelCapabilitiesSync, getModelDisplayNameSync, getModelReasoningSync, getModelsDevCatalog, isReasoningEffortSupported, reasoningEffortRank, sanitizeReasoningEffort } from "@/lib/model-capabilities";
+import { getModelCapabilities, getModelCapabilitiesSync, getModelDisplayNameSync, getModelReasoning, getModelReasoningSync, getModelsDevCatalog, reasoningEffortRank, reasoningToggleProtocolForBaseUrl, sanitizeReasoningEffort, type ModelReasoningSupport } from "@/lib/model-capabilities";
 import { buildMemoryContext, extractAndSaveMemory, loadMemory } from "@/lib/memory";
 
 function generateId() {
@@ -270,6 +270,8 @@ function streamSaveSignature(ctrl: AgentControllerApi): string {
     ctrl.files.length,
     ctrl.activities.map((a) => `${a.id}:${a.status}`).join(","),
     ctrl.reasoningStreams.map((s) => `${s.id}:${s.text.length}`).join(","),
+    ctrl.workStartedAt ?? "",
+    ctrl.workSegments.map((segment) => `${segment.id}:${segment.endedAt ?? ""}:${segment.endTextOffset ?? ""}:${segment.thinking?.length ?? 0}`).join(","),
   ].join("|");
 }
 
@@ -410,7 +412,7 @@ export function ChatView() {
     resizeComposerEl(sessionTextareaRef.current);
     resizeComposerEl(emptyTextareaRef.current);
   }, [resizeComposerEl]);
-  useEffect(() => {
+  useLayoutEffect(() => {
     resizeComposer();
   }, [inputText, resizeComposer]);
   useEffect(() => {
@@ -587,6 +589,10 @@ export function ChatView() {
   // Seeded from the active session when switching chats; changes persist to
   // the session so they survive reloads.
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("default");
+  const [resolvedReasoningSupport, setResolvedReasoningSupport] = useState<{
+    key: string;
+    support: ModelReasoningSupport | null;
+  } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
   const [selectedChildMap, setSelectedChildMap] = useState<
@@ -1641,6 +1647,10 @@ export function ChatView() {
           reasoning: ctrl.streamingReasoning || undefined,
           activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
           reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          workStartedAt: ctrl.workStartedAt,
+          workEndedAt: ctrl.workEndedAt,
+          workDurationMs: ctrl.workDurationMs,
+          workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
           artifacts: ctrl.artifacts.length ? [...ctrl.artifacts] : undefined,
           files: ctrl.files.length ? [...ctrl.files] : undefined,
         });
@@ -1662,6 +1672,16 @@ export function ChatView() {
         });
       } finally {
         clearInterval(saveInterval);
+        updateMessage(sessionId, assistantMsg.id, {
+          content: ctrl.streamingContent,
+          reasoning: ctrl.streamingReasoning || undefined,
+          activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+          reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          workStartedAt: ctrl.workStartedAt,
+          workEndedAt: ctrl.workEndedAt,
+          workDurationMs: ctrl.workDurationMs,
+          workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
+        });
         inProgressMsgIds.current.delete(sessionId);
       }
 
@@ -1683,6 +1703,10 @@ export function ChatView() {
           reasoning: result.reasoning || undefined,
           activities: result.activities,
           reasoningStreams: result.reasoningStreams,
+          workStartedAt: result.workStartedAt,
+          workEndedAt: result.workEndedAt,
+          workDurationMs: result.workDurationMs,
+          workSegments: result.workSegments,
           artifacts: result.artifacts?.length ? result.artifacts : undefined,
           files: result.files?.length ? result.files : undefined,
         });
@@ -1960,6 +1984,10 @@ export function ChatView() {
           reasoning: ctrl.streamingReasoning || undefined,
           activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
           reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          workStartedAt: ctrl.workStartedAt,
+          workEndedAt: ctrl.workEndedAt,
+          workDurationMs: ctrl.workDurationMs,
+          workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
         });
       }, 2500);
 
@@ -1978,6 +2006,16 @@ export function ChatView() {
         });
       } finally {
         clearInterval(saveInterval);
+        updateMessage(activeSessionId, assistantMsg.id, {
+          content: ctrl.streamingContent,
+          reasoning: ctrl.streamingReasoning || undefined,
+          activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+          reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          workStartedAt: ctrl.workStartedAt,
+          workEndedAt: ctrl.workEndedAt,
+          workDurationMs: ctrl.workDurationMs,
+          workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
+        });
         inProgressMsgIds.current.delete(activeSessionId);
       }
 
@@ -1988,6 +2026,10 @@ export function ChatView() {
           reasoning: result.reasoning || undefined,
           activities: result.activities,
           reasoningStreams: result.reasoningStreams,
+          workStartedAt: result.workStartedAt,
+          workEndedAt: result.workEndedAt,
+          workDurationMs: result.workDurationMs,
+          workSegments: result.workSegments,
         });
       } else {
         deleteMessage(activeSessionId, assistantMsg.id);
@@ -2080,6 +2122,10 @@ export function ChatView() {
           reasoning: ctrl.streamingReasoning || undefined,
           activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
           reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          workStartedAt: ctrl.workStartedAt,
+          workEndedAt: ctrl.workEndedAt,
+          workDurationMs: ctrl.workDurationMs,
+          workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
         });
       }, 2500);
 
@@ -2098,6 +2144,16 @@ export function ChatView() {
         });
       } finally {
         clearInterval(saveInterval);
+        updateMessage(activeSessionId, assistantMsg.id, {
+          content: ctrl.streamingContent,
+          reasoning: ctrl.streamingReasoning || undefined,
+          activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+          reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          workStartedAt: ctrl.workStartedAt,
+          workEndedAt: ctrl.workEndedAt,
+          workDurationMs: ctrl.workDurationMs,
+          workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
+        });
         inProgressMsgIds.current.delete(activeSessionId);
       }
 
@@ -2108,6 +2164,10 @@ export function ChatView() {
           reasoning: result.reasoning || undefined,
           activities: result.activities,
           reasoningStreams: result.reasoningStreams,
+          workStartedAt: result.workStartedAt,
+          workEndedAt: result.workEndedAt,
+          workDurationMs: result.workDurationMs,
+          workSegments: result.workSegments,
         });
       } else {
         deleteMessage(activeSessionId, assistantMsg.id);
@@ -2541,11 +2601,28 @@ export function ChatView() {
   const selectedModelProvider = selectedModelLabel
     ? providers.find((p) => p.id === selectedModelLabel.providerId)
     : undefined;
-  // models.dev thinking support for the selected model (cached catalog; the
-  // warm-up effect above re-renders once the catalog resolves).
+  const selectedReasoningKey = selectedModelLabel && selectedModelProvider
+    ? `${selectedModelProvider.id}:${selectedModelLabel.name}`
+    : "";
+  useEffect(() => {
+    let current = true;
+    setResolvedReasoningSupport(null);
+    if (!selectedModelLabel || !selectedModelProvider) return () => { current = false; };
+    void getModelReasoning(selectedModelProvider, selectedModelLabel.name)
+      .then((support) => {
+        if (current) setResolvedReasoningSupport({ key: selectedReasoningKey, support });
+      })
+      .catch(() => {});
+    return () => { current = false; };
+  }, [selectedReasoningKey, selectedModelLabel?.name, selectedModelProvider]);
+
+  // Prefer provider-native capabilities when available (Anthropic publishes
+  // them with its model list), then use the models.dev catalog and fallbacks.
   const reasoningSupport =
     selectedModelLabel && selectedModelProvider
-      ? getModelReasoningSync(selectedModelProvider, selectedModelLabel.name)
+      ? (resolvedReasoningSupport?.key === selectedReasoningKey
+          ? resolvedReasoningSupport.support
+          : getModelReasoningSync(selectedModelProvider, selectedModelLabel.name))
       : null;
 
   /** Attached files whose type the selected model can't read (models.dev). */
@@ -2573,53 +2650,187 @@ export function ChatView() {
     );
   };
 
-  // The model's real thinking options (models.dev reasoning_options): a
-  // Default (send nothing) plus the effort values it accepts, with "None"
-  // added for toggle-capable models when the scale doesn't include it.
+  // A discrete slider uses only the effort values published for this model.
+  // A separate off position is offered only for known toggle API dialects.
   const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = (() => {
-    if (!reasoningSupport) {
-      // Catalog miss (e.g. offline first launch): keep the legacy generic list.
-      return [
-        { value: "default", label: "Default" },
-        { value: "low", label: "Low" },
-        { value: "medium", label: "Medium" },
-        { value: "high", label: "High" },
-      ];
-    }
+    if (!reasoningSupport?.reasoning) return [];
     const opts: Array<{ value: ReasoningEffort; label: string }> = [
       { value: "default", label: "Default" },
     ];
     const values = [...reasoningSupport.efforts];
-    if (reasoningSupport.toggle && !values.includes("none")) values.push("none");
+    if (
+      reasoningSupport.toggle &&
+      reasoningToggleProtocolForBaseUrl(selectedModelProvider?.baseUrl ?? "", selectedModelLabel?.name ?? "") &&
+      !values.includes("none")
+    ) values.push("none");
     values.sort((a, b) => reasoningEffortRank(a) - reasoningEffortRank(b));
     for (const v of values) opts.push({ value: v, label: reasoningLabel(v) });
-    // A value carried over from another model stays visible (marked) so the
-    // user can see what the session holds — and fix it.
-    if (reasoningEffort !== "default" && !opts.some((o) => o.value === reasoningEffort)) {
-      opts.push({
-        value: reasoningEffort,
-        label: `${reasoningLabel(reasoningEffort)} (unsupported)`,
-      });
-    }
     return opts;
   })();
+  const thinkingBudget = reasoningSupport?.thinkingBudget;
+  const requestedBudgetMatch = reasoningEffort.match(/^budget:(\d+)$/);
+  const requestedBudget = requestedBudgetMatch ? Number(requestedBudgetMatch[1]) : undefined;
+  const selectedBudget = thinkingBudget && requestedBudget !== undefined
+    ? Math.max(thinkingBudget.min, Math.min(thinkingBudget.max, requestedBudget))
+    : undefined;
+  const hasBudgetToggle = Boolean(
+    thinkingBudget &&
+    reasoningSupport?.toggle &&
+    reasoningToggleProtocolForBaseUrl(selectedModelProvider?.baseUrl ?? "", selectedModelLabel?.name ?? ""),
+  );
+  const budgetSliderMin = hasBudgetToggle ? -2 : -1;
+  const budgetSliderValue = reasoningEffort === "none" && hasBudgetToggle
+    ? -2
+    : selectedBudget !== undefined && thinkingBudget
+      ? Math.round(((selectedBudget - thinkingBudget.min) / (thinkingBudget.max - thinkingBudget.min)) * 100)
+      : -1;
+  const budgetDisplay = selectedBudget !== undefined
+    ? `${selectedBudget.toLocaleString()} tokens`
+    : reasoningEffort === "none" && hasBudgetToggle
+      ? "Off"
+      : "Default";
+  const selectedReasoningEffort = reasoningOptions.some((option) => option.value === reasoningEffort)
+    ? reasoningEffort
+    : reasoningOptions.find(
+        (option) => option.value === sanitizeReasoningEffort(reasoningEffort, reasoningSupport),
+      )?.value ?? "default";
+  const selectedReasoningIndex = Math.max(
+    0,
+    reasoningOptions.findIndex((option) => option.value === selectedReasoningEffort),
+  );
+  const effortSliderPercent = reasoningOptions.length > 1
+    ? (selectedReasoningIndex / (reasoningOptions.length - 1)) * 100
+    : 0;
+  const budgetSliderPercent = ((budgetSliderValue - budgetSliderMin) / (100 - budgetSliderMin)) * 100;
+  const sliderLabelStyle = (percent: number) => ({
+    left: `${percent}%`,
+    transform: percent <= 8 ? "translateX(0)" : percent >= 92 ? "translateX(-100%)" : "translateX(-50%)",
+  });
 
-  const thinkingDisclaimer =
-    reasoningSupport && !isReasoningEffortSupported(reasoningSupport, reasoningEffort) ? (
-      <div className="mb-2 flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
-        <TriangleAlert className="mt-px size-3.5 shrink-0" />
-        <span>
-          Thinking "{reasoningLabel(reasoningEffort)}" isn't supported by{" "}
-          {selectedModelLabel ? modelNameFor(selectedModelLabel) : "this model"} — the run will
-          use{" "}
-          {(() => {
-            const fallback = sanitizeReasoningEffort(reasoningEffort, reasoningSupport);
-            return fallback ? `"${reasoningLabel(fallback)}"` : "the provider default";
-          })()}
-          .
-        </span>
-      </div>
-    ) : null;
+  const changeReasoningEffort = (effort: ReasoningEffort) => {
+    setReasoningEffort(effort);
+    if (activeSessionId) {
+      void updateSession(activeSessionId, { reasoning_effort: effort });
+    }
+  };
+
+  const reasoningSupportLoaded = resolvedReasoningSupport?.key === selectedReasoningKey;
+  const reasoningSupportLoading = Boolean(
+    selectedModelLabel && selectedModelProvider && !reasoningSupport && !reasoningSupportLoaded,
+  );
+  const thinkingControl = (
+    <div
+      className="min-w-72 shrink-0 bg-popover px-3 py-2.5"
+      aria-label="Thinking effort"
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      {reasoningSupportLoading ? (
+        <p className="mt-2 text-xs text-muted-foreground">Checking this model’s supported options…</p>
+      ) : !reasoningSupport ? (
+        <p className="mt-2 text-xs text-muted-foreground">Thinking options are unavailable for this model.</p>
+      ) : !reasoningSupport.reasoning ? (
+        <p className="mt-2 text-xs text-muted-foreground">This model does not support configurable thinking.</p>
+      ) : reasoningSupport.budgetTokens && !thinkingBudget ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          This model supports a thinking budget, but the catalog does not publish a safe slider range.
+        </p>
+      ) : reasoningSupport.efforts.length === 0 && !reasoningSupport.toggle && !thinkingBudget ? (
+        <p className="mt-2 text-xs text-muted-foreground">Thinking is always on for this model.</p>
+      ) : thinkingBudget ? (
+        <>
+          <div className="relative pb-5 pt-2">
+          <input
+            aria-label="Thinking token budget"
+            aria-valuetext={budgetDisplay}
+            className="thinking-effort-slider w-full cursor-pointer"
+            type="range"
+            min={budgetSliderMin}
+            max={100}
+            step={1}
+            value={budgetSliderValue}
+            style={{ background: `linear-gradient(to right, #3b82f6 0%, #3b82f6 ${budgetSliderPercent}%, var(--muted) ${budgetSliderPercent}%, var(--muted) 100%)` }}
+            onChange={(event) => {
+              const value = Number(event.currentTarget.value);
+              if (value === -2 && hasBudgetToggle) {
+                changeReasoningEffort("none");
+              } else if (value === -1) {
+                changeReasoningEffort("default");
+              } else {
+                const tokens = Math.round(
+                  thinkingBudget.min + (value / 100) * (thinkingBudget.max - thinkingBudget.min),
+                );
+                changeReasoningEffort(`budget:${tokens}`);
+              }
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") event.stopPropagation();
+            }}
+          />
+          <div className="pointer-events-none absolute inset-x-0 top-full -mt-4 text-xs text-muted-foreground" aria-live="polite">
+            <span className="absolute whitespace-nowrap" style={sliderLabelStyle(budgetSliderPercent)}>{budgetDisplay}</span>
+          </div>
+          </div>
+        </>
+      ) : reasoningOptions.length <= 1 ? (
+        <p className="mt-2 text-xs text-muted-foreground">This provider does not expose a compatible thinking toggle.</p>
+      ) : (
+        <>
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-xs font-medium text-muted-foreground">Thinking effort</span>
+            <span className="text-sm font-medium text-blue-500">
+              {reasoningOptions[selectedReasoningIndex]?.label}
+            </span>
+          </div>
+          <div className="relative mx-4 pb-5 pt-2">
+          <div className="thinking-effort-track" aria-hidden="true">
+            <span
+              className="thinking-effort-fill"
+              style={{ width: `${effortSliderPercent}%` }}
+            />
+          </div>
+          <input
+            aria-label="Thinking effort level"
+            aria-valuetext={reasoningOptions[selectedReasoningIndex]?.label}
+            className="thinking-effort-slider is-snap thinking-effort-level-slider w-full cursor-pointer"
+            type="range"
+            min={0}
+            max={reasoningOptions.length - 1}
+            step={1}
+            value={selectedReasoningIndex}
+            style={{ background: "transparent" }}
+            onChange={(event) => {
+              const option = reasoningOptions[Number(event.currentTarget.value)];
+              if (option) changeReasoningEffort(option.value);
+            }}
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") event.stopPropagation();
+            }}
+          />
+          <div className="thinking-effort-dots" aria-hidden="true">
+            {reasoningOptions.slice(1, -1).map((option, offset) => {
+              const index = offset + 1;
+              return (
+                <span
+                  key={option.value}
+                  className="thinking-effort-dot"
+                  style={{ left: `${(index / (reasoningOptions.length - 1)) * 100}%` }}
+                />
+              );
+            })}
+          </div>
+          <span
+            className="thinking-effort-thumb"
+            style={{ left: `${effortSliderPercent}%` }}
+            aria-hidden="true"
+          />
+          <div className="pointer-events-none absolute inset-x-0 top-full -mt-4 text-xs text-muted-foreground" aria-live="polite">
+            <span className="absolute whitespace-nowrap" style={sliderLabelStyle(effortSliderPercent)}>{reasoningOptions[selectedReasoningIndex]?.label}</span>
+          </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
 
   const attachmentDisclaimer = unsupportedAttachments.length > 0 ? (
     <div className="mb-2 flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
@@ -2638,7 +2849,6 @@ export function ChatView() {
   const composerDisclaimers = (
     <>
       {attachmentDisclaimer}
-      {thinkingDisclaimer}
     </>
   );
 
@@ -2661,18 +2871,19 @@ export function ChatView() {
               ? modelNameFor(selectedModelLabel)
               : "Select model"}
           </span>
-          {["high", "xhigh", "max"].includes(reasoningEffort) && (
+          {["high", "xhigh", "max"].includes(selectedReasoningEffort) && (
             <SignalHigh className="size-3.5 shrink-0 text-red-500" />
           )}
-          {reasoningEffort === "medium" && (
+          {selectedReasoningEffort === "medium" && (
             <SignalMedium className="size-3.5 shrink-0 text-yellow-500" />
           )}
-          {["low", "minimal"].includes(reasoningEffort) && (
+          {["low", "minimal"].includes(selectedReasoningEffort) && (
             <SignalLow className="size-3.5 shrink-0 text-green-500" />
           )}
         </button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="min-w-56">
+      <DropdownMenuContent side="top" avoidCollisions={false} align="end" className="flex min-w-72 flex-col overflow-hidden">
+        <div className="min-h-0 flex-1 overflow-y-auto">
         {allModels.length === 0 ? (
           <DropdownMenuItem disabled>
             No models — add a provider in Settings
@@ -2691,38 +2902,9 @@ export function ChatView() {
             </DropdownMenuItem>
           ))
         )}
-        <DropdownMenuSeparator />
-        <DropdownMenuSub>
-          <DropdownMenuSubTrigger>
-            <span>Thinking</span>
-          </DropdownMenuSubTrigger>
-          <DropdownMenuSubContent>
-            {reasoningSupport && !reasoningSupport.reasoning ? (
-              <DropdownMenuItem disabled>No thinking options for this model</DropdownMenuItem>
-            ) : reasoningSupport &&
-              reasoningSupport.efforts.length === 0 &&
-              !reasoningSupport.toggle ? (
-              <DropdownMenuItem disabled>Thinking is always on</DropdownMenuItem>
-            ) : (
-              reasoningOptions.map((opt) => (
-                <DropdownMenuItem
-                  key={opt.value}
-                  onSelect={() => {
-                    setReasoningEffort(opt.value);
-                    if (activeSessionId) {
-                      void updateSession(activeSessionId, { reasoning_effort: opt.value });
-                    }
-                  }}
-                >
-                  <span>{opt.label}</span>
-                  {reasoningEffort === opt.value && (
-                    <Check className="ml-auto size-3.5" />
-                  )}
-                </DropdownMenuItem>
-              ))
-            )}
-          </DropdownMenuSubContent>
-        </DropdownMenuSub>
+        </div>
+        <DropdownMenuSeparator className="shrink-0" />
+        {thinkingControl}
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -2940,6 +3122,10 @@ export function ChatView() {
                   activities={msg.activities}
                   reasoning={msg.reasoning}
                   reasoningStreams={msg.reasoningStreams}
+                  workStartedAt={msg.workStartedAt}
+                  workEndedAt={msg.workEndedAt}
+                  workDurationMs={msg.workDurationMs}
+                  workSegments={msg.workSegments}
                   onOpenArtifact={handleOpenArtifactFromContent}
                 />
               )}
@@ -3111,7 +3297,7 @@ export function ChatView() {
       open={sidebarOpen}
       onOpenChange={setSidebarOpen}
       className="relative h-dvh min-h-0 overflow-hidden bg-sidebar"
-      style={{ "--sidebar-width-icon": "3rem" } as React.CSSProperties}
+      style={{ "--sidebar-width-icon": "1px" } as React.CSSProperties}
     >
       <AppSidebar
         sessions={sessions}
@@ -3167,16 +3353,95 @@ export function ChatView() {
         onSignOut={handleAccountSignOut}
       />
 
-      <SidebarTrigger
-        className="fixed left-18 top-1.5 z-50 size-4.5 [&_svg]:size-3 hover:bg-accent hover:text-accent-foreground peer-data-[state=expanded]:text-sidebar-foreground peer-data-[state=expanded]:hover:bg-sidebar-accent peer-data-[state=expanded]:hover:text-sidebar-accent-foreground"
-        onClick={() => {
-          if (artifactPanel && artifactWindowMode !== "minimized") {
-            setArtifactWindowMode("minimized");
-          }
-        }}
-      />
+      <div className="fixed left-21 top-[11.75px] z-50 flex items-center gap-1 text-neutral-400 dark:text-neutral-500">
+        <SidebarTrigger
+          className="h-5 w-5 rounded-sm p-3 [&_svg]:size-3.5 text-neutral-500 hover:bg-accent hover:text-zinc-800 dark:hover:bg-accent dark:hover:text-zinc-400"
+          onClick={() => {
+            if (artifactPanel && artifactWindowMode !== "minimized") {
+              setArtifactWindowMode("minimized");
+            }
+          }}
+        />
+        {!sidebarOpen && (
+          <>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 gap-1.5 rounded-md px-1 text-xs text-neutral-500 hover:bg-accent hover:text-zinc-800 dark:text-neutral-400 dark:hover:bg-accent dark:hover:text-white [&_svg]:size-3.5"
+              onClick={handleNewChat}
+            >
+              <SquarePen />
+              New Chat
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 gap-1.5 rounded-md px-1 text-xs text-neutral-500 hover:bg-accent hover:text-zinc-800 dark:text-neutral-400 dark:hover:bg-accent dark:hover:text-white [&_svg]:size-3.5"
+                  aria-label="Switch between Chat and Agents"
+                >
+                  {activeTab === "chat" ? (
+                    <MessageCircle />
+                  ) : (
+                    <Bot />
+                  )}
+                  {activeTab === "chat" ? "Chat" : "Agents"}
+                  <ChevronDown className="ml-0.5 opacity-70" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent className="min-w-32 rounded-md" side="bottom" align="start">
+                <DropdownMenuItem onClick={() => switchTab("chat")}>
+                  <MessageCircle className="size-3.5" />
+                  Chat
+                </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => switchTab("agent")}>
+                  <Bot className="size-3.5" />
+                  Agents
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </>
+        )}
+        {/*<Button*/}
+        {/*  variant="ghost"*/}
+        {/*  size="icon-xs"*/}
+        {/*  className={cn(*/}
+        {/*    "size-5 rounded-md p-0 transition-opacity duration-150 [&_svg]:size-4 hover:bg-accent hover:text-black dark:hover:bg-accent dark:hover:text-white",*/}
+        {/*    sidebarOpen ? "opacity-100" : "pointer-events-none opacity-0",*/}
+        {/*  )}*/}
+        {/*  aria-label="Undo"*/}
+        {/*  title="Undo"*/}
+        {/*  aria-keyshortcuts="Meta+Z"*/}
+        {/*  aria-hidden={!sidebarOpen}*/}
+        {/*  tabIndex={sidebarOpen ? 0 : -1}*/}
+        {/*  style={{ transitionDelay: sidebarOpen ? "200ms" : "0ms" }}*/}
+        {/*  onMouseDown={(event) => event.preventDefault()}*/}
+        {/*  onClick={() => document.execCommand("undo")}*/}
+        {/*>*/}
+        {/*  <ArrowLeft strokeWidth={2.5} />*/}
+        {/*</Button>*/}
+        {/*<Button*/}
+        {/*  variant="ghost"*/}
+        {/*  size="icon-xs"*/}
+        {/*  className={cn(*/}
+        {/*    "size-5 rounded-md p-0 transition-opacity duration-150 [&_svg]:size-4 hover:bg-accent hover:text-black dark:hover:bg-accent dark:hover:text-white",*/}
+        {/*    sidebarOpen ? "opacity-100" : "pointer-events-none opacity-0",*/}
+        {/*  )}*/}
+        {/*  aria-label="Redo"*/}
+        {/*  title="Redo"*/}
+        {/*  aria-keyshortcuts="Meta+Shift+Z"*/}
+        {/*  aria-hidden={!sidebarOpen}*/}
+        {/*  tabIndex={sidebarOpen ? 0 : -1}*/}
+        {/*  style={{ transitionDelay: sidebarOpen ? "200ms" : "0ms" }}*/}
+        {/*  onMouseDown={(event) => event.preventDefault()}*/}
+        {/*  onClick={() => document.execCommand("redo")}*/}
+        {/*>*/}
+        {/*  <ArrowRight strokeWidth={2.5} />*/}
+        {/*</Button>*/}
+      </div>
 
-      <SidebarInset className="mt-2 mr-2 mb-2 overflow-hidden rounded-md shadow-sm border-1">
+      <SidebarInset className="m-2 overflow-hidden rounded-lg shadow-sm border-1">
         {view === "connectors" ? (
           <div
             key="connectors-view"
@@ -3475,7 +3740,7 @@ export function ChatView() {
                       handleNewChat();
                     }}
                   >
-                    <Plus />
+                    <SquarePen />
                     New Chat
                   </Button>
                 </div>
@@ -3688,7 +3953,11 @@ export function ChatView() {
 
         <div className="flex min-h-0 flex-1 flex-col">
         {(activeSession && (!isAgentTab || agentConsoleFocus === "session")) ? (
-          <div ref={sessionContainerRef} className="relative flex min-h-0 flex-1 gap-2 overflow-hidden p-2">
+          <div
+            key={activeSessionId}
+            ref={sessionContainerRef}
+            className="relative flex min-h-0 flex-1 gap-2 overflow-hidden p-2 animate-in fade-in duration-200 motion-reduce:animate-none"
+          >
             <ConversationSearch
               open={findOpen}
               onOpenChange={setFindOpen}
@@ -3728,18 +3997,19 @@ export function ChatView() {
                           >
                             <Message>
                               <MessageContent>
-                                {agent?.streamingContent ||
-                                agent?.streamingReasoning ||
-                                agent?.activities.length > 0 ? (
-                                  <>
-                                    <MessageStream
-                                      content={agent?.streamingContent}
-                                      activities={agent?.activities}
-                                      reasoning={agent?.streamingReasoning}
-                                      reasoningStreams={agent?.reasoningStreams}
-                                      todos={agentTaskView ? undefined : agent?.todos}
-                                      live
-                                    />
+                                <>
+                                  <MessageStream
+                                    content={agent?.streamingContent ?? ""}
+                                    activities={agent?.activities}
+                                    reasoning={agent?.streamingReasoning}
+                                    reasoningStreams={agent?.reasoningStreams}
+                                    workStartedAt={agent?.workStartedAt}
+                                    workEndedAt={agent?.workEndedAt}
+                                    workDurationMs={agent?.workDurationMs}
+                                    workSegments={agent?.workSegments}
+                                    todos={agentTaskView ? undefined : agent?.todos}
+                                    live
+                                  />
                                     {(agent?.files ?? []).length > 0 && (
                                       <div className="mb-1 flex flex-col gap-1.5">
                                         {agent.files.map((f) => (
@@ -3778,24 +4048,7 @@ export function ChatView() {
                                         ))}
                                       </div>
                                     )}
-                                    <div
-                                      className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground"
-                                      role="status"
-                                    >
-                                      <Loader2 className="size-3.5 animate-spin" />
-                                      <span className="shimmer">Working…</span>
-                                    </div>
-                                  </>
-                                ) : (
-                                  <Marker role="status">
-                                    <MarkerIcon>
-                                      <Spinner />
-                                    </MarkerIcon>
-                                    <MarkerContent className="shimmer">
-                                      Thinking…
-                                    </MarkerContent>
-                                  </Marker>
-                                )}
+                                </>
                               </MessageContent>
                             </Message>
                           </MessageScrollerItem>
@@ -5029,6 +5282,10 @@ export function ChatView() {
           reasoning: ctrl.streamingReasoning || undefined,
           activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
           reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          workStartedAt: ctrl.workStartedAt,
+          workEndedAt: ctrl.workEndedAt,
+          workDurationMs: ctrl.workDurationMs,
+          workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
           artifacts: ctrl.artifacts.length ? [...ctrl.artifacts] : undefined,
           files: ctrl.files.length ? [...ctrl.files] : undefined,
         });
@@ -5051,6 +5308,16 @@ export function ChatView() {
         });
       } finally {
         clearInterval(saveInterval);
+        updateMessage(newSession.id, assistantMsg.id, {
+          content: ctrl.streamingContent,
+          reasoning: ctrl.streamingReasoning || undefined,
+          activities: ctrl.activities.length ? [...ctrl.activities] : undefined,
+          reasoningStreams: ctrl.reasoningStreams.length ? [...ctrl.reasoningStreams] : undefined,
+          workStartedAt: ctrl.workStartedAt,
+          workEndedAt: ctrl.workEndedAt,
+          workDurationMs: ctrl.workDurationMs,
+          workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
+        });
         inProgressMsgIds.current.delete(newSession.id);
       }
 
@@ -5066,6 +5333,10 @@ export function ChatView() {
           reasoning: result.reasoning || undefined,
           activities: result.activities,
           reasoningStreams: result.reasoningStreams,
+          workStartedAt: result.workStartedAt,
+          workEndedAt: result.workEndedAt,
+          workDurationMs: result.workDurationMs,
+          workSegments: result.workSegments,
           artifacts: result.artifacts?.length ? result.artifacts : undefined,
           files: result.files?.length ? result.files : undefined,
         });

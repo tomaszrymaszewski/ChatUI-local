@@ -20,19 +20,19 @@ export const BUILTIN_PROVIDERS: BuiltinProvider[] = [
   },
   {
     key: "claude",
-    name: "Claude (Anthropic)",
+    name: "Claude",
     baseUrl: "https://api.anthropic.com/v1",
     requiresApiKey: true,
   },
   {
     key: "chatgpt",
-    name: "ChatGPT (OpenAI)",
+    name: "ChatGPT",
     baseUrl: "https://api.openai.com/v1",
     requiresApiKey: true,
   },
   {
     key: "gemini",
-    name: "Gemini (Google)",
+    name: "Gemini",
     baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai",
     requiresApiKey: true,
   },

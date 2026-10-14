@@ -8,6 +8,7 @@
 // path (branch switch, deleted message) is silently ignored.
 
 import { getProviderApiKey } from "@/lib/llm";
+import { completeAnthropicMessage, isAnthropicProvider } from "@/lib/providers/anthropic";
 import type { Provider } from "@/types";
 import type { AgentMessage } from "@/lib/agent/runtime";
 
@@ -129,6 +130,18 @@ export async function summarizeConversation(
 ): Promise<string> {
   if (!transcript.trim()) return "";
   const apiKey = await getProviderApiKey(provider.id);
+  if (isAnthropicProvider(provider.baseUrl)) {
+    return completeAnthropicMessage(
+      apiKey,
+      provider.baseUrl,
+      modelName,
+      [
+        { role: "system", content: SUMMARY_SYSTEM_PROMPT },
+        { role: "user", content: "Summarize the conversation below.\n\n" + transcript },
+      ],
+      2048,
+    );
+  }
   const url = `${provider.baseUrl.replace(/\/$/, "")}/chat/completions`;
 
   const request = (maxField: string) =>

@@ -45,8 +45,8 @@ import { ensureBrowserAsyncLocalStorage } from "@/lib/agent/browser-als-shim";
  * write_local_file) are the sandboxed Tauri-backed ones, so hide the
  * built-ins — otherwise the model sees two file toolsets and the sandbox can
  * be bypassed. Registration merges (set union) with the library's own
- * profiles; our models are all ChatOpenAI instances (hint "openai"), the
- * other hints are covered for safety.
+ * profiles; OpenAI-compatible providers use ChatOpenAI and direct Claude uses
+ * ChatAnthropic, so both harness hints are registered here.
  *
  * read_file is the exception: deepagents force-re-adds it (it is required by
  * the skills middleware's read-on-demand flow) and StateBackend reads are

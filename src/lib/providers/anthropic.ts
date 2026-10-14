@@ -35,8 +35,28 @@ interface AnthropicContentBlock {
   source?: { type: string; media_type: string; data: string };
 }
 
+export interface AnthropicModelInfo {
+  id: string;
+  display_name?: string;
+  capabilities?: {
+    effort?: Record<string, { supported?: boolean } | undefined>;
+    [key: string]: unknown;
+  } | null;
+}
+
 function isAnthropicProvider(baseUrl: string): boolean {
   return baseUrl.includes("anthropic.com");
+}
+
+function anthropicHeaders(apiKey: string, json = false): Record<string, string> {
+  return {
+    ...(json ? { "Content-Type": "application/json" } : {}),
+    "x-api-key": apiKey,
+    "anthropic-version": "2023-06-01",
+    // These requests run from the app's WebView. Anthropic requires this
+    // explicit opt-in header for direct browser-origin API calls.
+    "anthropic-dangerous-direct-browser-access": "true",
+  };
 }
 
 function toAnthropicContent(content: string | ContentPart[]): string | AnthropicContentBlock[] {
@@ -136,11 +156,7 @@ export async function* streamAnthropicCompletion(
   systemPrompt: string | null,
 ): AsyncGenerator<StreamChunk> {
   const url = `${baseUrl.replace(/\/$/, "")}/messages`;
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    "x-api-key": apiKey,
-    "anthropic-version": "2023-06-01",
-  };
+  const headers = anthropicHeaders(apiKey, true);
 
   let currentMessages = [...messages];
   const anthropicTools = tools && tools.length > 0 ? convertTools(tools) : undefined;
@@ -288,3 +304,78 @@ export async function* streamAnthropicCompletion(
 }
 
 export { isAnthropicProvider };
+
+/** Load the models visible to this API key, including their published capabilities. */
+export async function fetchAnthropicModels(
+  apiKey: string,
+  baseUrl: string,
+): Promise<AnthropicModelInfo[]> {
+  const base = baseUrl.replace(/\/$/, "");
+  const models: AnthropicModelInfo[] = [];
+  let afterId: string | undefined;
+
+  for (let page = 0; page < 10; page += 1) {
+    const url = new URL(`${base}/models`);
+    url.searchParams.set("limit", "1000");
+    if (afterId) url.searchParams.set("after_id", afterId);
+
+    const response = await fetch(url, {
+      headers: anthropicHeaders(apiKey),
+    });
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(
+        `Anthropic model lookup failed (${response.status}): ${errorText || response.statusText}`,
+      );
+    }
+
+    const data = await response.json() as {
+      data?: AnthropicModelInfo[];
+      has_more?: boolean;
+      last_id?: string | null;
+    };
+    models.push(...(Array.isArray(data.data) ? data.data.filter((model) => typeof model.id === "string") : []));
+    if (!data.has_more || !data.last_id || data.last_id === afterId) break;
+    afterId = data.last_id;
+  }
+
+  return models;
+}
+
+/** Make a one-shot Messages API request for small app-generated prompts. */
+export async function completeAnthropicMessage(
+  apiKey: string,
+  baseUrl: string,
+  model: string,
+  messages: Array<{ role: "system" | "user" | "assistant"; content: string }>,
+  maxTokens: number,
+): Promise<string> {
+  const { system, messages: converted } = convertMessages(
+    messages.map((message) => ({ ...message })),
+  );
+  const body: Record<string, unknown> = {
+    model,
+    max_tokens: maxTokens,
+    messages: converted,
+  };
+  if (system) body.system = system;
+
+  const response = await fetch(baseUrl.replace(/\/$/, "") + "/messages", {
+    method: "POST",
+    headers: anthropicHeaders(apiKey, true),
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      "Anthropic API error (" + response.status + "): " + (errorText || response.statusText),
+    );
+  }
+
+  const data = await response.json() as { content?: AnthropicContentBlock[] };
+  return (data.content ?? [])
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .join("")
+    .trim();
+}

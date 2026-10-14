@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import type { Message } from "@/types";
-import type { ActivityItem, ReasoningStream, SharedFile } from "@/lib/agent/types";
+import type { ActivityItem, ReasoningStream, SharedFile, WorkSegment } from "@/lib/agent/types";
 import type { Artifact } from "@/lib/artifacts";
 import { deleteFileBlob } from "@/lib/attachment-store";
 import { evictRebuildableCaches } from "@/lib/storage-pressure";
@@ -37,10 +37,15 @@ export function loadMessages(sessionId: string): Message[] {
       is_temporary?: boolean;
       reasoning?: string;
       reasoningStreams?: ReasoningStream[];
+      workStartedAt?: number;
+      workEndedAt?: number;
+      workDurationMs?: number;
+      workSegments?: WorkSegment[];
       activities?: ActivityItem[];
       artifacts?: Artifact[];
       files?: SharedFile[];
     }>;
+    const recoveredAt = Date.now();
     return data.map((m) => ({
       id: m.id,
       role: m.role as Message["role"],
@@ -53,6 +58,12 @@ export function loadMessages(sessionId: string): Message[] {
       is_temporary: m.is_temporary ?? false,
       reasoning: m.reasoning,
       reasoningStreams: m.reasoningStreams,
+      workStartedAt: m.workStartedAt,
+      workEndedAt: m.workEndedAt ?? (m.workStartedAt !== undefined ? recoveredAt : undefined),
+      workDurationMs: m.workDurationMs ?? (m.workStartedAt !== undefined ? Math.max(0, (m.workEndedAt ?? recoveredAt) - m.workStartedAt) : undefined),
+      workSegments: m.workSegments?.map((segment) => segment.endedAt === undefined
+        ? { ...segment, endedAt: recoveredAt, endTextOffset: m.content.length }
+        : segment),
       artifacts: m.artifacts,
       files: m.files,
       // A message loaded from storage is never mid-run, so any activity that was
@@ -90,6 +101,10 @@ function serializeMessages(messages: Message[]) {
       is_temporary: m.is_temporary,
       reasoning: m.reasoning,
       reasoningStreams: m.reasoningStreams,
+      workStartedAt: m.workStartedAt,
+      workEndedAt: m.workEndedAt,
+      workDurationMs: m.workDurationMs,
+      workSegments: m.workSegments,
       activities: m.activities,
       artifacts: m.artifacts,
       files: m.files,
@@ -202,7 +217,7 @@ export function appendMessageHeadless(sessionId: string, msg: Message) {
 export function updateMessageHeadless(
   sessionId: string,
   messageId: string,
-  updates: Partial<Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts" | "files">>,
+  updates: Partial<Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts" | "files" | "workStartedAt" | "workEndedAt" | "workDurationMs" | "workSegments">>,
 ) {
   const loaded = loadMessages(sessionId);
   if (!loaded.some((m) => m.id === messageId)) return;
@@ -285,7 +300,7 @@ export function useMessages(sessionId: string | null) {
       sessionId: string,
       messageId: string,
       updates: Partial<
-        Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts" | "files">
+        Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts" | "files" | "workStartedAt" | "workEndedAt" | "workDurationMs" | "workSegments">
       >,
     ) => {
       setMessages((prev) => {

@@ -9,6 +9,7 @@ const SESSIONS_EVENT = "chatui:sessions-changed";
 export interface StoredSession {
   id: string;
   title: string;
+  createdAt?: string;
   updatedAt: string;
   projectId?: string;
   type: "chat" | "agent";
@@ -42,6 +43,7 @@ function loadSessions(): ChatSession[] {
     return data.map((s) => migrateSessionRecord(s)).map((s) => ({
       id: s.id,
       title: s.title,
+      createdAt: s.createdAt ? new Date(s.createdAt) : undefined,
       updatedAt: new Date(s.updatedAt),
       projectId: s.projectId,
       type: s.type,
@@ -71,6 +73,7 @@ function saveSessions(sessions: ChatSession[]) {
         sessions.map((s) => ({
           id: s.id,
           title: s.title,
+          createdAt: s.createdAt?.toISOString(),
           updatedAt: s.updatedAt.toISOString(),
           projectId: s.projectId,
           type: s.type,
@@ -107,6 +110,7 @@ export function createAgentSessionHeadless(
   const session: ChatSession = {
     id: crypto.randomUUID(),
     title,
+    createdAt: new Date(),
     updatedAt: new Date(),
     type: agentId ? "agent" : "chat",
     isTemporary: false,
@@ -196,6 +200,7 @@ export function useSessions(type: "chat" | "agent") {
       const session: ChatSession = {
         id,
         title,
+        createdAt: new Date(),
         updatedAt: new Date(),
         projectId,
         type,

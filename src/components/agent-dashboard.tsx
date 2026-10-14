@@ -35,13 +35,6 @@ import { cn } from "@/lib/utils";
 /** Composer modes: the two ways to start something from the dashboard. */
 export type DashboardComposeMode = "agent" | "session";
 
-function formatWhen(date: Date) {
-  const now = new Date();
-  const sameDay = date.toDateString() === now.toDateString();
-  if (sameDay) return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  return date.toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
 function formatBytes(bytes: number) {
   if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
@@ -232,8 +225,6 @@ export function AgentDashboard({
             ) : (
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {agents.slice(0, 5).map((agent) => {
-                  const agentSessions = sessionsByAgent.get(agent.id) ?? [];
-                  const last = agentSessions[0];
                   const running = runningCountFor(agent.id);
                   return (
                     <div
@@ -247,11 +238,11 @@ export function AgentDashboard({
                           onOpenAgentConsole(agent.id);
                         }
                       }}
-                      className="flex cursor-pointer flex-col gap-3 rounded-xl border bg-card p-4 transition-colors hover:border-foreground/20 hover:bg-muted/50"
+                      className="flex cursor-pointer flex-col gap-3 rounded-xl border bg-card p-3 transition-colors hover:border-foreground/20 hover:bg-muted/50"
                     >
-                      <div className="flex items-start gap-2.5">
+                      <div className="flex items-center gap-2.5">
                         <div className="relative shrink-0">
-                          <AgentAvatar seed={agent.id} className="size-9" />
+                          <AgentAvatar seed={agent.id} className="size-16" />
                           {running > 0 && (
                             <span className="absolute -right-0.5 -top-0.5 flex size-3 items-center justify-center rounded-full bg-emerald-500 text-emerald-50">
                               <Spinner className="size-2" />
@@ -267,18 +258,13 @@ export function AgentDashboard({
                           </span>
                         </div>
                       </div>
-                      <div className="mt-auto flex items-center justify-between pt-1 text-[10px] text-muted-foreground/80">
-                        <span>
-                          {last
-                            ? `Last used ${formatWhen(last.updatedAt)}`
-                            : "Never used"}
-                        </span>
-                        {running > 0 && (
-                          <span className="font-medium text-emerald-600 dark:text-emerald-400">
-                            {running} running
-                          </span>
-                        )}
-                      </div>
+                      {/*<div className="mt-auto flex items-center justify-between pt-1 text-[10px] text-muted-foreground/80">*/}
+                      {/*  {running > 0 && (*/}
+                      {/*    <span className="font-medium text-emerald-600 dark:text-emerald-400">*/}
+                      {/*      {running} running*/}
+                      {/*    </span>*/}
+                      {/*  )}*/}
+                      {/*</div>*/}
                     </div>
                   );
                 })}
@@ -303,16 +289,10 @@ export function AgentDashboard({
           <section className="mt-6 flex flex-col gap-3">
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-semibold">Recent sessions</h2>
-              <span className="text-xs text-muted-foreground">
-                {sessions.length === 0
-                  ? "nothing yet"
-                  : `${sessions.length} session${sessions.length === 1 ? "" : "s"}`}
-              </span>
             </div>
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {sessions.slice(0, 5).map((session) => {
                   const agent = agents.find((a) => a.id === session.agentId) ?? null;
-                  const isRunning = runningIds?.has(session.id) ?? false;
                   return (
                     <div
                       key={session.id}
@@ -334,27 +314,28 @@ export function AgentDashboard({
                         >
                           {session.title}
                         </span>
+                        {agent && (
+                            <div className="absolute bottom-2.5 right-2.5">
+                              <AgentAvatar
+                                  seed={agent.id}
+                                  className="size-5"
+                                  title={agent.name}
+                              />
+                            {/*  {isRunning && (*/}
+                            {/*      <span className="absolute -right-1 -top-1 flex size-3 items-center justify-center rounded-full bg-emerald-500 text-emerald-50">*/}
+                            {/*  <Spinner className="size-2" />*/}
+                            {/*</span>*/}
+                            {/*  )}*/}
+                            </div>
+                        )}
                         <span className="truncate text-xs leading-snug text-muted-foreground">
                           {agent ? agent.name : "Session"}
                         </span>
                       </div>
-                      <div className="mt-auto flex items-center pt-1 text-[10px] text-muted-foreground/80">
-                        <span>Updated {formatWhen(session.updatedAt)}</span>
-                      </div>
-                      {agent && (
-                        <div className="absolute bottom-2.5 right-2.5">
-                          <AgentAvatar
-                            seed={agent.id}
-                            className="size-5"
-                            title={agent.name}
-                          />
-                          {isRunning && (
-                            <span className="absolute -right-1 -top-1 flex size-3 items-center justify-center rounded-full bg-emerald-500 text-emerald-50">
-                              <Spinner className="size-2" />
-                            </span>
-                          )}
-                        </div>
-                      )}
+                      {/*<div className="mt-auto flex items-center pt-1 text-[10px] text-muted-foreground/80">*/}
+                      {/*  <span>Updated {formatWhen(session.updatedAt)}</span>*/}
+                      {/*</div>*/}
+
                     </div>
                   );
                 })}
@@ -366,7 +347,7 @@ export function AgentDashboard({
                     setMode("session");
                     textareaRef.current?.focus();
                   }}
-                  className="flex min-h-24 cursor-pointer flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed p-4 text-muted-foreground transition-colors hover:border-foreground/30 hover:bg-muted/50 hover:text-foreground"
+                  className="flex cursor-pointer flex-col items-center justify-center gap-0.5 rounded-xl border border-dashed px-4 py-2 text-muted-foreground transition-colors hover:border-foreground/30 hover:bg-muted/50 hover:text-foreground"
                 >
                   <Plus className="size-5" />
                   <span className="text-sm font-medium">New session</span>

@@ -4,6 +4,20 @@ import type { AgentConfigPatch } from "@/types";
 export type ActivityKind = "tool" | "subagent" | "todo" | "input" | "source";
 export type ActivityStatus = "running" | "done" | "error";
 
+/** One uninterrupted block of agent work between assistant text spans. */
+export interface WorkSegment {
+  id: string;
+  startedAt: number;
+  endedAt?: number;
+  /** Assistant content offset where this block began. */
+  textOffset: number;
+  /** Assistant content offset where this block ended. */
+  endTextOffset?: number;
+  /** Legacy unlabelled reasoning emitted during this block. */
+  thinking?: string;
+  thinkingMs?: number;
+}
+
 export interface ActivityItem {
   id: string;
   kind: ActivityKind;
@@ -25,6 +39,8 @@ export interface ActivityItem {
   /** Monotonic creation order shared with reasoning streams — used to interleave
    *  thoughts and sub-agent boxes chronologically. Absent on legacy messages. */
   seq?: number;
+  /** Work block this action belongs to. */
+  workSegmentId?: string;
   /** Bounded preview of the tool call's arguments (file path + content head, code, command…). */
   argsPreview?: string;
   /** File created/appended by this tool call — feeds the session files widget. */
@@ -124,6 +140,8 @@ export interface ReasoningStream {
   /** Monotonic creation order shared with activities — used to interleave
    *  thoughts and sub-agent boxes chronologically. Absent on legacy messages. */
   seq?: number;
+  /** Work block this reasoning stream belongs to. */
+  workSegmentId?: string;
 }
 
 export interface AgentRunResult {
@@ -131,6 +149,10 @@ export interface AgentRunResult {
   reasoning: string;
   reasoningMs?: number;
   reasoningStreams?: ReasoningStream[];
+  workStartedAt?: number;
+  workEndedAt?: number;
+  workDurationMs?: number;
+  workSegments?: WorkSegment[];
   cancelled: boolean;
   interrupted: boolean;
   activities: ActivityItem[];

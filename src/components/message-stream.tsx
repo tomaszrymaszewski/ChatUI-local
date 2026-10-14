@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { ActivityIcon, Favicon, formatToolName } from "@/components/activity-icon";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
-import type { ActivityItem, ReasoningStream, TodoItem } from "@/lib/agent/types";
+import type { ActivityItem, ReasoningStream, TodoItem, WorkSegment } from "@/lib/agent/types";
 import { cn } from "@/lib/utils";
 
 function ActivityChip({ item }: { item: ActivityItem }) {
@@ -53,7 +53,7 @@ function ActivityChip({ item }: { item: ActivityItem }) {
           .replace(/^Writing /, "Wrote ")
           .replace(/^Reading /, "Read ")
       : label;
-  const hasExpandable = !!(item.detail || item.argsPreview);
+  const hasExpandable = !!(item.detail || item.argsPreview || item.output);
 
   // Fetched websites render as plain links to the page — no expandable
   // detail; clicking opens the site.
@@ -123,6 +123,11 @@ function ActivityChip({ item }: { item: ActivityItem }) {
               <pre className="whitespace-pre-wrap break-all font-sans">{item.detail}</pre>
             </div>
           )}
+          {item.output && (
+            <div className="mt-2 border-t pt-2">
+              <MarkdownRenderer content={item.output} className="text-xs" />
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -142,11 +147,13 @@ function ThinkingBlock({
   reasoningMs,
   live,
   label,
+  showLiveIndicator = true,
 }: {
   reasoning: string;
   reasoningMs?: number;
   live?: boolean;
   label?: string;
+  showLiveIndicator?: boolean;
 }) {
   const [open, setOpen] = useState(true);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -194,7 +201,7 @@ function ThinkingBlock({
         onClick={() => setOpen((p) => !p)}
         className="inline-flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
       >
-        {live && <Circle className="size-2.5 fill-blue-500/40 text-blue-500" />}
+        {live && showLiveIndicator && <Circle className="size-2.5 fill-blue-500/40 text-blue-500" />}
         <span className={cn(live && "shimmer")}>{displayLabel}</span>
         {open ? <ChevronDown className="size-2.5" /> : <ChevronRight className="size-2.5" />}
       </button>
@@ -332,12 +339,129 @@ function TodoList({ todos }: { todos: TodoItem[] }) {
   );
 }
 
+function formatWorkDuration(durationMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(durationMs / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+}
+
+function displayActionLabel(item: ActivityItem): string {
+  const label = item.label ?? formatToolName(item.name);
+  if (item.status !== "done") return label;
+  return label
+    .replace(/^Searching /, "Searched ")
+    .replace(/^Fetching /, "Fetched ")
+    .replace(/^Creating /, "Created ")
+    .replace(/^Running /, "Ran ")
+    .replace(/^Writing /, "Wrote ")
+    .replace(/^Reading /, "Read ");
+}
+
+function WorkSummary({
+  segment,
+  detailSegments,
+  totalDuration,
+  activities,
+  reasoningStreams,
+  live,
+}: {
+  segment: WorkSegment;
+  detailSegments?: WorkSegment[];
+  totalDuration?: number;
+  activities: ActivityItem[];
+  reasoningStreams: ReasoningStream[];
+  live?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [now, setNow] = useState(Date.now());
+  const active = !!live && segment.endedAt === undefined;
+
+  useEffect(() => {
+    if (!active) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active, segment.startedAt]);
+
+  const duration = totalDuration ?? Math.max(0, (segment.endedAt ?? (active ? now : segment.startedAt)) - segment.startedAt);
+  const thinkingSegments = detailSegments ?? [segment];
+  const thinking = thinkingSegments.some((item) => !!item.thinking) || reasoningStreams.some((stream) => !!stream.text);
+  const latestActivity = activities.reduce<ActivityItem | undefined>((latest, item) =>
+    !latest || (item.seq ?? 0) > (latest.seq ?? 0) ? item : latest, undefined);
+  const hasDetails = thinking || activities.length > 0;
+
+  return (
+    <div className="my-1 text-[15px] leading-[1.7] tracking-[0.01em]">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((value) => !value)}
+        className="inline-flex max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-left font-normal text-muted-foreground/60 transition-colors hover:text-muted-foreground"
+      >
+        <span>{active ? "Working" : "Worked"} for {formatWorkDuration(duration)}</span>
+        {active && hasDetails && <span aria-hidden="true">•</span>}
+        {active && thinking && <span>Thinking</span>}
+        {active && latestActivity && (
+          <span title={displayActionLabel(latestActivity)} className="inline-flex min-w-0 items-center gap-1">
+            <ActivityIcon item={latestActivity} className="size-3.5 shrink-0" />
+            <span className="max-w-56 truncate">{displayActionLabel(latestActivity)}</span>
+          </span>
+        )}
+        {hasDetails && (
+          <span className="shrink-0 text-muted-foreground/70">
+            <ChevronDown className={cn("size-3 transition-transform duration-300 ease-out", !expanded && "-rotate-90")} />
+          </span>
+        )}
+      </button>
+      <div
+        className={cn(
+          "grid transition-[grid-template-rows,opacity,margin] duration-300 ease-in-out",
+          expanded ? "mt-1 grid-rows-[1fr] opacity-100" : "mt-0 grid-rows-[0fr] opacity-0",
+        )}
+        aria-hidden={!expanded}
+      >
+        <div className="min-h-0 overflow-hidden">
+          {hasDetails && (
+            <div className="ml-3 flex flex-col gap-1 border-l border-muted-foreground/15 pl-3 text-muted-foreground/55 opacity-70 [&_.text-foreground]:text-muted-foreground/65">
+              {thinkingSegments.map((item) => item.thinking && (
+                <ThinkingBlock
+                  key={item.id}
+                  reasoning={item.thinking}
+                  reasoningMs={item.thinkingMs}
+                  live={active && item.endedAt === undefined}
+                  showLiveIndicator={false}
+                />
+              ))}
+              {reasoningStreams.map((stream) => (
+                <ThinkingBlock
+                  key={stream.id}
+                  reasoning={stream.text}
+                  reasoningMs={stream.ms}
+                  label={stream.label}
+                  live={active && stream.ms === undefined}
+                  showLiveIndicator={false}
+                />
+              ))}
+              {activities.map((item) => <ActivityChip key={item.id} item={item} />)}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export interface MessageStreamProps {
   content: string;
   activities?: ActivityItem[];
   reasoning?: string;
   reasoningMs?: number;
   reasoningStreams?: ReasoningStream[];
+  workStartedAt?: number;
+  workEndedAt?: number;
+  workDurationMs?: number;
+  workSegments?: WorkSegment[];
   todos?: TodoItem[];
   live?: boolean;
   className?: string;
@@ -361,6 +485,10 @@ export const MessageStream = memo(function MessageStream({
   reasoning,
   reasoningMs,
   reasoningStreams,
+  workStartedAt,
+  workEndedAt,
+  workDurationMs,
+  workSegments,
   todos,
   live,
   className,
@@ -371,9 +499,84 @@ export const MessageStream = memo(function MessageStream({
   const hasActivities = nonTodoActivities.length > 0;
   const hasReasoning = (reasoning?.length ?? 0) > 0;
   const hasStreams = (reasoningStreams?.length ?? 0) > 0;
+  const hasWorkTracking = workStartedAt !== undefined || (workSegments?.length ?? 0) > 0;
 
-  if (!hasContent && !hasActivities && !hasReasoning && !hasStreams && !(todos?.length)) {
+  if (!hasContent && !hasActivities && !hasReasoning && !hasStreams && !(todos?.length) && !hasWorkTracking) {
     return null;
+  }
+
+  if (hasWorkTracking) {
+    const segments = workSegments?.length
+      ? [...workSegments].sort((a, b) => a.textOffset - b.textOffset || a.startedAt - b.startedAt)
+      : [{
+          id: "work-legacy",
+          startedAt: workStartedAt ?? Date.now(),
+          endedAt: workEndedAt ?? (workDurationMs !== undefined && workStartedAt !== undefined ? workStartedAt + workDurationMs : undefined),
+          textOffset: 0,
+          endTextOffset: workEndedAt === undefined ? undefined : content.length,
+        } satisfies WorkSegment];
+    const trackedActivities = (activities ?? []).filter((item) => item.kind !== "todo");
+    const trackedStreams = reasoningStreams ?? [];
+    const totalDuration = segments.reduce((total, segment) => {
+      const end = segment.endedAt ?? (live ? Date.now() : segment.startedAt);
+      return total + Math.max(0, end - segment.startedAt);
+    }, 0);
+
+    const activitiesForSegment = (segment: WorkSegment, index: number) => trackedActivities.filter((item) => {
+      if (item.workSegmentId) return item.workSegmentId === segment.id;
+      const offset = item.textOffset ?? 0;
+      const nextOffset = segments[index + 1]?.textOffset ?? Number.POSITIVE_INFINITY;
+      return offset >= segment.textOffset && offset < nextOffset;
+    });
+    const streamsForSegment = (segment: WorkSegment, index: number) => trackedStreams.filter((stream) => {
+      if (stream.workSegmentId) return stream.workSegmentId === segment.id;
+      return index === 0;
+    });
+
+    if (live) {
+      let lastOffset = 0;
+      const entries: Array<{ kind: "text"; text: string; key: string } | { kind: "work"; segment: WorkSegment; index: number }> = [];
+      segments.forEach((segment, index) => {
+        const offset = Math.min(content.length, Math.max(lastOffset, segment.textOffset));
+        if (offset > lastOffset) entries.push({ kind: "text", text: content.slice(lastOffset, offset), key: `text-${segment.id}` });
+        entries.push({ kind: "work", segment, index });
+        lastOffset = offset;
+      });
+      if (lastOffset < content.length) entries.push({ kind: "text", text: content.slice(lastOffset), key: "text-tail" });
+
+      return (
+        <div className={className}>
+          {todos && todos.length > 0 && <TodoList todos={todos} />}
+          {entries.map((entry) => entry.kind === "text" ? (
+            <MarkdownRenderer key={entry.key} content={entry.text} onOpenArtifact={onOpenArtifact} />
+          ) : (
+            <WorkSummary
+              key={entry.segment.id}
+              segment={entry.segment}
+              activities={activitiesForSegment(entry.segment, entry.index)}
+              reasoningStreams={streamsForSegment(entry.segment, entry.index)}
+              live={live}
+            />
+          ))}
+        </div>
+      );
+    }
+
+    const summarySegment = segments[0];
+    return (
+      <div className={className}>
+        <WorkSummary
+          segment={summarySegment}
+          detailSegments={segments}
+          totalDuration={totalDuration}
+          activities={trackedActivities}
+          reasoningStreams={trackedStreams}
+          live={false}
+        />
+        {todos && todos.length > 0 && <TodoList todos={todos} />}
+        {content && <MarkdownRenderer content={content} onOpenArtifact={onOpenArtifact} />}
+      </div>
+    );
   }
 
   // Identify sub-agent activities and group children by parentId (or id-prefix

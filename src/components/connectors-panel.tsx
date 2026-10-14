@@ -16,6 +16,7 @@ import {
   Trash2,
   ChevronRight,
   ArrowLeft,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -549,12 +550,23 @@ export function ConnectorsPage({ onBack }: { onBack: () => void }) {
       );
     }
     return (
-      <span
-        title="Connected"
-        className="flex size-6 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
+      <button
+        type="button"
+        title={`Remove ${row.name}`}
+        aria-label={`Remove ${row.name}`}
+        disabled={uninstalling === row.id}
+        onClick={() => void handleUninstall(row.id, row.name)}
+        className="group flex size-6 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-600 transition-colors hover:bg-red-500 hover:text-white focus-visible:bg-red-500 focus-visible:text-white disabled:opacity-60 dark:text-emerald-400 dark:hover:text-white dark:focus-visible:text-white"
       >
-        <Check className="size-3.5" />
-      </span>
+        {uninstalling === row.id ? (
+          <Loader2 className="size-3 animate-spin" />
+        ) : (
+          <>
+            <Check className="size-3.5 group-hover:hidden group-focus-visible:hidden" />
+            <X className="hidden size-3.5 group-hover:block group-focus-visible:block" />
+          </>
+        )}
+      </button>
     );
   };
 

@@ -1546,12 +1546,34 @@ fn write_response(mut stream: std::net::TcpStream, status: &str, body: &str) {
     let _ = stream.flush();
 }
 
+fn focus_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+const MCP_OAUTH_SUCCESS_PAGE: &str = r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>AI Studio · Connected</title>
+<style>
+:root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",system-ui,sans-serif;font-synthesis:none;text-rendering:optimizeLegibility;-webkit-font-smoothing:antialiased}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:#f5f5f5;color:#171717}
+.card{width:min(100%,420px);padding:32px;border:1px solid #00000012;border-radius:20px;background:#fff;box-shadow:0 18px 55px #00000012;text-align:center}
+.mark{width:42px;height:42px;margin:0 auto 22px;display:grid;place-items:center;border-radius:13px;background:#171717;color:#fff;font-size:18px;font-weight:500;letter-spacing:-.06em}
+.check{width:44px;height:44px;margin:0 auto 18px;display:grid;place-items:center;border-radius:50%;background:#22c55e18;color:#16a34a}
+h1{margin:0;font-size:21px;line-height:1.3;font-weight:500;letter-spacing:-.025em}p{margin:10px 0 0;color:#737373;font-size:14px;line-height:1.6;font-weight:400}
+.hint{margin-top:24px;padding-top:18px;border-top:1px solid #00000010;color:#8a8a8a;font-size:12px}
+@media(prefers-color-scheme:dark){body{background:#101010;color:#f5f5f5}.card{background:#191919;border-color:#ffffff14;box-shadow:0 18px 55px #00000055}.mark{background:#f3f3f3;color:#171717}.check{background:#22c55e20;color:#4ade80}p{color:#a3a3a3}.hint{border-color:#ffffff14;color:#858585}}
+</style></head><body><main class="card"><div class="check" aria-hidden="true"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="m5 12.5 4.5 4.5L19 7" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div><h1>Connected successfully</h1><p>Your account is authorized. Returning you to AI Studio…</p><div class="hint">You can close this tab if it stays open.</div></main></body></html>"#;
+
 /// Accept loop for the OAuth callback: wait for /callback?code=…&state=…,
 /// validate state, then exchange the code and store the tokens. Exits when
 /// the abort flag is set (a newer flow replaced this one) or after the code
 /// was handled.
 fn oauth_callback_loop(
     listener: TcpListener,
+    app: tauri::AppHandle,
     abort: Arc<AtomicBool>,
     name: String,
     server_url: String,
@@ -1606,7 +1628,7 @@ fn oauth_callback_loop(
         write_response(
             stream,
             "200 OK",
-            "<html><body><h2>Sign-in complete</h2><p>You can close this tab and return to AI Studio.</p></body></html>",
+            MCP_OAUTH_SUCCESS_PAGE,
         );
 
         let client = match reqwest::blocking::Client::builder()
@@ -1639,6 +1661,7 @@ fn oauth_callback_loop(
             }
             Err(e) => eprintln!("[mcp-oauth] token exchange failed for {}: {}", name, e),
         }
+        focus_main_window(&app);
         return;
     }
 }
@@ -1721,6 +1744,7 @@ fn static_client_for(meta: &serde_json::Value) -> Option<StaticOauthClient> {
 /// read_mcp_auth to observe completion.
 #[tauri::command]
 async fn mcp_oauth_begin(
+    app: tauri::AppHandle,
     name: String,
     server_url: String,
     client_id: Option<String>,
@@ -1885,6 +1909,7 @@ async fn mcp_oauth_begin(
         std::thread::spawn(move || {
             oauth_callback_loop(
                 listener,
+                app,
                 abort,
                 name,
                 server_url,
@@ -5020,6 +5045,7 @@ pub fn run() {
                     .min_inner_size(800.0, 600.0)
                     .hidden_title(true)
                     .title_bar_style(tauri::TitleBarStyle::Overlay)
+                    .traffic_light_position(tauri::LogicalPosition::new(20.0, 22.0))
                     .build();
                 }
             }
