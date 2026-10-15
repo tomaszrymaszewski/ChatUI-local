@@ -57,6 +57,7 @@ function formatBytes(bytes: number) {
 export function AgentDashboard({
   agents,
   sessions,
+  sidebarOpen,
   runningIds,
   sendOnEnter,
   modelSelect,
@@ -69,6 +70,8 @@ export function AgentDashboard({
   agentSuggestions,
 }: {
   agents: AgentDefinition[];
+  /** Show the agent/session cards in the dashboard only while the sidebar is collapsed. */
+  sidebarOpen: boolean;
   /** Agent-tab sessions, newest first. */
   sessions: ChatSession[];
   runningIds?: Set<string>;
@@ -186,6 +189,29 @@ export function AgentDashboard({
     <div className="relative flex min-h-0 flex-1 flex-col">
       <ScrollArea className="min-h-0 flex-1">
         <div className="mx-auto w-full max-w-5xl px-4 pb-8">
+          {sidebarOpen ? (
+            <div className="flex min-h-[55vh] flex-col items-center justify-center px-6 text-center">
+              {agents.length > 0 && (
+                <div className="mb-5 flex max-w-full items-center justify-center gap-2 overflow-x-auto px-1 py-2">
+                  {agents.map((agent) => (
+                    <AgentAvatar
+                      key={agent.id}
+                      seed={agent.id}
+                      title={agent.name}
+                      autoAnimate
+                      className="size-10"
+                    />
+                  ))}
+                </div>
+              )}
+              <h1 className="text-xl font-medium tracking-tight">
+                {selectedAgent ? `Chat with ${selectedAgent.name}` : "Start a conversation with an agent"}
+              </h1>
+              <p className="mt-2 max-w-md text-sm text-muted-foreground">
+                Choose an agent from the sidebar to open its messages, or start a new agent session below.
+              </p>
+            </div>
+          ) : (
           <div
             className={cn(
               "transition-opacity duration-300",
@@ -224,7 +250,7 @@ export function AgentDashboard({
               </button>
             ) : (
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {agents.slice(0, 5).map((agent) => {
+                {agents.map((agent) => {
                   const running = runningCountFor(agent.id);
                   return (
                     <div
@@ -355,6 +381,7 @@ export function AgentDashboard({
               </div>
           </section>
           </div>
+          )}
         </div>
       </ScrollArea>
 

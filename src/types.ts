@@ -12,6 +12,8 @@ export interface MessageAttachment {
   previewUrl?: string;
   /** Key into the IndexedDB file store — makes the attachment persist across restarts. */
   storageId?: string;
+  /** Native absolute directory path; folders are passed to agent mode by path, never embedded. */
+  folderPath?: string;
 }
 
 export interface Message {
@@ -117,9 +119,16 @@ export interface AgentCapabilities {
   files?: boolean;
   /** May use web search/fetch. */
   web: boolean;
-  /** Reserved for the computer-use phase (not implemented yet). */
+  /** May operate the isolated Playwright browser for interactive web tasks. */
   computerUse: boolean;
 }
+
+export type AgentAvatarShape =
+  | "circle"
+  | "rounded-square"
+  | "inverted-rounded-triangle"
+  | "rounded-star"
+  | "rounded-hexagon";
 
 /** A knowledge file/image attached to a saved agent (bytes in IndexedDB). */
 export interface AgentAttachment {
@@ -137,8 +146,10 @@ export interface AgentDefinition {
   name: string;
   /** One-line purpose shown in the sidebar. */
   purpose: string;
-  /** Face-circle color (hex) — picked at creation, unique among agents. */
+  /** Avatar face color (hex) — picked at creation, unique among agents. */
   color?: string;
+  /** Face silhouette — picked at creation and synced with the agent definition. */
+  shape?: AgentAvatarShape;
   /** The agent's own system prompt — besides skills/connectors, all it knows. */
   systemPrompt: string;
   /** Installed skill names this agent may use. */

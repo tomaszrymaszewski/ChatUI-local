@@ -209,12 +209,15 @@ export async function rebuildAttachmentContent(
   provider: Provider,
   modelName: string,
 ): Promise<string | ContentPart[] | null> {
+  const folders = (message.attachments ?? []).filter((a) => a.folderPath);
   const attachments = (message.attachments ?? []).filter((a) => a.storageId);
-  if (attachments.length === 0) return null;
+  if (attachments.length === 0 && folders.length === 0) return null;
 
   const caps = await getModelCapabilities(provider, modelName);
   const imageUrls: string[] = [];
-  let docContext = "";
+  let docContext = folders.length
+    ? `Attached folders (read files directly from disk; do not embed or re-upload):\n${folders.map((folder) => `- ${folder.folderPath}`).join("\n")}`
+    : "";
 
   for (const a of attachments) {
     const blob = await getFileBlob(a.storageId!);

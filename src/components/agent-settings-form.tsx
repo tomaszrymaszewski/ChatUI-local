@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, ChevronDown, FileText, Image as ImageIcon, Pencil, X } from "lucide-react";
-import type { AgentAttachment, AgentDefinition, Project } from "@/types";
+import type { AgentAttachment, AgentAvatarShape, AgentDefinition, Project } from "@/types";
 import type { AgentUpdatePatch } from "@/lib/agents";
+import { AGENT_AVATAR_SHAPE_LABELS, AGENT_AVATAR_SHAPES } from "@/lib/agents";
 import { deleteFileBlob, getFileBlob, putFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
 import { modelLabel } from "@/lib/model-display";
@@ -250,6 +251,24 @@ export function AgentSettingsForm({
             />
           </div>
         </div>
+        <div className="flex max-w-sm flex-col gap-1.5">
+          <Label htmlFor={`agent-shape-${agent.id}`}>Avatar shape</Label>
+          <Select
+            value={agent.shape ?? "circle"}
+            onValueChange={(shape) => update({ shape: shape as AgentAvatarShape })}
+          >
+            <SelectTrigger id={`agent-shape-${agent.id}`}>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {AGENT_AVATAR_SHAPES.map((shape) => (
+                <SelectItem key={shape} value={shape}>
+                  {AGENT_AVATAR_SHAPE_LABELS[shape]}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between">
             <Label htmlFor={`agent-instructions-${agent.id}`}>System prompt</Label>
@@ -360,6 +379,12 @@ export function AgentSettingsForm({
           description="Run shell commands, open and automate Mac apps, and delegate coding tasks — each action approved"
           checked={agent.capabilities.terminal}
           onCheckedChange={(terminal) => update({ capabilities: { terminal } })}
+        />
+        <PermissionRow
+          label="Browser controls"
+          description="Use an isolated Playwright browser. Your own browser and other apps remain available."
+          checked={agent.capabilities.computerUse}
+          onCheckedChange={(computerUse) => update({ capabilities: { computerUse } })}
         />
         <p className="text-xs text-muted-foreground">
           The agent can always search and read its own past sessions. Chats from

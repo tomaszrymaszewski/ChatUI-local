@@ -3179,6 +3179,17 @@ fn read_local_file_impl(raw_path: String) -> Result<LocalFileRead, String> {
     })
 }
 
+#[tauri::command]
+fn path_is_directory(path: String) -> Result<bool, String> {
+    let p = expand_tilde(&path);
+    if !p.is_absolute() {
+        return Err(format!("Path must be absolute (start with / or ~): {}", path));
+    }
+    fs::metadata(&p)
+        .map(|meta| meta.is_dir())
+        .map_err(|e| format!("{}: {}", p.display(), e))
+}
+
 fn write_local_file_impl(raw_path: String, content: String) -> Result<LocalFileWrite, String> {
     let p = expand_tilde(&raw_path);
     if !p.is_absolute() {
@@ -4989,6 +5000,7 @@ pub fn run() {
             open_app,
             run_applescript,
             read_local_file,
+            path_is_directory,
             write_local_file,
             read_shared_file,
             copy_path,

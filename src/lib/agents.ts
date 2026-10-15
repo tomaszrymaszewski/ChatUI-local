@@ -1,4 +1,4 @@
-import type { AgentDefinition } from "@/types";
+import type { AgentAvatarShape, AgentDefinition } from "@/types";
 import { setItemOrThrowFriendly } from "./storage-pressure";
 import { invoke } from "@tauri-apps/api/core";
 import { chatUiBaseDir, remapLegacyChatUiPath } from "@/lib/agent/sandbox";
@@ -10,6 +10,7 @@ import { chatUiBaseDir, remapLegacyChatUiPath } from "@/lib/agent/sandbox";
 const STORAGE_KEY = "chatui:agents";
 const AGENTS_EVENT = "chatui:agents-changed";
 const PATHS_REMAPPED_KEY = "chatui:agents:paths-remapped";
+const COMPUTER_USE_MIGRATED_KEY = "chatui:agents:computer-use-migrated";
 
 /** Palette the agent face avatars draw from (see AgentAvatar). */
 export const AGENT_FACE_COLORS = [
@@ -24,6 +25,22 @@ export const AGENT_FACE_COLORS = [
   "#f472b6",
   "#e879f9",
 ];
+
+export const AGENT_AVATAR_SHAPES: AgentAvatarShape[] = [
+  "circle",
+  "rounded-square",
+  "inverted-rounded-triangle",
+  "rounded-star",
+  "rounded-hexagon",
+];
+
+export const AGENT_AVATAR_SHAPE_LABELS: Record<AgentAvatarShape, string> = {
+  circle: "Circle",
+  "rounded-square": "Rounded square",
+  "inverted-rounded-triangle": "Inverted rounded triangle",
+  "rounded-star": "Rounded star",
+  "rounded-hexagon": "Rounded hexagon",
+};
 
 /**
  * Pick a face color no existing agent uses, so every agent is visually
@@ -45,6 +62,18 @@ function pickAgentColor(agents: AgentDefinition[]): string {
   return pool[Math.floor(Math.random() * pool.length)];
 }
 
+function pickAgentShape(agents: AgentDefinition[]): AgentAvatarShape {
+  const used = new Map<AgentAvatarShape, number>();
+  for (const agent of agents) {
+    if (agent.shape && AGENT_AVATAR_SHAPES.includes(agent.shape)) {
+      used.set(agent.shape, (used.get(agent.shape) ?? 0) + 1);
+    }
+  }
+  const leastUsed = Math.min(...AGENT_AVATAR_SHAPES.map((shape) => used.get(shape) ?? 0));
+  const pool = AGENT_AVATAR_SHAPES.filter((shape) => (used.get(shape) ?? 0) === leastUsed);
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
 /**
  * The agent's stored face color, assigning (and persisting + syncing) one for
  * agents created before colors existed. Idempotent; safe to call repeatedly.
@@ -56,6 +85,16 @@ export function ensureAgentColor(id: string): string {
   const color = pickAgentColor(agents);
   if (found) updateAgentDefinition(id, { color });
   return color;
+}
+
+/** Assign and persist a stable shape for agents created before shape support. */
+export function ensureAgentShape(id: string): AgentAvatarShape {
+  const agents = loadAgentDefinitions();
+  const found = agents.find((agent) => agent.id === id);
+  if (found?.shape && AGENT_AVATAR_SHAPES.includes(found.shape)) return found.shape;
+  const shape = pickAgentShape(agents);
+  if (found) updateAgentDefinition(id, { shape });
+  return shape;
 }
 
 /** The agent's stored face color, or undefined when the id is unknown. */
@@ -78,6 +117,10 @@ export function loadAgentDefinitions(): AgentDefinition[] {
     // Records saved before updatedAt existed backfill it from createdAt so
     // cloud-sync merges can order them.
     let migrated = false;
+    // The computerUse rollout runs once (flag-guarded): false was the reserved
+    // default before browser automation shipped, so flipping it on every load
+    // would also re-enable agents the user deliberately turned off afterwards.
+    const migrateComputerUse = !localStorage.getItem(COMPUTER_USE_MIGRATED_KEY);
     const next = valid.map((a) => {
       let rec = a;
       if ((a as AgentDefinition).readChats && a.externalChats === undefined) {
@@ -88,9 +131,17 @@ export function loadAgentDefinitions(): AgentDefinition[] {
         migrated = true;
         rec = { ...rec, updatedAt: rec.createdAt };
       }
+      // computerUse was reserved but had no effect before browser automation
+      // shipped. Enable the isolated browser for existing agents; users can
+      // turn it off in the access settings.
+      if (migrateComputerUse && rec.capabilities && !rec.capabilities.computerUse) {
+        migrated = true;
+        rec = { ...rec, capabilities: { ...rec.capabilities, computerUse: true } };
+      }
       return rec;
     });
     if (migrated) persistAgents(next);
+    if (migrateComputerUse) localStorage.setItem(COMPUTER_USE_MIGRATED_KEY, "1");
     void remapLegacySandboxFolders();
     return next;
   } catch {
@@ -143,6 +194,7 @@ export function saveAgentDefinition(
     ...def,
     // Distinct face color per agent, chosen at creation (callers may pin one).
     color: def.color ?? pickAgentColor(agents),
+    shape: def.shape ?? pickAgentShape(agents),
     id: crypto.randomUUID(),
     createdAt: now,
     updatedAt: now,

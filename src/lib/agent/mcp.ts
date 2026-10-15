@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { DynamicStructuredTool, type StructuredTool } from "langchain";
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -24,6 +25,182 @@ export function mcpAuthFailureHint(serverName: string): string {
 
 function sanitizeName(name: string): string {
   return name.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 60);
+}
+
+function browserActivityLabel(toolName: string, args: Record<string, unknown>): { label: string; detail?: string } {
+  const name = toolName.toLowerCase();
+  if (name.includes("navigate")) {
+    let detail: string | undefined;
+    if (typeof args.url === "string") {
+      try {
+        const url = new URL(args.url);
+        detail = `${url.hostname}${url.pathname === "/" ? "" : url.pathname}`;
+      } catch {
+        detail = undefined;
+      }
+    }
+    return { label: "Opening a page", detail };
+  }
+  if (name.includes("snapshot") || name.includes("inspect")) return { label: "Inspecting page controls" };
+  if (name.includes("screenshot")) return { label: "Capturing a browser view" };
+  if (name.includes("click") || name.includes("select_option")) return { label: "Using a page control" };
+  if (name.includes("type") || name.includes("fill")) return { label: "Entering text in the browser" };
+  if (name.includes("press_key")) return { label: "Pressing a browser key" };
+  if (name.includes("scroll")) return { label: "Scrolling a page" };
+  if (name.includes("tabs") || name.includes("tab")) return { label: "Selecting a browser tab" };
+  if (name.includes("hover")) return { label: "Inspecting a page control" };
+  return { label: "Using browser controls" };
+}
+
+async function publishBrowserActivity(payload: { id?: string; active: boolean; label: string; detail?: string }): Promise<void> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+  await emit("agent-computer-activity", payload).catch(() => {});
+}
+
+function mcpToolOutput(result: Awaited<ReturnType<Client["callTool"]>>): string | Array<Record<string, unknown>> {
+  const blocks = (result.content as Array<{ type: string; text?: string; data?: string; mimeType?: string } | undefined>) ?? [];
+  const text = blocks
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block?.text ?? "")
+    .join("\n");
+  const images = blocks
+    .filter((block) => block?.type === "image" && typeof block.data === "string")
+    .map((block) => ({ type: "image", data: block?.data as string, mimeType: block?.mimeType ?? "image/png" }));
+  if (images.length > 0) {
+    return [{ type: "text", text: text || "Screenshot captured." }, ...images];
+  }
+  return text.slice(0, 12000) || JSON.stringify(result).slice(0, 12000);
+}
+
+function addSharedBrowserControls(tools: StructuredTool[], getClient: () => Promise<Client>): void {
+  const available = new Set([
+    "browser_tabs",
+    "browser_navigate",
+    "browser_take_screenshot",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_press_key",
+    "browser_evaluate",
+  ]);
+  const call = async (
+    mcpName: string,
+    args: Record<string, unknown>,
+    activity: { label: string; detail?: string },
+  ) => {
+    const id = crypto.randomUUID();
+    await publishBrowserActivity({ id, active: true, ...activity });
+    try {
+      const client = await getClient();
+      return mcpToolOutput(await client.callTool({ name: mcpName, arguments: args }));
+    } catch (error) {
+      return `Browser action failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      await publishBrowserActivity({ id, active: false, ...activity });
+    }
+  };
+  const add = (
+    name: string,
+    description: string,
+    schema: ReturnType<typeof z.object>,
+    mcpName: string,
+    activity: { label: string; detail?: string },
+    args: (input: Record<string, unknown>) => Record<string, unknown>,
+  ) => {
+    if (!available.has(mcpName)) return;
+    tools.push(new DynamicStructuredTool({
+      name,
+      description,
+      schema,
+      func: (input) => call(mcpName, args(input as Record<string, unknown>), activity),
+    }));
+  };
+
+  add(
+    "computer_select_window",
+    "Select a browser tab in the isolated Playwright browser session. Call with action='list' first to see tab indexes.",
+    z.object({ action: z.enum(["list", "select", "new", "close"]), index: z.number().optional(), url: z.string().optional() }),
+    "browser_tabs",
+    { label: "Selecting a browser tab" },
+    (input) => input,
+  );
+  add(
+    "computer_navigate",
+    "Navigate the isolated Playwright browser to a website. Use this for browser tasks; it does not change the user's visible browser.",
+    z.object({ url: z.string().url() }),
+    "browser_navigate",
+    { label: "Opening a page" },
+    (input) => input,
+  );
+  add(
+    "computer_screenshot",
+    "Capture the current Playwright browser page. The returned image is available to inspect; use computer_accessibility_tree to locate controls.",
+    z.object({ target: z.string().optional(), fullPage: z.boolean().optional(), type: z.enum(["png", "jpeg", "webp"]).optional() }),
+    "browser_take_screenshot",
+    { label: "Capturing a browser view" },
+    (input) => input,
+  );
+  add(
+    "computer_accessibility_tree",
+    "Inspect the current browser page's accessibility tree. Use this before interacting with page controls.",
+    z.object({ depth: z.number().optional(), boxes: z.boolean().optional() }),
+    "browser_snapshot",
+    { label: "Inspecting page controls" },
+    (input) => input,
+  );
+  add(
+    "computer_click",
+    "Click an element in the isolated browser, identified by a reference from the accessibility snapshot or a unique selector.",
+    z.object({ target: z.string(), element: z.string().optional(), doubleClick: z.boolean().optional(), button: z.string().optional() }),
+    "browser_click",
+    { label: "Using a page control" },
+    (input) => input,
+  );
+  add(
+    "computer_type",
+    "Type or fill text into an editable browser element identified by the accessibility snapshot or a unique selector.",
+    z.object({ target: z.string(), text: z.string(), element: z.string().optional(), submit: z.boolean().optional(), slowly: z.boolean().optional() }),
+    "browser_type",
+    { label: "Entering text in the browser" },
+    (input) => input,
+  );
+  add(
+    "computer_keypress",
+    "Press a key in the isolated browser page (for example Enter, Tab, Escape, ArrowDown, or PageDown).",
+    z.object({ key: z.string() }),
+    "browser_press_key",
+    { label: "Pressing a browser key" },
+    (input) => input,
+  );
+  if (available.has("browser_evaluate")) {
+    tools.push(new DynamicStructuredTool({
+      name: "computer_scroll",
+      description: "Scroll the current isolated browser page by a bounded amount. This scrolls only the Playwright page, not the user's desktop.",
+      schema: z.object({ direction: z.enum(["up", "down"]), amount: z.number().min(50).max(2000).default(640) }),
+      func: ({ direction, amount }: { direction: "up" | "down"; amount: number }) => {
+        const delta = (direction === "down" ? 1 : -1) * Math.max(50, Math.min(2000, amount ?? 640));
+        return call("browser_evaluate", {
+          function: `() => { window.scrollBy({ top: ${delta}, behavior: "smooth" }); return "Scrolled ${direction} ${Math.abs(delta)} pixels."; }`,
+        }, { label: direction === "down" ? "Scrolling down a page" : "Scrolling up a page" });
+      },
+    }));
+    tools.push(new DynamicStructuredTool({
+      name: "computer_clipboard_read",
+      description: "Read text from the clipboard available to the isolated browser session. Clipboard permissions vary, and the browser may use the operating system clipboard; read only when the task needs it.",
+      schema: z.object({}),
+      func: () => call("browser_evaluate", {
+        function: "async () => await navigator.clipboard.readText()",
+      }, { label: "Reading browser clipboard" }),
+    }));
+    tools.push(new DynamicStructuredTool({
+      name: "computer_clipboard_write",
+      description: "Write text to the clipboard available to the isolated browser session. This may use the operating system clipboard, so only write when the task needs it.",
+      schema: z.object({ text: z.string() }),
+      func: ({ text }: { text: string }) => call("browser_evaluate", {
+        function: `async () => { await navigator.clipboard.writeText(${JSON.stringify(text)}); return "Clipboard updated."; }`,
+      }, { label: "Writing browser clipboard" }),
+    }));
+  }
 }
 
 /** Response of the mcp_http_post Tauri command. */
@@ -175,10 +352,20 @@ export async function loadMcpTools(
   allowedServers?: string[],
   /** How many eagerly-connected servers to allow (the MRU hot set). */
   hotSetLimit = 3,
+  /** Agentic runs always get the isolated built-in Playwright browser. */
+  includeBuiltInBrowser = false,
 ): Promise<McpToolsResult> {
   const tools: StructuredTool[] = [];
   const clients: Client[] = [];
   const entries = visibleMcpServers(projectDir);
+  const browserEntry: McpServerEntry | undefined = includeBuiltInBrowser
+    ? {
+      type: "remote",
+      url: "http://localhost:8931/mcp",
+      enabled: true,
+      addedAt: "built-in",
+    }
+    : undefined;
   // Only the most recently used servers connect eagerly (native mcp__ tools
   // with full JSON schemas — costly); the rest stay reachable through the
   // call_mcp_tool proxy, so a big connector library can't bloat the prompt
@@ -186,7 +373,14 @@ export async function loadMcpTools(
   const hot = new Set(hotSetMcpServers(projectDir, hotSetLimit));
 
   for (const [serverName, entry] of Object.entries(entries)) {
-    if (allowedServers && !allowedServers.includes(serverName)) continue;
+    // The built-in browser is connected lazily by its wrapper tools, keeping
+    // agent startup responsive while retaining reliable retries on first use.
+    if (includeBuiltInBrowser && serverName === "playwright-browser") continue;
+    if (
+      allowedServers &&
+      !allowedServers.includes(serverName) &&
+      !(includeBuiltInBrowser && serverName === "playwright-browser")
+    ) continue;
     if (!hot.has(serverName)) continue;
     if (!entry.url || !/^https?:\/\//.test(entry.url)) continue;
     try {
@@ -205,17 +399,22 @@ export async function loadMcpTools(
             schema: z.record(z.string(), z.unknown()),
             func: async (args) => {
               touchMcpUsage(serverName);
+              const isBrowserAction = includeBuiltInBrowser && serverName === "playwright-browser";
+              const browserActivity = isBrowserAction ? browserActivityLabel(t.name, args) : null;
+              const browserActivityId = browserActivity ? crypto.randomUUID() : undefined;
+              if (browserActivity && browserActivityId) {
+                await publishBrowserActivity({ id: browserActivityId, active: true, ...browserActivity });
+              }
               try {
                 const result = await client.callTool({ name: t.name, arguments: args });
-                const content = (result.content as Array<{ type: string; text?: string }> | undefined) ?? [];
-                const text = content
-                  .filter((c) => c.type === "text" && typeof c.text === "string")
-                  .map((c) => c.text)
-                  .join("\n");
-                return text.slice(0, 12000) || JSON.stringify(result).slice(0, 12000);
+                return mcpToolOutput(result);
               } catch (err) {
                 const hint = isMcpAuthError(err) ? ` ${mcpAuthFailureHint(serverName)}` : "";
                 return `Error: MCP tool failed — ${err instanceof Error ? err.message : String(err)}.${hint}`;
+              } finally {
+                if (browserActivity && browserActivityId) {
+                  await publishBrowserActivity({ id: browserActivityId, active: false, ...browserActivity });
+                }
               }
             },
           }),
@@ -224,6 +423,24 @@ export async function loadMcpTools(
     } catch {
       // unreachable / unsupported — skip this server
     }
+  }
+  if (browserEntry) {
+    let browserClient: Promise<Client> | null = null;
+    const getBrowserClient = () => {
+      if (!browserClient) {
+        browserClient = connectServer("playwright-browser", browserEntry)
+          .then((client) => {
+            clients.push(client);
+            return client;
+          })
+          .catch((error) => {
+            browserClient = null;
+            throw error;
+          });
+      }
+      return browserClient;
+    };
+    addSharedBrowserControls(tools, getBrowserClient);
   }
   return {
     tools,

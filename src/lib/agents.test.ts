@@ -86,11 +86,13 @@ describe("agent definitions storage", () => {
     expect(updated?.readChats).toBe(true);
     expect(updated?.allowedFolders).toEqual(["/Users/tester/Projects/invoices"]);
     // capabilities patch merges into the existing object, not replaces it.
+    // The load inside updateAgentDefinition runs the one-time computerUse
+    // rollout first, so the merged record carries computerUse: true.
     expect(updated?.capabilities).toEqual({
       terminal: true,
       web: true,
       files: false,
-      computerUse: false,
+      computerUse: true,
     });
     // Still exactly one record, updated in place.
     const all = loadAgentDefinitions();
@@ -148,6 +150,9 @@ describe("agent definitions storage", () => {
 
   it("notifies subscribers when a definition is updated", () => {
     const saved = saveAgentDefinition(sampleDef);
+    // Burn the one-time computerUse migration so its persist doesn't count
+    // toward the update's own notification.
+    loadAgentDefinitions();
     const fn = vi.fn();
     const unsubscribe = subscribeToAgents(fn);
     updateAgentDefinition(saved.id, { purpose: "New purpose" });
@@ -182,6 +187,19 @@ describe("agent definitions storage", () => {
     expect(all[0].externalChats).toBe("all");
     // The migration persists so it runs once, not on every load.
     expect(JSON.parse(storage.get("chatui:agents")!)[0].externalChats).toBe("all");
+  });
+
+  it("migrates agents to computerUse=true once (browser automation shipped)", () => {
+    const saved = saveAgentDefinition(sampleDef);
+    // Re-seed the saved record to simulate a pre-migration agent.
+    storage.set("chatui:agents", JSON.stringify([saved]));
+    const all = loadAgentDefinitions();
+    expect(all[0].capabilities.computerUse).toBe(true);
+    // The migration persists so it runs once, not on every load.
+    expect(JSON.parse(storage.get("chatui:agents")!)[0].capabilities.computerUse).toBe(true);
+    // A user turning it off afterwards sticks (the rollout never re-fires).
+    updateAgentDefinition(saved.id, { capabilities: { computerUse: false } });
+    expect(loadAgentDefinitions()[0].capabilities.computerUse).toBe(false);
   });
 
   it("leaves agents with externalChats already set (or readChats off) untouched", () => {

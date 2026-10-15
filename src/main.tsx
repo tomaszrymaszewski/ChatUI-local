@@ -4,6 +4,7 @@ import ReactDOM from "react-dom/client";
 import { preloadStores } from "./lib/idb-store";
 import { ThemeProvider } from "next-themes";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { AgentActivityOverlay } from "@/components/agent-activity-overlay";
 import App from "./App";
 import "./index.css";
 
@@ -56,20 +57,25 @@ async function boot(): Promise<void> {
   // Load chats into the big-key mirror (and sweep localStorage leftovers
   // into IndexedDB) before first render so no component ever sees an empty
   // store. Never throws — on failure the mirror falls back to localStorage.
-  await preloadStores();
+  const isActivityOverlay = new URLSearchParams(window.location.search).has("agent-activity-overlay");
+  if (!isActivityOverlay) await preloadStores();
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
       <ErrorBoundary>
-        <ThemeProvider
-          attribute="class"
-          defaultTheme="system"
-          enableSystem
-          disableTransitionOnChange
-        >
-          <TooltipProvider>
-            <App />
-          </TooltipProvider>
-        </ThemeProvider>
+        {isActivityOverlay ? (
+          <AgentActivityOverlay />
+        ) : (
+          <ThemeProvider
+            attribute="class"
+            defaultTheme="system"
+            enableSystem
+            disableTransitionOnChange
+          >
+            <TooltipProvider>
+              <App />
+            </TooltipProvider>
+          </ThemeProvider>
+        )}
       </ErrorBoundary>
     </React.StrictMode>,
   );

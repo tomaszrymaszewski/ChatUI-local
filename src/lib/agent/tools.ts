@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
 import { tool, type StructuredTool } from "langchain";
 import { executeTool } from "@/lib/tools";
 import { runPython } from "@/lib/run-python";
@@ -210,6 +211,11 @@ async function runLegacyTool(name: string, args: Record<string, unknown>): Promi
     arguments: JSON.stringify(args),
   });
   return result.content;
+}
+
+async function publishComputerActivity(payload: { id?: string; active: boolean; label: string }): Promise<void> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+  await emit("agent-computer-activity", payload).catch(() => {});
 }
 
 export function buildAgentTools(
@@ -1082,18 +1088,22 @@ export function buildAgentTools(
           if (!approved) {
             return "The user denied opening this app. Do not retry it — ask what to do differently or continue without it.";
           }
+          const activityId = crypto.randomUUID();
+          await publishComputerActivity({ id: activityId, active: true, label: `Opening ${app}` });
           try {
             return await openApp(app);
           } catch (err) {
             return `Error: could not open "${app}" — ${err instanceof Error ? err.message : String(err)}`;
+          } finally {
+            await publishComputerActivity({ id: activityId, active: false, label: `Opening ${app}` });
           }
         },
         {
           name: "open_app",
           description:
-            "Open a Mac app by name (e.g. 'Mail', 'Calendar', 'Preview', 'Music') so the user can " +
-            "continue there. Use after preparing something for another app, or when the user asks to " +
-            "open one. The user approves each open.",
+            "Open a Mac app by name (e.g. 'Mail', 'Calendar', 'Preview', 'Music'). Opening an app " +
+            "changes the user's active app, so only do this when the user explicitly asks you to open it. " +
+            "The user approves each open.",
           schema: z.object({
             app: z.string().describe("App name as shown in /Applications, e.g. 'Mail'."),
             reason: z.string().optional().describe("One line: why this app should be opened."),
@@ -1114,13 +1124,19 @@ export function buildAgentTools(
           if (!approved) {
             return "The user denied this automation. Do not retry it — ask what to do differently or continue without it.";
           }
-          const result = await runAppleScript(script);
-          const parts: string[] = [];
-          if (result.stdout) parts.push(`stdout:\n${result.stdout.slice(0, 8000)}`);
-          if (result.stderr) parts.push(`stderr:\n${result.stderr.slice(0, 4000)}`);
-          if (result.timedOut) parts.push("(automation timed out and was killed)");
-          parts.push(`exit code: ${result.exitCode}`);
-          return parts.join("\n\n");
+          const activityId = crypto.randomUUID();
+          await publishComputerActivity({ id: activityId, active: true, label: "Running Mac app automation" });
+          try {
+            const result = await runAppleScript(script);
+            const parts: string[] = [];
+            if (result.stdout) parts.push(`stdout:\n${result.stdout.slice(0, 8000)}`);
+            if (result.stderr) parts.push(`stderr:\n${result.stderr.slice(0, 4000)}`);
+            if (result.timedOut) parts.push("(automation timed out and was killed)");
+            parts.push(`exit code: ${result.exitCode}`);
+            return parts.join("\n\n");
+          } finally {
+            await publishComputerActivity({ id: activityId, active: false, label: "Running Mac app automation" });
+          }
         },
         {
           name: "run_applescript",
@@ -1129,7 +1145,8 @@ export function buildAgentTools(
             "System Events, …): read or organize emails and events, reveal files, start " +
             "playlists, read window titles. Prefer `tell application \"X\"` blocks; GUI " +
             "scripting via System Events only when no scripting dictionary exists. " +
-            "The user approves each script.",
+            "Prefer Playwright for browser tasks. Avoid global keystrokes, mouse clicks, or actions " +
+            "that change focus while the user is working. The user approves each script.",
           schema: z.object({
             script: z.string().describe("Complete AppleScript to execute."),
             reason: z.string().optional().describe("One line: what this automation does."),
@@ -1613,7 +1630,7 @@ export function buildAgentTools(
             capabilities: {
               terminal: input.terminal ?? true,
               web: input.web ?? true,
-              computerUse: false,
+              computerUse: true,
             },
             model: input.model ?? undefined,
           });

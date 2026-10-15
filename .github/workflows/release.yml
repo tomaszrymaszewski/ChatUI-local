@@ -100,6 +100,7 @@ jobs:
             - Provider-aware thinking controls, with supported effort levels and native Claude API support.
             - A live agent work timeline with elapsed-time tracking and saved work-duration logs.
             - Sidebar conversation sorting, grouping, filtering, rename, and delete controls.
+            - Temporary chats stay out of saved history until explicitly kept; agent dashboard and recent-session navigation refinements.
             - Refined startup skeleton, chat transitions, composer sizing, and model selector.
 
             See the assets below to download and install this version.
@@ -113,3 +114,15 @@ jobs:
           prerelease: false
           updaterJsonPreferNsis: true
           args: ${{ matrix.args }}
+
+  publish-release:
+    name: Publish GitHub release
+    needs: publish-tauri
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release after all platform builds finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false

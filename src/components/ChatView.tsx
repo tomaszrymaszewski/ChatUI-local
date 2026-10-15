@@ -1,6 +1,8 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   ArrowUp,
@@ -23,6 +25,7 @@ import {
   Search,
   FolderPlus,
   FileText,
+  Folder,
   FileCode,
   Trash2,
   X,
@@ -820,6 +823,7 @@ export function ChatView() {
       toolProfile: "task" | "setup";
       enableCommandTools: boolean;
       enableFileTools: boolean;
+      enableComputerUse: boolean;
       skillNames?: string[];
       mcpNames?: string[];
       sandbox?: AgentSandbox;
@@ -872,6 +876,7 @@ export function ChatView() {
       taskProfile: {
         toolProfile: (desc.isSetup ? "setup" : "task") as "task" | "setup",
         enableCommandTools: agentDef ? agentDef.capabilities.terminal : true,
+        enableComputerUse: agentDef ? agentDef.capabilities.computerUse : true,
         // Folders-only access model: saved agents always get the file tools;
         // the sandbox (workspace + granted folders + granted projects) is the
         // authorization — granted folders are trusted, no approval cards.
@@ -926,6 +931,16 @@ export function ChatView() {
     () => getActivePath(roots, nodeMap, selectedChildMap),
     [roots, nodeMap, selectedChildMap],
   );
+  const hasFolderAttachment = files.some((file) => !!file.folderPath) || activePath.some(
+    (node) => node.message.attachments?.some((attachment) => !!attachment.folderPath),
+  );
+
+  useEffect(() => {
+    if (!hasFolderAttachment || chatMode === "task") return;
+    setChatMode("task");
+    autoModeRef.current = "none";
+    if (activeSessionId) updateSession(activeSessionId, { chat_mode: "task" });
+  }, [hasFolderAttachment, chatMode, activeSessionId, updateSession]);
 
   // The session's compaction record (if any) and the active-path index of
   // its anchor — the divider renders directly after that message. -1 hides
@@ -1293,6 +1308,25 @@ export function ChatView() {
     ]);
   };
 
+  const addFolderPath = (path: string) => {
+    const name = path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
+    setFiles((prev) => [...prev, {
+      id: generateId(), name, size: 0, type: "inode/directory", folderPath: path,
+    }]);
+    setChatMode("task");
+    autoModeRef.current = "none";
+    if (activeSessionId) updateSession(activeSessionId, { chat_mode: "task" });
+  };
+
+  const pickFolder = async () => {
+    try {
+      const path = await openDialog({ directory: true, multiple: false });
+      if (typeof path === "string") addFolderPath(path);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not add folder");
+    }
+  };
+
   const handleFiles = (e: React.ChangeEvent<HTMLInputElement>) => {
     addFiles(Array.from(e.target.files ?? []));
     e.target.value = "";
@@ -1343,11 +1377,37 @@ export function ChatView() {
     window.addEventListener("dragover", onDragOver);
     window.addEventListener("dragleave", onDragLeave);
     window.addEventListener("drop", onDrop);
+    let unlistenNative: (() => void) | undefined;
+    if ("__TAURI_INTERNALS__" in window) {
+      void getCurrentWindow().onDragDropEvent(async (event) => {
+        const payload = event.payload;
+        if (payload.type !== "drop") return;
+        fileDropCounter.current = 0;
+        setFileDropOverlay(false);
+        setDraggingFiles(false);
+        for (const path of payload.paths) {
+          try {
+            const isDirectory = await invoke<boolean>("path_is_directory", { path });
+            if (isDirectory) {
+              addFolderPath(path);
+            } else {
+              const raw = await invoke<{ name: string; size: number; contentBase64: string }>("read_shared_file", { path });
+              const binary = atob(raw.contentBase64);
+              const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+              addFiles([new File([bytes], raw.name, { type: "application/octet-stream" })]);
+            }
+          } catch (error) {
+            toast.error(error instanceof Error ? error.message : `Could not attach ${path}`);
+          }
+        }
+      }).then((unlisten) => { unlistenNative = unlisten; });
+    }
     return () => {
       window.removeEventListener("dragenter", onDragEnter);
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("dragleave", onDragLeave);
       window.removeEventListener("drop", onDrop);
+      unlistenNative?.();
     };
   }, []);
 
@@ -1411,6 +1471,13 @@ export function ChatView() {
       : chatMode === "task"
         ? await agentRunContext({})
         : null;
+    if (arc?.taskProfile.sandbox && hasFolderAttachment) {
+      arc.taskProfile.sandbox.allowedDirectories = [...new Set([
+        ...(arc.taskProfile.sandbox.allowedDirectories ?? []),
+        ...activePath.flatMap((node) => node.message.attachments ?? []).filter((a) => !!a.folderPath).map((a) => a.folderPath!),
+        ...files.filter((a) => !!a.folderPath).map((a) => a.folderPath!),
+      ])];
+    }
     // Saved agents may pin their own model; otherwise the composer's model.
     const runModelName = arc?.model ?? selectedModel;
     const provider = runModelName ? findProviderForModel(runModelName) : null;
@@ -1448,6 +1515,8 @@ export function ChatView() {
     }
 
     const attachments = files.length > 0 ? files : undefined;
+    const folderAttachments = (attachments ?? []).filter((attachment) => !!attachment.folderPath);
+    const documentAttachments = (attachments ?? []).filter((attachment) => !attachment.folderPath);
     setInputText("");
     setFiles([]);
 
@@ -1467,6 +1536,7 @@ export function ChatView() {
                   : (pendingAgentId ?? activeAgentConsole?.id ?? undefined),
               isSetup:
                 (overrides ? !!overrides.setup : pendingSetup) || undefined,
+              isTemporary: !isAgentTab && isTemporary,
             }
           : undefined,
       );
@@ -1489,7 +1559,7 @@ export function ChatView() {
       name: a.name,
       size: a.size,
       type: a.type,
-      storageId: a.id,
+      ...(a.folderPath ? { folderPath: a.folderPath } : { storageId: a.id }),
     }));
 
     try {
@@ -1518,12 +1588,19 @@ export function ChatView() {
       const agentFilesDir = arc?.taskProfile
         ? await ensureDeliverablesDir(sessionId)
         : undefined;
-      const prep = await prepareAttachmentContext(attachments ?? [], text, provider, runModelName, modelLabelStr, { filePathsDir: agentFilesDir });
+      const prep = await prepareAttachmentContext(documentAttachments, text, provider, runModelName, modelLabelStr, { filePathsDir: agentFilesDir });
       if (prep.blocked) {
         toast.error(prep.warning ?? "This model doesn't support images.");
         return;
       }
-      const userContent: string | ContentPart[] = prep.content;
+      const folderContext = folderAttachments.length
+        ? `Attached folders (read files directly from disk; do not embed or re-upload the folder):\n${folderAttachments.map((folder) => `- ${folder.folderPath}`).join("\n")}`
+        : "";
+      const userContent: string | ContentPart[] = folderContext
+        ? typeof prep.content === "string"
+          ? [prep.content, folderContext].filter(Boolean).join("\n\n")
+          : [...prep.content, { type: "text", text: folderContext }]
+        : prep.content;
 
       // Agent-mode sessions are isolated: no universal memory in or out, and
       // they run on the task/agent prompt instead of the chat-tab mode prompts.
@@ -1842,6 +1919,10 @@ export function ChatView() {
     // prepare them exactly like a fresh send (cached previews are reused).
     const rehydrated: PendingFile[] = [];
     for (const a of msg.attachments ?? []) {
+      if (a.folderPath) {
+        rehydrated.push({ ...a });
+        continue;
+      }
       const storageId = a.storageId ?? a.id;
       let file: File | undefined;
       try {
@@ -1893,6 +1974,8 @@ export function ChatView() {
 
     // Attachment context for the re-run, prepared like a fresh send.
     const attachments = editedFiles.length > 0 ? editedFiles : undefined;
+    const folderAttachments = (attachments ?? []).filter((attachment) => !!attachment.folderPath);
+    const documentAttachments = (attachments ?? []).filter((attachment) => !attachment.folderPath);
     const modelLabelStr = selectedModelLabel
       ? modelLabel(selectedModelLabel)
       : runModelName;
@@ -1900,7 +1983,7 @@ export function ChatView() {
       ? await ensureDeliverablesDir(activeSessionId)
       : undefined;
     const prep = await prepareAttachmentContext(
-      attachments ?? [],
+      documentAttachments,
       text,
       provider,
       runModelName,
@@ -1916,7 +1999,7 @@ export function ChatView() {
       name: a.name,
       size: a.size,
       type: a.type,
-      storageId: a.storageId ?? a.id,
+      ...(a.folderPath ? { folderPath: a.folderPath } : { storageId: a.storageId ?? a.id }),
     }));
 
     // Commit: the composer contents become the edited message and the
@@ -1933,7 +2016,9 @@ export function ChatView() {
       const userMsg = await addMessage(
         activeSessionId,
         "user",
-        text,
+        folderAttachments.length
+          ? `${text}\n\nAttached folders (read directly from disk):\n${folderAttachments.map((folder) => `- ${folder.folderPath}`).join("\n")}`
+          : text,
         undefined,
         userAttachments,
         parentId,
@@ -1960,7 +2045,14 @@ export function ChatView() {
         completionMessages,
         loadSessionCompaction(activeSessionId),
       );
-      runHistory.push({ role: "user" as const, content: prep.content });
+      const editedFolderContext = folderAttachments.length
+        ? `Attached folders (read directly from disk):\n${folderAttachments.map((folder) => `- ${folder.folderPath}`).join("\n")}`
+        : "";
+      runHistory.push({ role: "user" as const, content: editedFolderContext
+        ? typeof prep.content === "string"
+          ? `${prep.content}\n\n${editedFolderContext}`
+          : [...prep.content, { type: "text", text: editedFolderContext }]
+        : prep.content });
 
       const ctrl = getAgentController(activeSessionId!);
       const assistantMsg = await addMessage(
@@ -2261,9 +2353,11 @@ export function ChatView() {
 
   const discardChatAndLeave = () => {
     if (!pendingLeave) return;
-    const { proceed } = pendingLeave;
+    const { sessionId, proceed } = pendingLeave;
     setPendingLeave(null);
-    // The navigation itself deletes the temporary messages.
+    // Remove the in-memory session as well as its temporary messages. This
+    // also prevents a title-only entry from surviving in the current sidebar.
+    void deleteSession(sessionId);
     proceed();
   };
 
@@ -2925,7 +3019,7 @@ export function ChatView() {
         variant="ghost"
         aria-label={`Toggle ${label} mode`}
         title={title}
-        disabled={disabled}
+        disabled={disabled || hasFolderAttachment}
         onClick={() => {
           // Manual toggle: wins over auto-detection and persists to the
           // session so the mode survives reloads (learn stays on until off).
@@ -2984,7 +3078,7 @@ export function ChatView() {
     // While editing, the bubble mirrors the composer: live text and the
     // composer's attachment chips (which start as the message's own).
     const shownAttachments: Array<
-      Pick<MessageAttachment, "id" | "name" | "size" | "previewUrl">
+      Pick<MessageAttachment, "id" | "name" | "size" | "previewUrl" | "folderPath">
     > = isEditing ? files : (msg.attachments ?? []);
     const bubbleContent = isEditing ? inputText : msg.content;
     // Tappable answers for a clarifying question: only under the latest
@@ -3028,15 +3122,15 @@ export function ChatView() {
                         src={attachment.previewUrl ?? attachmentPreviews.get(attachment.id)}
                         alt={attachment.name}
                       />
+                    ) : attachment.folderPath ? (
+                      <Folder />
                     ) : (
                       <FileText />
                     )}
                   </AttachmentMedia>
                   <AttachmentContent>
                     <AttachmentTitle>{attachment.name}</AttachmentTitle>
-                    <AttachmentDescription>
-                      {formatBytes(attachment.size)}
-                    </AttachmentDescription>
+                    <AttachmentDescription>{attachment.folderPath ?? formatBytes(attachment.size)}</AttachmentDescription>
                   </AttachmentContent>
                 </Attachment>
               ))}
@@ -3367,12 +3461,42 @@ export function ChatView() {
             <Button
               variant="ghost"
               size="sm"
-              className="h-6 gap-1.5 rounded-md px-1 text-xs text-neutral-500 hover:bg-accent hover:text-zinc-800 dark:text-neutral-400 dark:hover:bg-accent dark:hover:text-white [&_svg]:size-3.5"
+              className="h-6 gap-1.5 rounded-l-md px-1 text-xs text-neutral-500 hover:bg-accent hover:text-zinc-800 dark:text-neutral-400 dark:hover:bg-accent dark:hover:text-white [&_svg]:size-3.5"
               onClick={handleNewChat}
             >
               <SquarePen />
               New Chat
             </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  className="size-6 ml-[-6px] rounded-r-md text-neutral-500 hover:bg-accent hover:text-zinc-800 dark:text-neutral-400 dark:hover:bg-accent dark:hover:text-white"
+                  aria-label="Open a recent session"
+                  title="Recent sessions"
+                >
+                  <ChevronDown className="size-3.5" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start" side="bottom" className="max-h-96 min-w-64">
+                {sessions.filter((session) => !session.isTemporary).length > 0 ? (
+                  sessions
+                    .filter((session) => !session.isTemporary)
+                    .map((session) => (
+                      <DropdownMenuItem
+                        key={session.id}
+                        onClick={() => selectSession(session.id)}
+                        className="max-w-80"
+                      >
+                        <span className="truncate">{session.title}</span>
+                      </DropdownMenuItem>
+                    ))
+                ) : (
+                  <DropdownMenuItem disabled>No recent sessions</DropdownMenuItem>
+                )}
+              </DropdownMenuContent>
+            </DropdownMenu>
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button
@@ -4163,15 +4287,15 @@ export function ChatView() {
                             >
                               {file.previewUrl ? (
                                 <img src={file.previewUrl} alt={file.name} />
+                              ) : file.folderPath ? (
+                                <Folder />
                               ) : (
                                 <FileText />
                               )}
                             </AttachmentMedia>
                             <AttachmentContent>
                               <AttachmentTitle>{file.name}</AttachmentTitle>
-                              <AttachmentDescription>
-                                {formatBytes(file.size)}
-                              </AttachmentDescription>
+                              <AttachmentDescription>{file.folderPath ?? formatBytes(file.size)}</AttachmentDescription>
                             </AttachmentContent>
                             <AttachmentActions>
                               <AttachmentAction
@@ -4286,6 +4410,10 @@ export function ChatView() {
                           Add files
                           <DropdownMenuShortcut>⌘U</DropdownMenuShortcut>
                         </DropdownMenuItem>
+                        <DropdownMenuItem onClick={() => void pickFolder()}>
+                          <Folder />
+                          Add folder for agent
+                        </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
                     {currentProjectName && (
@@ -4350,8 +4478,8 @@ export function ChatView() {
                 </>
                 )}
 
-                <p className="mt-2 text-center text-xs text-muted-foreground">
-                  ChatUI can make mistakes. Check important information.
+                <p className="mt-1 mb-[-12px] text-center text-xs leading-3 text-bold text-muted-foreground">
+                  {selectedModelLabel ? modelLabel(selectedModelLabel) : selectedModel ?? "AI"} can make mistakes. Check important information.
                 </p>
               </div>
             </div>
@@ -4725,6 +4853,7 @@ export function ChatView() {
            <AgentDashboard
              agents={agents}
              sessions={sessions}
+             sidebarOpen={sidebarOpen}
              runningIds={runningIds}
              sendOnEnter={settings.sendOnEnter}
              modelSelect={modelSelect()}
@@ -4743,7 +4872,7 @@ export function ChatView() {
             />
          ) : (
           <div className="relative flex min-h-0 flex-1 flex-col items-center justify-center overflow-hidden px-4 pb-8">
-            <h1 className="select-none cursor-default relative z-10 mb-12 text-center text-4xl font-semibold tracking-tight welcome-fade-in">
+            <h1 className="select-none cursor-default relative z-10 mb-12 text-center text-4xl font-bold tracking-tight welcome-fade-in">
               {emptyStateHeading}
             </h1>
             <div className="relative z-10 w-full max-w-3xl">
@@ -4818,15 +4947,15 @@ export function ChatView() {
                           >
                             {file.previewUrl ? (
                               <img src={file.previewUrl} alt={file.name} />
+                            ) : file.folderPath ? (
+                              <Folder />
                             ) : (
                               <FileText />
                             )}
                           </AttachmentMedia>
                           <AttachmentContent>
                             <AttachmentTitle>{file.name}</AttachmentTitle>
-                            <AttachmentDescription>
-                              {formatBytes(file.size)}
-                            </AttachmentDescription>
+                            <AttachmentDescription>{file.folderPath ?? formatBytes(file.size)}</AttachmentDescription>
                           </AttachmentContent>
                           <AttachmentActions>
                             <AttachmentAction
@@ -4904,6 +5033,10 @@ export function ChatView() {
                         <Paperclip />
                         Add files
                         <DropdownMenuShortcut>⌘U</DropdownMenuShortcut>
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onClick={() => void pickFolder()}>
+                        <Folder />
+                        Add folder for agent
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -4985,8 +5118,8 @@ export function ChatView() {
               </>
               )}
 
-              <p className="mt-2 text-center text-xs text-foreground opacity-40 bg-background w-fit mx-auto">
-                AI can make mistakes. Check important information.
+              <p className="mt-0.5 text-center text-[10px] leading-3 text-foreground opacity-40 bg-background w-fit mx-auto">
+                {selectedModelLabel ? modelLabel(selectedModelLabel) : selectedModel ?? "AI"} can make mistakes. Check important information.
               </p>
             </div>
           </div>
@@ -5202,7 +5335,9 @@ export function ChatView() {
           : "chat";
 
     try {
-      const newSession = createSession(instantChatTitle(text), activeProject?.id);
+      const newSession = createSession(instantChatTitle(text), activeProject?.id, {
+        isTemporary: isTemporary || undefined,
+      });
       setActiveSessionId(newSession.id);
       setActiveProjectId(null);
 

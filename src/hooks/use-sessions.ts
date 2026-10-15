@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import type { ChatSession, ReasoningEffort, SessionChatMode } from "@/types";
 import { readBigKey, writeBigKey } from "@/lib/idb-store";
 import { deleteSessionMessageStore } from "./use-messages";
@@ -70,7 +70,7 @@ function saveSessions(sessions: ChatSession[]) {
     writeBigKey(
       STORAGE_KEY,
       JSON.stringify(
-        sessions.map((s) => ({
+        sessions.filter((s) => !s.isTemporary).map((s) => ({
           id: s.id,
           title: s.title,
           createdAt: s.createdAt?.toISOString(),
@@ -149,6 +149,7 @@ export function useSessions(type: "chat" | "agent") {
   // (e.g. the agent console's external-chats access grant).
   const [allSessions, setAllSessions] = useState<ChatSession[]>([]);
   const [loading, setLoading] = useState(true);
+  const temporarySessions = useRef(new Map<string, ChatSession>());
 
   useEffect(() => {
     const load = () => {
@@ -160,9 +161,17 @@ export function useSessions(type: "chat" | "agent") {
         type === "chat"
           ? all.filter((s) => s.type === "chat" || s.movedToAgent)
           : all.filter((s) => s.type === type);
-      setSessions(visible.sort(
-        (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
-      ));
+      setSessions(() => {
+        // Keep active temporary chats in memory across storage-change events,
+        // while never writing them to the saved session list.
+        const savedIds = new Set(all.map((session) => session.id));
+        const temporary = [...temporarySessions.current.values()].filter(
+          (session) => !savedIds.has(session.id),
+        );
+        return [...visible, ...temporary].sort(
+          (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime(),
+        );
+      });
       setLoading(false);
     };
     load();
@@ -195,7 +204,7 @@ export function useSessions(type: "chat" | "agent") {
   );
 
   const createSession = useCallback(
-    (title = "New Chat", projectId?: string, opts?: { chatMode?: SessionChatMode; agentId?: string; isSetup?: boolean }) => {
+    (title = "New Chat", projectId?: string, opts?: { chatMode?: SessionChatMode; agentId?: string; isSetup?: boolean; isTemporary?: boolean }) => {
       const id = crypto.randomUUID();
       const session: ChatSession = {
         id,
@@ -204,11 +213,12 @@ export function useSessions(type: "chat" | "agent") {
         updatedAt: new Date(),
         projectId,
         type,
-        isTemporary: false,
+        isTemporary: opts?.isTemporary ?? false,
         chatMode: opts?.chatMode,
         agentId: opts?.agentId,
         isSetup: opts?.isSetup,
       };
+      if (session.isTemporary) temporarySessions.current.set(id, session);
       persistSessions((prev) => [session, ...prev]);
       return { ...session, persisted: Promise.resolve() };
     },
@@ -217,6 +227,7 @@ export function useSessions(type: "chat" | "agent") {
 
   const deleteSession = useCallback(
     async (id: string) => {
+      temporarySessions.current.delete(id);
       persistSessions((prev) => prev.filter((s) => s.id !== id));
       // Drop the message store too — older versions left it behind and the
       // orphans accumulated forever.
@@ -237,6 +248,32 @@ export function useSessions(type: "chat" | "agent") {
         is_temporary?: boolean;
       },
     ) => {
+      const temporary = temporarySessions.current.get(id);
+      if (temporary) {
+        if (updates.is_temporary === false) {
+          temporarySessions.current.delete(id);
+        } else {
+          temporarySessions.current.set(id, {
+            ...temporary,
+            title: updates.title ?? temporary.title,
+            projectId:
+              updates.project_id !== undefined
+                ? updates.project_id ?? undefined
+                : temporary.projectId,
+            chatMode:
+              updates.chat_mode !== undefined ? updates.chat_mode : temporary.chatMode,
+            reasoningEffort:
+              updates.reasoning_effort !== undefined
+                ? updates.reasoning_effort
+                : temporary.reasoningEffort,
+            agentId:
+              updates.agent_id !== undefined
+                ? updates.agent_id ?? undefined
+                : temporary.agentId,
+            updatedAt: new Date(),
+          });
+        }
+      }
       persistSessions((prev) =>
         prev.map((s) =>
           s.id === id

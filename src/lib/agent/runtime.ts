@@ -107,6 +107,8 @@ export interface AgentSessionOptions {
   enableCommandTools?: boolean;
   /** Task profile: set true to add read_local_file/write_local_file (agents with the local-files capability). */
   enableFileTools?: boolean;
+  /** Task profile: true exposes isolated Playwright browser controls. */
+  enableComputerUse?: boolean;
   /** Restrict loaded skills to these names (sandboxed agents). undefined = all installed. */
   skillNames?: string[];
   /** Restrict MCP connectors to these connector store keys. undefined = all enabled; [] = none. */
@@ -359,6 +361,12 @@ function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
     parts.push(TASK_MANAGER_PROMPT);
     if (opts.enableCommandTools !== false) {
       parts.push(TASK_COMMAND_TOOLS_PROMPT);
+    }
+    if (opts.enableComputerUse) {
+      parts.push(
+        "For websites and browser interfaces, use the shared computer_* browser tools first. List/select a browser tab with computer_select_window; open sites with computer_navigate; inspect pages with computer_accessibility_tree, then use computer_click, computer_type, computer_keypress, or computer_scroll. Use computer_screenshot when a visual check helps. " +
+          "These tools operate in an isolated headless browser session, and the user can keep using their own apps and browser while you work. Never take over the user's visible mouse or keyboard.",
+      );
     }
     if (opts.enableFileTools) {
       parts.push(TASK_FILE_TOOLS_PROMPT);
@@ -632,7 +640,13 @@ export class DeepAgentSession {
     // in the WKWebView and subagents never spawn. No-op in Node.
     ensureBrowserAsyncLocalStorage();
     const model = await createChatModel(opts.provider, opts.modelName, opts.reasoningEffort);
-    const mcp = await loadMcpTools(opts.projectDir, opts.mcpNames);
+    const profile = opts.toolProfile ?? "chat";
+    const mcp = await loadMcpTools(
+      opts.projectDir,
+      opts.mcpNames,
+      3,
+      profile === "task" && opts.enableComputerUse === true,
+    );
     // On-demand proxy for the non-hot connectors — including ones connected
     // mid-run from a suggestion card (usable in the SAME run).
     const mcpProxy = createMcpProxy(opts.projectDir, opts.mcpNames);
@@ -652,7 +666,6 @@ export class DeepAgentSession {
     const compactionTokens = await resolveCompactionThreshold(opts.provider, opts.modelName);
 
     const runCtx: { current: RunContext | null } = { current: null };
-    const profile = opts.toolProfile ?? "chat";
     let tools = buildAgentTools(
       opts.webFetchEnabled,
       () => runCtx.current,

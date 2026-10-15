@@ -51,6 +51,8 @@ export interface DeepAgentRunOptions {
     enableCommandTools?: boolean;
     /** true adds read_local_file/write_local_file (agents with the local-files capability). */
     enableFileTools?: boolean;
+    /** true adds the shared isolated Playwright browser tools. */
+    enableComputerUse?: boolean;
     /** Restrict skills to these names (sandboxed agents). */
     skillNames?: string[];
     /** Restrict MCP connectors to these connector store keys (sandboxed agents). */
@@ -837,6 +839,7 @@ class AgentController implements AgentControllerApi {
           toolProfile: opts.taskProfile?.toolProfile,
           enableCommandTools: opts.taskProfile?.enableCommandTools,
           enableFileTools: opts.taskProfile?.enableFileTools,
+          enableComputerUse: opts.taskProfile?.enableComputerUse,
           skillNames: opts.taskProfile?.skillNames,
           mcpNames: opts.taskProfile?.mcpNames,
           sandbox,

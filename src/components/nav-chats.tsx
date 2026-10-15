@@ -261,7 +261,7 @@ export function NavChats({
   const createdAtFor = (session: ChatSession) =>
     session.createdAt ?? legacyCreatedAtById.get(session.id) ?? session.updatedAt
 
-  const sortedSessions = useMemo(() => [...sessions].sort((a, b) => {
+  const sortedSessions = useMemo(() => sessions.filter((session) => !session.isTemporary).sort((a, b) => {
     if (sortMode === "alphabetical") {
       return a.title.localeCompare(b.title, undefined, { sensitivity: "base" })
     }
