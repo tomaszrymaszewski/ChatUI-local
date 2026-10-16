@@ -392,7 +392,7 @@ function WorkSummary({
   const hasDetails = thinking || activities.length > 0;
 
   return (
-    <div className="my-1 text-[15px] leading-[1.7] tracking-[0.01em]">
+    <div className="my-1 text-[15px] leading-[1.7] tracking-[0.02em]">
       <button
         type="button"
         aria-expanded={expanded}

@@ -35,6 +35,12 @@
   }
 }
 
+/* KaTeX assumes zero letter-spacing: the app's message tracking would
+   stretch wide formulas and misalign rules/overlines drawn as borders. */
+.prose-chat .katex {
+  letter-spacing: normal;
+}
+
 .thinking-effort-slider {
   appearance: none;
   height: 8px;

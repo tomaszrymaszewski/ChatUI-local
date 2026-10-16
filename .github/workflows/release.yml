@@ -101,6 +101,7 @@ jobs:
             - A live agent work timeline with elapsed-time tracking and saved work-duration logs.
             - Sidebar conversation sorting, grouping, filtering, rename, and delete controls.
             - Temporary chats stay out of saved history until explicitly kept; agent dashboard and recent-session navigation refinements.
+            - Fixed math rendering (full-size fractions and radicals), LaTeX now uses double-dollar delimiters so a single $ stays literal, theme-aware SVG diagrams, and roomier message typography.
             - Refined startup skeleton, chat transitions, composer sizing, and model selector.
 
             See the assets below to download and install this version.

@@ -4101,7 +4101,7 @@ export function ChatView() {
             >
               <MessageScroller className="flex-1">
                 <MessageScrollerViewport>
-                  <MessageScrollerContent className="mx-auto w-full max-w-3xl px-4 py-6">
+                  <MessageScrollerContent className="mx-auto w-full max-w-3xl px-4 pt-6 pb-16">
                     {activePath.map((node, index) => {
                       // The in-progress assistant message renders its live
                       // streaming bubble in place — the same MessageScrollerItem

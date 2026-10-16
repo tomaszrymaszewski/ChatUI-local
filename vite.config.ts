@@ -54,6 +54,11 @@ export default defineConfig(async () => ({
   plugins: [react(), tailwindcss(), devHttpFetch],
 
   resolve: {
+    // rehype-katex ships its own katex@0.16 whose markup classes (.base,
+    // .strut) don't match the katex@0.18 CSS imported in index.css — the
+    // strut/vlist layout then collapses and fractions overlap. Dedupe forces
+    // the root katex@0.18 everywhere so markup and CSS stay in sync.
+    dedupe: ["katex"],
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },

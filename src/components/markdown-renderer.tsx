@@ -26,8 +26,35 @@ interface MarkdownRendererProps {
 
 function normalizeLatexDelimiters(content: string): string {
   return content
-    .replace(/\\\((.+?)\\\)/gs, (_, math) => `$${math}$`)
+    .replace(/\\\((.+?)\\\)/gs, (_, math) => `$$${math}$$`)
     .replace(/\\\[(.+?)\\\]/gs, (_, math) => `$$${math}$$`);
+}
+
+interface MathNode {
+  type?: string;
+  value?: unknown;
+  children?: MathNode[];
+}
+
+/**
+ * Render inline math in display style (like ChatGPT): TeX's text style packs
+ * \frac numerator/denominator at script size, which reads as squished in
+ * flowing text. \displaystyle keeps fractions and nested constructs full-size.
+ * Single-dollar math is disabled (see remarkMath below), so only the
+ * intentional $$…$$ delimiters reach this point.
+ */
+function remarkDisplayStyleMath() {
+  const walk = (node: MathNode) => {
+    if (
+      node.type === "inlineMath" &&
+      typeof node.value === "string" &&
+      !/^\s*\\displaystyle\b/.test(node.value)
+    ) {
+      node.value = `\\displaystyle ${node.value}`;
+    }
+    node.children?.forEach(walk);
+  };
+  return (tree: MathNode) => walk(tree);
 }
 
 function processCitations(content: string): string {
@@ -228,18 +255,27 @@ function VegaBlock({ spec }: { spec: string }) {
 }
 
 function SvgBlock({ svg }: { svg: string }) {
+  const { resolvedTheme } = useTheme();
+  const dark = resolvedTheme === "dark";
   const doc = useMemo(() => {
     const cleaned = svg
       .replace(/<script[\s\S]*?<\/script>/gi, "")
       .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, "");
-    return `<!DOCTYPE html><html><head><style>html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:#fff}svg{max-width:100%;max-height:100%}</style></head><body>${cleaned}</body></html>`;
-  }, [svg]);
+    // Dark mode flips the diagram at the CSS layer (the LLM keeps drawing for
+    // a light background): invert swaps black↔white and hue-rotate puts the
+    // hues back, so dark colors become their light counterparts (a black line
+    // turns white on the black background, dark blue becomes light blue).
+    const style = dark
+      ? "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:#000}svg{max-width:100%;max-height:100%;filter:invert(1) hue-rotate(180deg)}"
+      : "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:#fff}svg{max-width:100%;max-height:100%}";
+    return `<!DOCTYPE html><html><head><style>${style}</style></head><body>${cleaned}</body></html>`;
+  }, [svg, dark]);
   return (
     <iframe
       title="Inline SVG"
       sandbox=""
       srcDoc={doc}
-      className="my-2 w-full rounded-lg bg-white"
+      className={cn("my-2 w-full rounded-lg", dark ? "bg-black" : "bg-white")}
       style={{ height: 360 }}
     />
   );
@@ -408,7 +444,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   return (
     <div
       className={cn(
-        "prose-chat max-w-none text-[15px] leading-[1.7] tracking-[0.01em]",
+        "prose-chat max-w-none text-[15px] leading-[1.7] tracking-[0.02em]",
         "[&_p]:my-2.5 [&_p:first-child]:mt-0 [&_p:last-child]:mb-0",
         "[&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-5",
         "[&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-5",
@@ -434,7 +470,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
       )}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, remarkMath]}
+        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkDisplayStyleMath]}
         rehypePlugins={[rehypeKatex]}
         components={components}
       >

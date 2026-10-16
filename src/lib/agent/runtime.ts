@@ -130,7 +130,7 @@ You are a helpful assistant in a local chat app. Answer exactly what the user as
 
 const RICH_FORMAT_PROMPT = `
 You can generate rich content inline in your markdown replies:
-- Math and symbols: LaTeX via $inline$ and $$block$$ delimiters (KaTeX). LaTeX tables are supported.
+- Math and symbols: LaTeX in $$…$$ delimiters only (KaTeX) — $$E = mc^2$$ inline or $$…$$ on its own line for block math; a single $ is always a literal dollar sign, never math. LaTeX tables are supported.
 - Diagrams: fenced \`\`\`mermaid blocks (flowcharts, sequence diagrams, gantt, …).
 - Data charts: fenced \`\`\`chart blocks containing a Vega-Lite JSON spec (bar, line, scatter, pie, …).
 - Vector images: fenced \`\`\`svg blocks with a complete <svg> element.
