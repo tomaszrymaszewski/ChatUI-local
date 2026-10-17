@@ -97,11 +97,12 @@ jobs:
           releaseBody: |
             ## Highlights
 
-            - Provider-aware thinking controls, with supported effort levels and native Claude API support.
-            - A live agent work timeline with elapsed-time tracking and saved work-duration logs.
-            - Sidebar conversation sorting, grouping, filtering, rename, and delete controls.
-            - Temporary chats stay out of saved history until explicitly kept; agent dashboard and recent-session navigation refinements.
-            - Fixed math rendering (full-size fractions and radicals), LaTeX now uses double-dollar delimiters so a single $ stays literal, theme-aware SVG diagrams, and roomier message typography.
+            - Agents everywhere: every chat-tab send runs the Deep Agents runtime, and a post-run suggestion system proposes skills, connectors, and modes as you go.
+            - On-device OCR for scanned PDFs (macOS Vision) — PDFs, images, and documents work fully offline.
+            - Browser sign-in for agent runs (Gmail, etc.), plus shell/PATH fixes so homebrew and nvm tools work in the packaged app.
+            - One run per chat across windows and devices, with a live "Working for …" indicator when a run is already in flight.
+            - Thinking controls list only the model's real effort levels and resolve to a sensible middle tier by default.
+            - Fixed math rendering (full-size fractions and radicals), theme-aware SVG diagrams, and roomier message typography with guarded inline math (prices like "$5 and $10" stay literal).
             - Refined startup skeleton, chat transitions, composer sizing, and model selector.
 
             See the assets below to download and install this version.

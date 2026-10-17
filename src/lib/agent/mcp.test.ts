@@ -138,12 +138,11 @@ describe("corsFreeMcpFetch", () => {
 });
 
 describe("mcpAuthFailureHint", () => {
-  it("tells the model to show the re-connect card for the failing server", () => {
+  it("tells the model to send the user to Settings → Connectors for a re-sign-in", () => {
     const hint = mcpAuthFailureHint("github");
     expect(hint).toContain('"github"');
-    expect(hint).toContain('kind="connector"');
-    expect(hint).toContain('target="github"');
-    expect(hint).toMatch(/re-connect card/);
+    expect(hint).toContain("Settings → Connectors");
+    expect(hint).toMatch(/reconnect/);
     expect(hint).toMatch(/retry/);
   });
 });

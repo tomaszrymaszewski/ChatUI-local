@@ -173,6 +173,57 @@ describe("mergeRecordLists", () => {
     const merged = JSON.parse(mergeRecordLists(local, remote, spec)) as Array<{ id: string }>;
     expect(merged.map((r) => r.id).sort()).toEqual(["p1", "p2"]);
   });
+
+  it("resolves two writers' versions of one message by updatedAt, not creation time", () => {
+    // The production spec for chatui:messages:* — two app contexts streaming
+    // into the same chat both write the same record id with the same
+    // creation timestamp; only updatedAt orders their versions.
+    const messageSpec = {
+      idKey: "id",
+      timeKey: "updatedAt",
+      fallbackTimeKey: "timestamp",
+    };
+    const message = (updatedAt: string, content: string) => ({
+      id: "msg-1",
+      role: "assistant",
+      timestamp: "2026-09-15T12:00:00Z",
+      updatedAt,
+      content,
+    });
+    const local = JSON.stringify([message("2026-09-15T12:00:05Z", "older")]);
+    const remote = JSON.stringify([message("2026-09-15T12:00:09Z", "newer")]);
+    const merged = JSON.parse(mergeRecordLists(local, remote, messageSpec)) as Array<{
+      content: string;
+    }>;
+    expect(merged).toHaveLength(1);
+    expect(merged[0].content).toBe("newer");
+  });
+
+  it("falls back to the creation timestamp for legacy messages without updatedAt", () => {
+    const messageSpec = {
+      idKey: "id",
+      timeKey: "updatedAt",
+      fallbackTimeKey: "timestamp",
+    };
+    const legacy = {
+      id: "msg-1",
+      role: "assistant",
+      timestamp: "2026-09-15T12:00:00Z",
+      content: "legacy",
+    };
+    const updated = {
+      id: "msg-1",
+      role: "assistant",
+      timestamp: "2026-09-15T11:00:00Z",
+      updatedAt: "2026-09-15T12:00:05Z",
+      content: "updated",
+    };
+    const merged = JSON.parse(
+      mergeRecordLists(JSON.stringify([legacy]), JSON.stringify([updated]), messageSpec),
+    ) as Array<{ content: string }>;
+    expect(merged).toHaveLength(1);
+    expect(merged[0].content).toBe("updated");
+  });
 });
 
 describe("healCaseVariantRecords", () => {

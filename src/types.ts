@@ -21,6 +21,10 @@ export interface Message {
   role: MessageRole;
   content: string;
   timestamp: Date;
+  /** Last write time (epoch ms). Sync merges message records by this instead
+   *  of the creation timestamp, so two contexts streaming into the same chat
+   *  resolve deterministically instead of flip-flopping versions. */
+  updatedAt?: number;
   model?: string;
   attachments?: MessageAttachment[];
   session_id?: string;
@@ -79,9 +83,10 @@ export type SessionChatMode =
 
 /**
  * Reasoning effort sent as reasoning_effort on chat-completions requests for
- * reasoning-capable models. "default" sends nothing (provider default); the
- * other values come from models.dev reasoning_options (e.g. none/low/high/
- * xhigh/max) and are validated against the model's catalog entry before send.
+ * reasoning-capable models. "default" (unset) resolves to the model's middle
+ * tier at send time — never the provider's often-off default; the other
+ * values come from models.dev reasoning_options (e.g. none/low/high/xhigh/
+ * max) and are validated against the model's catalog entry before send.
  */
 export type ReasoningEffort = "default" | (string & {});
 
@@ -180,7 +185,7 @@ export interface AgentDefinition {
 
 /**
  * The subset of an agent's settings the agent itself may change via chat
- * (update_agent tool / suggest kind=agent_config). Folder, project, and
+ * (update_agent tool; also carried on suggestion cards). Folder, project, and
  * attachment access stays user-only — an agent can never widen its own
  * filesystem sandbox.
  */

@@ -5,21 +5,21 @@ import { emit } from "@tauri-apps/api/event";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
+import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { visibleMcpServers, hotSetMcpServers, touchMcpUsage, type McpServerEntry } from "@/lib/mcp-store";
 import { getCatalogEntry } from "@/lib/mcp-catalog";
 import { getAccessToken, isMcpAuthError } from "@/lib/mcp-auth";
+import { homeDir } from "@/lib/agent/sandbox";
 
 /**
  * Follow-up instruction for the model when a connector call fails with
- * rejected credentials: surface a one-click re-connect card (the same card
- * as first-time connect — it re-runs the OAuth sign-in and overwrites the
- * stored tokens) and retry once the user connects.
+ * rejected credentials: tell the user to re-run the sign-in from Settings →
+ * Connectors (which overwrites the stored tokens), then retry the call.
  */
 export function mcpAuthFailureHint(serverName: string): string {
   return (
-    `The "${serverName}" sign-in looks expired or revoked. Call suggest with ` +
-    `kind="connector" and target="${serverName}" to show the user a one-click ` +
-    `re-connect card, then retry the call after they connect.`
+    `The "${serverName}" sign-in looks expired or revoked. Tell the user to reconnect ` +
+    `"${serverName}" in Settings → Connectors, then retry the call.`
   );
 }
 
@@ -270,7 +270,20 @@ async function connectClient(
   headers: Record<string, string>,
   corsFree?: boolean,
 ): Promise<Client> {
-  const client = new Client({ name: "chatui", version: "0.1.0" });
+  // Declare the home folder as an MCP root. The built-in Playwright browser
+  // derives its persistent Chrome profile folder from the first root
+  // (mcp-chrome-<sha256(root)[:7]>) — with no roots declared the server
+  // throws while creating the profile and the browser never launches. The
+  // home folder also makes the profile path deterministic for the sign-in
+  // helper (browser_login_open in src-tauri/src/lib.rs).
+  const client = new Client(
+    { name: "chatui", version: "0.1.0" },
+    { capabilities: { roots: {} } },
+  );
+  client.setRequestHandler(ListRootsRequestSchema, async () => {
+    const home = await homeDir().catch(() => null);
+    return { roots: [{ uri: `file://${encodeURI(home ?? "/")}`, name: "Home" }] };
+  });
   const url = new URL(entry.url!);
   if (corsFree) {
     await client.connect(
@@ -573,7 +586,7 @@ export function createMcpProxy(
       "Use search_connectors to find the connector and list_mcp_tools for exact tool names and " +
       "argument schemas (see the tool's args schema hint in the listing). " +
       "If a call fails with an authorization/401-style error, the user's sign-in likely expired: " +
-      "call suggest with kind=\"connector\" for that server so they can re-authenticate, then retry.",
+      "tell them to reconnect that connector in Settings → Connectors, then retry.",
     schema: z.object({
       server: z.string().describe("Connector id from search_connectors, e.g. 'github' or 'zapier'."),
       tool: z.string().describe("Tool name from list_mcp_tools, e.g. 'create_issue'."),

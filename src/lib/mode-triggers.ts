@@ -5,7 +5,6 @@
  * - "teach me ..."       → "learn"
  * - "i want to learn ..." → "learn"
  * - "research ..."       → "research"
- * - "task ..."           → "task"
  *
  * Matching is case-insensitive and tolerates leading whitespace. The trigger
  * word must be followed by a word boundary (space, tab, newline) — this
@@ -14,7 +13,7 @@
  * Returns null when no trigger is detected.
  */
 
-export type DetectedMode = "council" | "learn" | "research" | "task";
+export type DetectedMode = "council" | "learn" | "research";
 
 export function detectModeTrigger(text: string): DetectedMode | null {
   const trimmed = text.replace(/^\s+/, "");
@@ -25,7 +24,6 @@ export function detectModeTrigger(text: string): DetectedMode | null {
   if (/^teach me\b/.test(lower)) return "learn";
   if (/^i want to learn\b/.test(lower)) return "learn";
   if (/^research\b/.test(lower)) return "research";
-  if (/^task\b/.test(lower)) return "task";
 
   return null;
 }

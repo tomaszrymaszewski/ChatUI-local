@@ -72,7 +72,7 @@ let artifactCounter = 0;
 /** Which extra tools a run gets: plain chat, an agent-mode task, or the agent builder. */
 export type ToolProfile = "chat" | "task" | "setup";
 
-/** Zod schema for the agent-editable settings (update_agent / suggest). */
+/** Zod schema for the agent-editable settings (update_agent). */
 const agentPatchSchema = z.object({
   name: z.string().optional().describe("New short agent name."),
   purpose: z.string().optional().describe("New one-line purpose shown in the sidebar."),
@@ -233,7 +233,7 @@ export function buildAgentTools(
   const allowedNote = sandbox?.allowedDirectories
     ? ` You are sandboxed to these folders: ${sandbox.allowedDirectories.join(", ")}.`
     : "";
-  const tools: StructuredTool[] = [
+  let tools: StructuredTool[] = [
     tool(
       async ({ timezone }: { timezone?: string }) =>
         runLegacyTool("get_current_time", { timezone }),
@@ -587,7 +587,8 @@ export function buildAgentTools(
               .slice(0, 6000)
               .trim();
           } catch {
-            // Offline / rate-limited — fall through to the suggest-card path.
+            // Offline / rate-limited — the listing below still names the skill;
+            // the user can install it from Settings → Skills.
           }
         }
 
@@ -613,8 +614,8 @@ export function buildAgentTools(
           "Returns the skill name, description, category, install state, and on-disk folder of installed skills. " +
           "Use this when the user's task might benefit from a skill (e.g. creating Word/Excel/PPT/PDF " +
           "documents, frontend design, testing). If the best match is NOT installed, this tool installs " +
-          "it on the spot and returns its SKILL.md inline — follow it in this run; only if the install " +
-          "fails, call suggest with kind=skill.",
+          "it on the spot and returns its SKILL.md inline — follow it in this run. If the install fails " +
+          "(offline), tell the user they can install it from Settings → Skills.",
         schema: z.object({
           query: z.string().describe("What the user wants to do, e.g. 'create word document' or 'react best practices'."),
         }),
@@ -709,7 +710,8 @@ export function buildAgentTools(
         if (unconnected.length > 0) {
           return (
             `${header}\n\n${unconnected.map(({ connector: c }) => c.name).join(", ")} ` +
-            `require${unconnected.length === 1 ? "s" : ""} sign-in: call suggest with kind=connector to show a one-click connect card.`
+            `require${unconnected.length === 1 ? "s" : ""} sign-in — tell the user to connect ` +
+            `${unconnected.length === 1 ? "it" : "them"} in Settings → Connectors.`
           );
         }
         return header;
@@ -721,63 +723,12 @@ export function buildAgentTools(
           "Returns the connector name, tagline, category, auth type, and whether it is connected/usable. " +
           "Use this when the user wants to interact with an external app (email, calendar, docs, " +
           "project management, etc.). Connected and auth-free connectors are usable IMMEDIATELY via " +
-          "list_mcp_tools + call_mcp_tool in this run. For connectors that need sign-in, call suggest " +
-          "with kind=connector — after the user connects, the same call_mcp_tool flow works. " +
+          "list_mcp_tools + call_mcp_tool in this run. Connectors that need sign-in must be connected " +
+          "by the user in Settings → Connectors first — tell them which one and why. " +
           "For Google Workspace (Gmail, Calendar, Docs) and Microsoft 365 (Outlook, Excel, Word), " +
           "the Zapier connector covers all of them — search for 'gmail' or 'office' to find it.",
         schema: z.object({
           query: z.string().describe("What the user wants to connect to, e.g. 'gmail', 'google calendar', 'notion', 'office'."),
-        }),
-      },
-    ),
-    tool(
-      async (input: {
-        kind: "skill" | "connector" | "mode" | "agent_mode" | "agent_config";
-        target: string;
-        title: string;
-        reason: string;
-        agent_patch?: AgentPatchInput;
-      }) => {
-        const ctx = ctxFn();
-        if (!ctx) return "Error: no active run — suggestion could not be shown.";
-        ctx.emit({
-          type: "suggestion",
-          suggestion: {
-            kind: input.kind,
-            target: input.target,
-            title: input.title,
-            reason: input.reason,
-            ...(input.kind === "agent_config" && input.agent_patch
-              ? { agentPatch: toAgentPatch(input.agent_patch) }
-              : {}),
-          },
-        });
-        return `Suggestion "${input.title}" has been shown to the user as an actionable card. Continue your reply naturally — do not repeat the suggestion in text.`;
-      },
-      {
-        name: "suggest",
-        description:
-          "Show the user an actionable suggestion card in place of the text composer. " +
-          "Use after search_skills or search_connectors finds something useful that isn't " +
-          "installed/connected yet, when the user's request would benefit from a mode " +
-          "(research, discuss, learn, task — use 'task' when the conversation has become " +
-          "hands-on work with terminal commands, file edits, or multi-step local execution), " +
-          "or when a change to YOUR OWN agent settings " +
-          "would help (kind=agent_config with an agent_patch — the user gets a one-click " +
-          "Apply card). The card has a button to install/connect/enable/apply and a " +
-          "dismiss option. Call this instead of just mentioning the suggestion in prose.",
-        schema: z.object({
-          // kind=agent_mode is a legacy alias for kind=mode target="task"
-          // (kept so in-flight suggestions still render); never emit it.
-          kind: z.enum(["skill", "connector", "mode", "agent_mode", "agent_config"]),
-          target: z.string().describe(
-            "For skill: the skill name (e.g. 'docx'). For connector: the catalog id (e.g. 'zapier'). For mode: 'research', 'council', 'learn', or 'task'. For agent_config: your own agent id from the configuration section of your prompt.",
-          ),
-          title: z.string().describe("Short headline for the card, e.g. 'Install Word Documents skill'."),
-          reason: z.string().describe("1-2 sentences explaining why this is being suggested."),
-          agent_patch: agentPatchSchema.optional().describe(
-            "kind=agent_config only: the settings change you are proposing. Never include folder/project access — that is user-only.",
-          ),
         }),
       },
     ),
@@ -1710,6 +1661,21 @@ export function buildAgentTools(
         },
       ),
     );
+  }
+
+  // Automations (schedules + workflows) belong to dedicated (saved) agents —
+  // chat-tab and standalone task runs never see the scheduling tools (or pay
+  // for their schemas).
+  if (!sandbox?.agentId) {
+    const schedulingTools = new Set([
+      "schedule_task",
+      "list_schedules",
+      "update_schedule",
+      "delete_schedule",
+      "create_workflow",
+      "delete_workflow",
+    ]);
+    tools = tools.filter((t) => !schedulingTools.has(t.name));
   }
 
   return tools;

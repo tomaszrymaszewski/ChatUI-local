@@ -1,5 +1,9 @@
-const PDFJS_VERSION = "6.2.108";
-const PDFJS_WORKER_URL = `https://cdn.jsdelivr.net/npm/pdfjs-dist@${PDFJS_VERSION}/build/pdf.worker.min.mjs`;
+// The pdf.js worker is bundled with the app (vite `?url`) instead of loaded
+// from a CDN: the packaged WKWebView app must extract PDFs offline, and a
+// cross-origin worker script is a fragile dependency there.
+import workerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
+
+const PDFJS_WORKER_URL = workerUrl;
 
 const TEXT_EXTENSIONS = [
   "md", "txt", "csv", "json", "js", "jsx", "ts", "tsx", "py", "rs", "go",
@@ -50,8 +54,10 @@ export async function extractFileText(file: File): Promise<string> {
     if (isDocxFile(file)) {
       return await extractDocxText(file);
     }
-  } catch {
-    // ignore extraction errors
+  } catch (err) {
+    // A silent "" here used to make PDF failures invisible — the document
+    // simply came through as "[File content could not be extracted]".
+    console.warn(`Could not extract text from "${file.name}" (${file.type || "unknown type"}):`, err);
   }
   return "";
 }
@@ -177,7 +183,8 @@ export async function pdfPagesToDataUrls(
       urls.push(canvas.toDataURL("image/jpeg", 0.92));
     }
     return urls;
-  } catch {
+  } catch (err) {
+    console.warn(`Could not render pages of "${file.name}" for OCR/vision:`, err);
     return [];
   }
 }

@@ -40,8 +40,9 @@ interface MathNode {
  * Render inline math in display style (like ChatGPT): TeX's text style packs
  * \frac numerator/denominator at script size, which reads as squished in
  * flowing text. \displaystyle keeps fractions and nested constructs full-size.
- * Single-dollar math is disabled (see remarkMath below), so only the
- * intentional $$…$$ delimiters reach this point.
+ * Single-dollar math is enabled below, so both $$…$$ and $…$ reach this
+ * point; remark-math's pandoc-style guards keep prices like "$5 and $10"
+ * literal (a closing $ followed by a digit never closes math).
  */
 function remarkDisplayStyleMath() {
   const walk = (node: MathNode) => {
@@ -264,10 +265,12 @@ function SvgBlock({ svg }: { svg: string }) {
     // Dark mode flips the diagram at the CSS layer (the LLM keeps drawing for
     // a light background): invert swaps black↔white and hue-rotate puts the
     // hues back, so dark colors become their light counterparts (a black line
-    // turns white on the black background, dark blue becomes light blue).
+    // turns white on the chat background, dark blue becomes light blue). The
+    // document background stays transparent so the iframe element's
+    // bg-background (the chat background, not black) shows through.
     const style = dark
-      ? "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:#000}svg{max-width:100%;max-height:100%;filter:invert(1) hue-rotate(180deg)}"
-      : "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:#fff}svg{max-width:100%;max-height:100%}";
+      ? "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:transparent}svg{max-width:100%;max-height:100%;filter:invert(1) hue-rotate(180deg)}"
+      : "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:transparent}svg{max-width:100%;max-height:100%}";
     return `<!DOCTYPE html><html><head><style>${style}</style></head><body>${cleaned}</body></html>`;
   }, [svg, dark]);
   return (
@@ -275,7 +278,7 @@ function SvgBlock({ svg }: { svg: string }) {
       title="Inline SVG"
       sandbox=""
       srcDoc={doc}
-      className={cn("my-2 w-full rounded-lg", dark ? "bg-black" : "bg-white")}
+      className="my-2 w-full rounded-lg bg-background"
       style={{ height: 360 }}
     />
   );
@@ -470,7 +473,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
       )}
     >
       <ReactMarkdown
-        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: false }], remarkDisplayStyleMath]}
+        remarkPlugins={[remarkGfm, [remarkMath, { singleDollarTextMath: true }], remarkDisplayStyleMath]}
         rehypePlugins={[rehypeKatex]}
         components={components}
       >

@@ -107,6 +107,7 @@ export async function runHeadlessTask(opts: {
     role: "user",
     content: opts.prompt,
     timestamp: new Date(),
+    updatedAt: Date.now(),
     session_id: sessionId,
     parent_id: null,
   });
@@ -115,6 +116,7 @@ export async function runHeadlessTask(opts: {
     role: "assistant",
     content: "",
     timestamp: new Date(),
+    updatedAt: Date.now(),
     model: modelName,
     session_id: sessionId,
     parent_id: userMsg.id,

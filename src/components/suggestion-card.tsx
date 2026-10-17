@@ -43,7 +43,7 @@ export function SuggestionCard({
   onDismiss: () => void;
   onInstallSkill: (name: string) => Promise<void>;
   onOpenConnectors: () => void;
-  onEnableMode: (mode: "council" | "learn" | "research" | "task") => void;
+  onEnableMode: (mode: "council" | "learn" | "research") => void;
   onApplyAgentConfig?: (agentId: string, patch: AgentConfigPatch) => void;
 }) {
   const [installing, setInstalling] = useState(false);
@@ -244,13 +244,13 @@ export function SuggestionCard({
   };
 
   const handleEnableMode = () => {
-    // kind=agent_mode is the legacy alias for task mode (its target was
-    // always "task"); enable Task mode directly instead of trusting it.
-    onEnableMode(
-      suggestion.kind === "agent_mode"
-        ? "task"
-        : (suggestion.target as "council" | "learn" | "research" | "task"),
-    );
+    // kind=agent_mode is the legacy alias for the removed Task mode — there
+    // is nothing to enable anymore; just dismiss the stale card.
+    if (suggestion.kind === "agent_mode" || suggestion.target === "task") {
+      onDismiss();
+      return;
+    }
+    onEnableMode(suggestion.target as "council" | "learn" | "research");
     onDismiss();
   };
 

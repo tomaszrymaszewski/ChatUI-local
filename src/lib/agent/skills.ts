@@ -10,11 +10,12 @@ export interface SkillFile {
 /**
  * Cap on how many installed skills are advertised to the model per run. Every
  * advertised skill costs prompt tokens on EVERY model call (the deepagents
- * skills middleware appends name + description to the system message), so a
- * large installed library is truncated to the most recently used ones — the
- * full catalog stays reachable via search_skills.
+ * skills middleware appends name + description to the system message), so the
+ * advertised set is kept tiny: task-relevant skills first, then the most
+ * recently used ones. The full catalog stays reachable via search_skills and
+ * the RAG knowledge block.
  */
-export const MAX_ADVERTISED_SKILLS = 30;
+export const MAX_ADVERTISED_SKILLS = 8;
 
 /**
  * App runtime overrides for catalog skills whose creation workflow doesn't
@@ -107,9 +108,15 @@ export function virtualSkillPathToReal(path: string, skillsDir: string): string 
  * filesystem entries for the Deep Agents skills middleware. Skills live at
  * `/skills/<name>/SKILL.md` in the agent's StateBackend; the harness reads
  * front-matter at startup and full content on demand (progressive disclosure).
+ *
+ * `relevantNames` (skill names matched by the run's RAG retrieval, in
+ * relevance order) are advertised first; the remaining slots go to the most
+ * recently used skills. `onlyNames` restricts the candidate pool (sandboxed
+ * agents) before ranking. Everything else stays reachable via search_skills.
  */
 export async function loadSkillFiles(
   projectDir?: string | null,
+  opts?: { relevantNames?: string[]; onlyNames?: string[] },
 ): Promise<Record<string, SkillFile>> {
   const files: Record<string, SkillFile> = {};
   const now = new Date().toISOString();
@@ -119,10 +126,12 @@ export async function loadSkillFiles(
   if (projectDir) scopes.push({ scope: "project", dir: projectDir });
 
   const usage = readSkillUsage();
+  const only = opts?.onlyNames ? new Set(opts.onlyNames) : null;
   const installed: Array<{ name: string; path: string }> = [];
   for (const { scope, dir } of scopes) {
     try {
       for (const skill of await listInstalledSkills(scope, dir)) {
+        if (only && !only.has(skill.name)) continue;
         installed.push({ name: skill.name, path: skill.path });
       }
     } catch {
@@ -130,11 +139,25 @@ export async function loadSkillFiles(
     }
   }
 
-  // MRU cap: advertise only the most recently used installed skills when the
-  // library outgrows the prompt budget (usage is touched on install/read).
+  // Ranking: task-relevant first (RAG hit order), then MRU (usage is touched
+  // on install/read), then install order for the rest.
+  const relevance = new Map<string, number>();
+  for (const [i, name] of (opts?.relevantNames ?? []).entries()) {
+    if (!relevance.has(name)) relevance.set(name, i);
+  }
   const ranked = installed
-    .map((s, i) => ({ ...s, last: usage[s.name] ?? 0, order: i }))
-    .sort((a, b) => b.last - a.last || a.order - b.order)
+    .map((s, i) => ({
+      ...s,
+      relevant: relevance.get(s.name),
+      last: usage[s.name] ?? 0,
+      order: i,
+    }))
+    .sort((a, b) => {
+      const ar = a.relevant ?? Number.MAX_SAFE_INTEGER;
+      const br = b.relevant ?? Number.MAX_SAFE_INTEGER;
+      if (ar !== br) return ar - br;
+      return b.last - a.last || a.order - b.order;
+    })
     .slice(0, MAX_ADVERTISED_SKILLS);
 
   for (const skill of ranked) {

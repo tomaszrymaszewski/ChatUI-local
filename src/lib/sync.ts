@@ -245,8 +245,9 @@ function normalizeRecord(record: Record<string, unknown>, spec: MergeSpec): Reco
 
 /**
  * Union-merge two JSON arrays of records by id, per-record last-write-wins
- * (ties go local). Sessions merge by updatedAt, messages by timestamp,
- * agents by updatedAt (createdAt fallback for legacy records), so a chat or
+ * (ties go local). Sessions merge by updatedAt, messages by updatedAt
+ * (creation-timestamp fallback for legacy records), agents by updatedAt
+ * (createdAt fallback for legacy records), so a chat or
  * agent created on device A and one created on device B both survive linking.
  * Either side being unparseable keeps the local string (fail closed: never
  * delete local data on corrupt input).
@@ -306,7 +307,7 @@ function mergeSpecFor(key: string): MergeSpec {
   }
   return key === "chatui:sessions"
     ? { idKey: "id", timeKey: "updatedAt" }
-    : { idKey: "id", timeKey: "timestamp" };
+    : { idKey: "id", timeKey: "updatedAt", fallbackTimeKey: "timestamp" };
 }
 
 /** Local-only flag: the one-time case-variant UUID heal already ran. */

@@ -38,6 +38,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
+import { openBrowserSignIn } from "@/lib/browser-signin";
 import {
   NotionLogo,
   TodoistLogo,
@@ -171,6 +172,12 @@ export function ConnectorsPage({ onBack }: { onBack: () => void }) {
   const [oauthTarget, setOauthTarget] = useState<McpCatalogEntry | null>(null);
   const [oauthClientId, setOauthClientId] = useState("");
   const [oauthClientSecret, setOauthClientSecret] = useState("");
+
+  // Browser sign-in form: opens the agent browser so the user can log into
+  // websites (Gmail, …) by hand; the session persists for agent runs.
+  const [browserSigninOpen, setBrowserSigninOpen] = useState(false);
+  const [browserSigninUrl, setBrowserSigninUrl] = useState("");
+  const [browserSigninBusy, setBrowserSigninBusy] = useState(false);
 
   // Custom app dialog: manual add + registry search
   const [registryQuery, setRegistryQuery] = useState("");
@@ -629,6 +636,10 @@ export function ConnectorsPage({ onBack }: { onBack: () => void }) {
         </div>
         {!category && !manageOpen && (
           <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setBrowserSigninOpen((v) => !v)}>
+              <Globe className="size-3.5" />
+              Browser sign-in
+            </Button>
             <Button variant="outline" size="sm" onClick={() => setManageOpen(true)}>
               Manage
             </Button>
@@ -639,6 +650,55 @@ export function ConnectorsPage({ onBack }: { onBack: () => void }) {
           </div>
         )}
       </div>
+
+      {/* ─── Browser sign-in: log into websites for agents that browse ─── */}
+      {browserSigninOpen && (
+        <div className="flex flex-col gap-2 rounded-lg border border-primary/40 bg-primary/5 p-3">
+          <div className="flex items-center gap-2 text-sm font-medium">
+            <Globe className="size-3.5" /> Sign in to a website for your agents
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Opens the agent browser's own profile so you can sign in once (e.g. Gmail).
+            Agents reuse the saved session on later runs. Close the window when you're done —
+            agents can't use the browser while it stays open.
+          </p>
+          <div className="flex flex-col gap-1">
+            <Label className="text-xs">Website (optional)</Label>
+            <Input
+              value={browserSigninUrl}
+              onChange={(e) => setBrowserSigninUrl(e.target.value)}
+              placeholder="https://mail.google.com"
+            />
+          </div>
+          <div className="flex items-center justify-end gap-2">
+            <Button size="sm" variant="ghost" onClick={() => setBrowserSigninOpen(false)}>
+              Cancel
+            </Button>
+            <Button
+              size="sm"
+              disabled={browserSigninBusy}
+              onClick={async () => {
+                setBrowserSigninBusy(true);
+                try {
+                  await openBrowserSignIn(browserSigninUrl);
+                  toast.success("Browser opened — sign in, then close the window.");
+                } catch (err) {
+                  toast.error(err instanceof Error ? err.message : String(err));
+                } finally {
+                  setBrowserSigninBusy(false);
+                }
+              }}
+            >
+              {browserSigninBusy ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <ExternalLink className="size-3.5" />
+              )}
+              Open browser
+            </Button>
+          </div>
+        </div>
+      )}
 
       {!manageOpen && !category && (
         <p className="text-sm text-muted-foreground">

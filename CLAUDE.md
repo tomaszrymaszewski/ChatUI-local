@@ -23,7 +23,13 @@ sync on top of the local store — anonymous mode works fully offline and is unc
     system prompts incl. council/research mode prompts).
   - `src/lib/agent/tools.ts` — built-in tools (time/date/weather/web_fetch,
     create_artifact, share_files, run_python, request_structured_input, search_skills,
-    search_connectors, suggest).
+    search_connectors). Scheduling/workflow tools exist only for dedicated (saved)
+    agents (`sandbox.agentId`). Every chat-tab send is agentic (the old "Agentic"
+    toggle is gone); learn/research/council remain special modes.
+  - `src/lib/agent/suggestions.ts` — post-run suggestion cards: after a message
+    ends, a separate small model call over the transcript + not-installed-skills/
+    not-connected-connector digests decides whether to show a skill/connector/mode
+    card (`AgentController.showSuggestion`). The agent itself has no suggest tool.
   - `src/lib/agent/{models,skills,mcp,run-context,types}.ts` — ChatOpenAI factory
     (OpenAI-compatible endpoints only; maxTokens comes from models.dev `limit.output`,
     8192 fallback — omitting it means small provider defaults like DeepSeek's 4096),
@@ -31,7 +37,9 @@ sync on top of the local store — anonymous mode works fully offline and is unc
   - `src/lib/run-python.ts` → Tauri command `run_python` in `src-tauri/src/lib.rs`
     (system python3, temp file, optional cwd — defaults to the run's deliverables
     folder, try_wait poll + kill on timeout).
-- **Rich content** — `src/components/markdown-renderer.tsx` renders LaTeX (KaTeX),
+- **Rich content** — `src/components/markdown-renderer.tsx` renders LaTeX (KaTeX,
+  both `$$…$$` and single-`$…$`; pandoc-style guards keep prices like "$5 and $10"
+  literal — `singleDollarTextMath` is on),
   ```mermaid, ```chart (Vega-Lite), ```svg fences, prism syntax highlighting.
   `src/components/artifact-panel.tsx` is the editable side panel (CodeMirror editing
   with overrides in `src/lib/artifacts.ts`, Python run console, React preview via
@@ -97,6 +105,32 @@ sync on top of the local store — anonymous mode works fully offline and is unc
 - **History is truncated to a token budget** (`src/lib/agent/history.ts`) before replay:
   models.dev `limit.context` when known, 8k for localhost providers, 32k fallback, minus
   4k reserve for system prompt + tool schemas + output.
+- **Thinking effort has no "Default" slot.** The composer slider lists only the model's
+  real levels (plus Off where a toggle dialect is known; toggle-only models get On/Off).
+  An unset session resolves at send time to the model's *middle* tier
+  (`resolveDefaultReasoningEffort` in `model-capabilities.ts`, "medium" preferred) — in
+  `models.ts` for both the OpenAI-compatible and Anthropic paths — and the composer shows
+  that exact level as muted text next to the model name ("GLM 5.3 · High"). Never send
+  "nothing" for an unset session: provider defaults are often thinking-off (and the old
+  GLM special case forced the lowest tier — removed).
+- **PDFs + on-device OCR**: the pdf.js worker is bundled via vite `?url` (never a CDN —
+  the packaged WKWebView app must extract offline). Scanned (image-only) PDFs are
+  rendered by pdf.js; vision models get the page images, and models WITHOUT vision get
+  on-device OCR via the Rust `ocr_image` command (macOS Vision framework, `objc2-vision`
+  — no external tools) in `attachment-context.ts` (send + history replay; replay caches
+  the OCR text via `setFileText`). Agent-mode attachments still go to disk for
+  `read_local_file` (pdftotext).
+- **Agent browser + PATH**: all agent shell spawns use `login_shell_command()`
+  (`$SHELL -lic`) — GUI-launched apps miss ~/.zprofile/~/.zshrc, so plain `sh -lc`
+  cannot see homebrew/nvm binaries (node, npx, blender). This broke the built-in
+  Playwright browser, run_node, and coding-agent delegation in the packaged app. The
+  MCP client declares the home folder as an MCP root (`mcp.ts`) — @playwright/mcp
+  derives its persistent Chrome profile from the first root
+  (`~/Library/Caches/ms-playwright-mcp/mcp-chrome-<sha256(root)[:7]>`) and throws
+  without one. "Browser sign-in" (Settings → Connectors → Rust `browser_login_open`)
+  opens that profile headed so the user can log into Gmail etc. once; the headless MCP
+  server stops first (one Chrome per profile) and restarts lazily — the user must close
+  the sign-in window for agent runs to use the browser.
 - **OpenCode server** (port 2138) is spawned/adopted by the Rust shell for the legacy
   agent half; env vars are sanitized there — keep that behavior.
 - **Deliverables + share_files**: `run_python`/`run_node` default their cwd to the run's
@@ -129,6 +163,10 @@ sync on top of the local store — anonymous mode works fully offline and is unc
   overwritten by live local data on push (`isLegacyEnvelope`). Sync is per-key
   last-write-wins with tombstones, except sessions/message stores/agents
   which union-merge by record id (`mergeRecordLists`, `planSync` — pure, unit-tested);
+  message records merge by `updatedAt` (creation-timestamp fallback for legacy
+  records — never by `timestamp` alone, which two writers share and which made
+  concurrent versions flip-flop), and every message write stamps `updatedAt`
+  (addMessage/updateMessage/updateMessageHeadless);
   ambiguous states fail closed toward local (blank cloud rows never overwrite populated
   data; deletes travel as tombstones — `deleteProvider` drops the key when the list empties).
   Egress is frugal: full syncs fetch a value-less manifest first and download values only
@@ -143,6 +181,15 @@ sync on top of the local store — anonymous mode works fully offline and is unc
   `write_text_file` command. Never put the Supabase *secret* key in the app — only the
   publishable key in `.env`. Attachment BYTES never sync — they live in IndexedDB
   (`chatui-files`) device-only; sync carries message records with attachment metadata only.
+- **One run per chat across contexts** (`src/lib/run-state.ts`): a chat can be
+  mid-run in another app window/instance, or on another device syncing in. Its
+  in-progress assistant record is fresh + unfinalized (no `workEndedAt`, open
+  last segment, `updatedAt` inside `RUN_ACTIVE_WINDOW_MS` = 90 s). `loadMessages`
+  keeps such records raw (only stale ones settle, as before), the message renders
+  as "Working for …" instead of a "Worked for …" summary that keeps growing, and
+  every send path (handleSend/handleSaveEdit/handleRegenerate + `AgentController.run`)
+  refuses to start a second run ("already running in another app window or on
+  another device") so two runs can't interleave into one session.
 - **Attachments to agents as file paths** (`src/lib/attachment-context.ts`,
   `src/lib/deliverables.ts`, Rust `write_file_base64`): on agent runs (agent tab + task
   mode, i.e. whenever `taskProfile` exists), non-image chat attachments are copied into
@@ -165,9 +212,10 @@ sync on top of the local store — anonymous mode works fully offline and is unc
     auto-install at launch (`ensureBundledSkillsInstalled`); everything else installs on
     first use — `search_skills` (semantic over the knowledge index, keyword fallback)
     installs a matching miss and inlines its SKILL.md. `loadSkillFiles` virtualizes at
-    most `MAX_ADVERTISED_SKILLS` (30, MRU) into `/skills/<name>/SKILL.md` and stamps a
-    **"Disk location" header** into each SKILL.md (`applySkillDiskHeader`) — the real
-    path is how the agent stops guessing and wandering into other apps' folders.
+    most `MAX_ADVERTISED_SKILLS` (8) into `/skills/<name>/SKILL.md` — RAG-matched
+    skills first, then MRU (sandboxed agents rank within their allowed set) — and
+    stamps a **"Disk location" header** into each SKILL.md (`applySkillDiskHeader`) —
+    the real path is how the agent stops guessing and wandering into other apps' folders.
   - **Connectors**: `listAllConnectors()` (mcp-catalog.ts) = bundled + registry; UI
     renders use the sync `listCachedConnectors()`. Connectors with `customOAuth`
     (Google Workspace) are bring-your-own-client: the user pastes their provider
@@ -177,8 +225,9 @@ sync on top of the local store — anonymous mode works fully offline and is unc
     everything else goes through the lazy **`list_mcp_tools` / `call_mcp_tool` proxy**
     (`createMcpProxy` in `src/lib/agent/mcp.ts`, one instance per run) — which is also
     what makes a connector connected mid-run (suggestion card) usable in the same run.
-  - Suggestion cards (`src/components/suggestion-card.tsx`) remain the connect/install
-    UX (non-blocking, `RunContext.emit`). Adding skills: Settings → Skills → Add skill
+  - Suggestion cards (`src/components/suggestion-card.tsx`) are the connect/install
+    UX, generated post-run by the separate suggestion system (never by the agent —
+    see `src/lib/agent/suggestions.ts`). Adding skills: Settings → Skills → Add skill
     (GitHub URL / local folder / paste SKILL.md) or Import (one-click from
     `~/.claude/skills`, `~/.config/opencode/skills`, `~/.eigent/skills`).
 

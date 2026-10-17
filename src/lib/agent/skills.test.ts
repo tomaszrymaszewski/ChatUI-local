@@ -95,7 +95,6 @@ describe("applySkillDiskHeader", () => {
 
 describe("MAX_ADVERTISED_SKILLS", () => {
   it("caps the advertised skill list at a prompt-friendly number", () => {
-    expect(MAX_ADVERTISED_SKILLS).toBeGreaterThanOrEqual(10);
-    expect(MAX_ADVERTISED_SKILLS).toBeLessThanOrEqual(50);
+    expect(MAX_ADVERTISED_SKILLS).toBe(8);
   });
 });

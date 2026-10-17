@@ -2,7 +2,6 @@ import * as React from "react"
 import {
   ArrowLeft,
   ArrowDownToLine,
-  Bot,
   Brain,
   CalendarClock,
   ChartColumnBig,
@@ -83,8 +82,33 @@ const SETTINGS_TABS: Array<[SettingsTab, string, React.ReactNode]> = [
 ]
 
 /**
+ * Custom Agents mark: a stroked circle with two filled oval eyes, echoing the
+ * agent avatars. Geometry and stroke match the lucide icons around it
+ * (24 viewBox, strokeWidth 2, round joins).
+ */
+function AgentFaceIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className={className}
+    >
+      <circle cx="12" cy="12" r="10" />
+      <ellipse cx="8.9" cy="12" rx="1.1" ry="2.6" fill="currentColor" stroke="none" />
+      <ellipse cx="15.1" cy="12" rx="1.1" ry="2.6" fill="currentColor" stroke="none" />
+    </svg>
+  )
+}
+
+/**
  * Chat | Agents switcher at the top of the sidebar. Expanded: a segmented
- * control; collapsed to the icon rail: a single toggle button.
+ * control; collapsed to the icon rail: a single toggle button. Shortcut hints
+ * fade in on hover (their space stays reserved so nothing shifts).
  */
 function ModeSwitcher({
   activeTab,
@@ -104,7 +128,7 @@ function ModeSwitcher({
             onClick={() => onTabChange(next)}
             tooltip={activeTab === "chat" ? "Switch to Agents" : "Switch to Chat"}
           >
-            {activeTab === "chat" ? <Bot /> : <MessageCircle />}
+            {activeTab === "chat" ? <AgentFaceIcon /> : <MessageCircle />}
             <span>{activeTab === "chat" ? "Agents" : "Chat"}</span>
           </SidebarMenuButton>
         </SidebarMenuItem>
@@ -115,28 +139,38 @@ function ModeSwitcher({
   const tabButton = (
     tab: "chat" | "agent",
     label: string,
-    icon: React.ReactNode,
+    // Icons temporarily hidden — the tabs show the title (and ⌘ hint) alone.
+    // icon: React.ReactNode,
+    shortcut: string,
   ) => (
     <button
       onClick={() => onTabChange(tab)}
       aria-pressed={activeTab === tab}
       className={cn(
-        "flex flex-1 items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium transition-colors",
+        "flex flex-1 items-center justify-center rounded-md px-2 py-1.5 text-xs font-medium transition-colors",
         activeTab === tab
           ? "bg-background text-foreground shadow-sm"
           : "text-muted-foreground hover:text-foreground",
       )}
     >
-      {icon}
+      {/* {icon} */}
       {label}
+      {/* The hint takes no space until the switcher is hovered, so the title
+          sits centered on its own and the title + hint recenter together. */}
+      <span
+        aria-hidden="true"
+        className="max-w-0 overflow-hidden whitespace-nowrap text-[10px] font-normal text-muted-foreground/70 opacity-0 transition-all duration-200 group-hover/switcher:ml-1.5 group-hover/switcher:max-w-8 group-hover/switcher:opacity-100"
+      >
+        {shortcut}
+      </span>
     </button>
   )
 
   return (
-    <div className="mx-2 mt-1 flex items-center gap-1 rounded-lg bg-muted/70 p-1">
-      {tabButton("chat", "Chat", <MessageCircle className="size-3.5" />)}
+    <div className="group/switcher mx-2 mt-1 flex items-center gap-1 rounded-lg bg-muted/70 p-1">
+      {tabButton("chat", "Chat", "⌘1")}
       {/*{tabButton("chat", "Chat")}*/}
-      {tabButton("agent", "Agents", <Bot className="size-3.5" />)}
+      {tabButton("agent", "Agents", "⌘2")}
       {/*{tabButton("agent", "Agents")}*/}
     </div>
   )
@@ -462,6 +496,12 @@ export function AppSidebar({
                 <SidebarMenuButton onClick={onNewChat} tooltip="New Chat">
                   <CircleFadingPlus />
                   <span className="hidden-xs">New Chat</span>
+                  <span
+                    aria-hidden="true"
+                    className="ml-auto text-[10px] font-normal text-sidebar-foreground/60 opacity-0 transition-opacity duration-200 group-hover:opacity-100"
+                  >
+                    ⌘N
+                  </span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
               <SidebarMenuItem>

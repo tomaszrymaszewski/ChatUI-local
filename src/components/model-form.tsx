@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createPortal } from "react-dom";
+import { RemoveScroll } from "react-remove-scroll";
 import { Check, Loader2, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -28,7 +29,10 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
   // Searchable model picker: the field itself holds what the user types and
   // the list below filters to names containing it. The list is portaled to
   // the body (fixed positioning) so it can overflow the Add Model dialog
-  // instead of being clipped by its scroll container.
+  // instead of being clipped by its scroll container. Wrapped in RemoveScroll
+  // (like Radix Select's own portaled content): the modal dialog's scroll
+  // lock cancels wheel events outside its content, which would otherwise
+  // make this body-portaled list unscrollable.
   const [modelQuery, setModelQuery] = useState("");
   const [modelOpen, setModelOpen] = useState(false);
   const modelBoxRef = useRef<HTMLDivElement>(null);
@@ -270,52 +274,54 @@ export function ModelForm({ providers, onSave, onCancel }: ModelFormProps) {
                     {modelOpen &&
                       modelListStyle &&
                       createPortal(
-                        <div
-                          ref={modelListRef}
-                          data-model-listbox=""
-                          id="model-listbox"
-                          role="listbox"
-                          style={modelListStyle}
-                          // pointer-events-auto: the modal dialog sets
-                          // pointer-events: none on the body, which this
-                          // body-portaled list would otherwise inherit —
-                          // clicks and hover would never reach the options.
-                          className="pointer-events-auto z-[80] overflow-y-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
-                        >
-                          {visibleModels.length === 0 ? (
-                            <p className="px-2 py-1.5 text-sm text-muted-foreground">
-                              No models match “{modelQuery.trim()}”
-                            </p>
-                          ) : (
-                            visibleModels.map((m) => (
-                              <button
-                                key={m}
-                                type="button"
-                                role="option"
-                                aria-selected={m === modelId}
-                                // Keep focus in the input so the list stays open
-                                // until the click lands.
-                                onMouseDown={(e) => e.preventDefault()}
-                                onClick={() => selectModel(m)}
-                                className={cn(
-                                  "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm outline-none hover:bg-accent hover:text-accent-foreground",
-                                  m === modelId && "bg-accent/50",
-                                )}
-                              >
-                                <span className="min-w-0 flex-1 truncate">{m}</span>
-                                {m === modelId && (
-                                  <Check className="size-3.5 shrink-0" />
-                                )}
-                              </button>
-                            ))
-                          )}
-                          {filteredModels.length > visibleModels.length && (
-                            <p className="px-2 py-1.5 text-xs text-muted-foreground">
-                              {filteredModels.length - visibleModels.length} more — keep
-                              typing to narrow
-                            </p>
-                          )}
-                        </div>,
+                        <RemoveScroll allowPinchZoom>
+                          <div
+                            ref={modelListRef}
+                            data-model-listbox=""
+                            id="model-listbox"
+                            role="listbox"
+                            style={modelListStyle}
+                            // pointer-events-auto: the modal dialog sets
+                            // pointer-events: none on the body, which this
+                            // body-portaled list would otherwise inherit —
+                            // clicks and hover would never reach the options.
+                            className="pointer-events-auto z-[80] overflow-y-auto rounded-md border bg-popover p-1 text-popover-foreground shadow-md"
+                          >
+                            {visibleModels.length === 0 ? (
+                              <p className="px-2 py-1.5 text-sm text-muted-foreground">
+                                No models match “{modelQuery.trim()}”
+                              </p>
+                            ) : (
+                              visibleModels.map((m) => (
+                                <button
+                                  key={m}
+                                  type="button"
+                                  role="option"
+                                  aria-selected={m === modelId}
+                                  // Keep focus in the input so the list stays open
+                                  // until the click lands.
+                                  onMouseDown={(e) => e.preventDefault()}
+                                  onClick={() => selectModel(m)}
+                                  className={cn(
+                                    "flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm outline-none hover:bg-accent hover:text-accent-foreground",
+                                    m === modelId && "bg-accent/50",
+                                  )}
+                                >
+                                  <span className="min-w-0 flex-1 truncate">{m}</span>
+                                  {m === modelId && (
+                                    <Check className="size-3.5 shrink-0" />
+                                  )}
+                                </button>
+                              ))
+                            )}
+                            {filteredModels.length > visibleModels.length && (
+                              <p className="px-2 py-1.5 text-xs text-muted-foreground">
+                                {filteredModels.length - visibleModels.length} more — keep
+                                typing to narrow
+                              </p>
+                            )}
+                          </div>
+                        </RemoveScroll>,
                         document.body,
                       )}
                   </div>

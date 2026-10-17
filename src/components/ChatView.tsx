@@ -33,17 +33,14 @@ import {
   ChevronLeft,
   SquareTerminal,
   GraduationCap,
-  Workflow,
   Menu,
   UsersRound,
-  SignalHigh,
-  SignalMedium,
-  SignalLow,
   Download,
   File as FileIcon,
   FileSpreadsheet,
   ArrowDownToLine,
   TriangleAlert,
+  PackagePlus,
   type LucideIcon,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -140,7 +137,6 @@ import {
   SidebarTrigger,
 } from "@/components/ui/sidebar";
 import { Textarea } from "@/components/ui/textarea";
-import { Switch } from "@/components/ui/switch";
 import type {
   Message as ChatMessage,
   MessageAttachment,
@@ -153,6 +149,7 @@ import { useAuth } from "@/hooks/use-auth";
 import { getAccountProfile } from "@/lib/account-profile";
 import { useSessions, getSessionChatMode, getSessionTemporary, agentSessionIds, deleteStoredSessions } from "@/hooks/use-sessions";
 import { useMessages, loadMessages } from "@/hooks/use-messages";
+import { findActiveRunMessage, isRunRecordActive } from "@/lib/run-state";
 import { useProjects } from "@/hooks/use-projects";
 import { useProviders } from "@/hooks/use-providers";
 import { useUserSettings } from "@/hooks/use-user-settings";
@@ -185,6 +182,7 @@ import {
   type LearnSubject,
 } from "@/lib/learn-mode";
 import { generateChatTitle, instantChatTitle, generateFollowUpSuggestion, generateQuestionOptions, type ContentPart, type FollowUpTranscriptEntry } from "@/lib/llm";
+import { generatePostRunSuggestion, collectSuggestionOptions } from "@/lib/agent/suggestions";
 import type { AgentMessage } from "@/lib/agent/runtime";
 import { toHistoryMessage } from "@/lib/agent/history";
 import {
@@ -205,7 +203,7 @@ import { prepareAttachmentContext, rebuildAttachmentContent, buildProjectFilesCo
 import { getFileBlob, putFileBlob, deleteFileBlob } from "@/lib/attachment-store";
 import { extractFileText } from "@/lib/files";
 import { ensureDeliverablesDir } from "@/lib/deliverables";
-import { getModelCapabilities, getModelCapabilitiesSync, getModelDisplayNameSync, getModelReasoning, getModelReasoningSync, getModelsDevCatalog, reasoningEffortRank, reasoningToggleProtocolForBaseUrl, sanitizeReasoningEffort, type ModelReasoningSupport } from "@/lib/model-capabilities";
+import { getModelCapabilities, getModelCapabilitiesSync, getModelDisplayNameSync, getModelReasoning, getModelReasoningSync, getModelsDevCatalog, reasoningEffortRank, reasoningToggleProtocolForBaseUrl, resolveDefaultReasoningEffort, sanitizeReasoningEffort, type ModelReasoningSupport } from "@/lib/model-capabilities";
 import { buildMemoryContext, extractAndSaveMemory, loadMemory } from "@/lib/memory";
 
 function generateId() {
@@ -247,13 +245,14 @@ const MODALITY_LABELS: Record<string, string> = {
 /** Display label for a models.dev reasoning effort value. */
 function reasoningLabel(effort: string): string {
   const known: Record<string, string> = {
-    default: "Default",
+    // "default" only reaches the UI as a toggle-only model's explicit "on".
+    default: "",
     none: "None",
     minimal: "Minimal",
     low: "Low",
     medium: "Medium",
     high: "High",
-    xhigh: "Extra high",
+    xhigh: "Extra High",
     max: "Max",
   };
   return known[effort] ?? effort.charAt(0).toUpperCase() + effort.slice(1);
@@ -284,7 +283,7 @@ type PendingFile = MessageAttachment & { file?: File };
  * Single chat mode — at most one active at a time. Temporary is NOT a mode:
  * it's a whole-chat flag (temporary below) that can coexist with any mode.
  */
-type ChatMode = "none" | "learn" | "research" | "council" | "task";
+type ChatMode = "none" | "learn" | "research" | "council";
 
 const WELCOME_PROMPTS = [
   "What do you want to know?",
@@ -501,6 +500,44 @@ export function ChatView() {
       .finally(() => {
         optionInflight.current.delete(key);
       });
+  };
+
+  /**
+   * Post-run capability card: a separate model call (never the agent) over
+   * the finished exchange decides whether the user's next step needs a
+   * skill/connector/mode card. Best-effort, non-blocking, and never stacks on
+   * an unanswered card or a running turn.
+   */
+  const requestPostRunSuggestion = (
+    sessionId: string,
+    suggestionProvider: Provider,
+    modelName: string,
+    transcript: FollowUpTranscriptEntry[],
+    opts: { allowModes: boolean },
+  ) => {
+    if (!settings.promptSuggestions) return;
+    const ctrl = getAgentController(sessionId);
+    if (ctrl.pendingSuggestion) return;
+    void (async () => {
+      try {
+        const { skills, connectors } = await collectSuggestionOptions();
+        const suggestion = await generatePostRunSuggestion({
+          provider: suggestionProvider,
+          model: modelName,
+          transcript,
+          skills,
+          connectors,
+          allowModes: opts.allowModes,
+        });
+        if (!suggestion) return;
+        // The user may have sent a new message (or another card appeared)
+        // while the suggestion call was in flight — never interrupt that.
+        if (ctrl.isRunning || ctrl.pendingSuggestion) return;
+        ctrl.showSuggestion(suggestion);
+      } catch {
+        // best-effort — no card on failure
+      }
+    })();
   };
   const [files, setFiles] = useState<PendingFile[]>([]);
   const [draggingFiles, setDraggingFiles] = useState(false);
@@ -808,7 +845,8 @@ export function ChatView() {
    * Agent-style run context: saved-agent sessions run sandboxed on the
    * agent's own prompt/skills/connectors, restricted to its workspace +
    * user-granted folders/projects; setup chats run the builder; no agent
-   * (chat-tab Task mode) runs the full task-manager agent.
+   * (every chat-tab send outside the special learn/research/council modes)
+   * runs the full task-manager agent.
    *
    * Async because resolving the sandbox touches the filesystem (workspace).
    */
@@ -934,13 +972,6 @@ export function ChatView() {
   const hasFolderAttachment = files.some((file) => !!file.folderPath) || activePath.some(
     (node) => node.message.attachments?.some((attachment) => !!attachment.folderPath),
   );
-
-  useEffect(() => {
-    if (!hasFolderAttachment || chatMode === "task") return;
-    setChatMode("task");
-    autoModeRef.current = "none";
-    if (activeSessionId) updateSession(activeSessionId, { chat_mode: "task" });
-  }, [hasFolderAttachment, chatMode, activeSessionId, updateSession]);
 
   // The session's compaction record (if any) and the active-path index of
   // its anchor — the divider renders directly after that message. -1 hides
@@ -1281,41 +1312,55 @@ export function ChatView() {
 
   const addFiles = (selected: File[]) => {
     if (selected.length === 0) return;
-    setFiles((prev) => [
-      ...prev,
-      ...selected.map((file) => {
-        const id = generateId();
-        // Persist the bytes (plus eagerly extracted text for documents) so
-        // the attachment survives restarts and stays in context on replay.
-        if (file.type.startsWith("image/")) {
-          void putFileBlob(id, file);
-        } else {
-          void extractFileText(file)
-            .then((text) => putFileBlob(id, file, { extractedText: text }))
-            .catch(() => {});
-        }
-        return {
-          id,
-          name: file.name,
-          size: file.size,
-          type: file.type,
-          previewUrl: file.type.startsWith("image/")
-            ? URL.createObjectURL(file)
-            : undefined,
-          file,
-        };
-      }),
-    ]);
+    setFiles((prev) => {
+      // One drop can reach this twice (the composer and window listeners, or
+      // the Tauri native drop racing the webview's) — collapse repeats of
+      // files already pending instead of stacking two identical chips.
+      const seen = new Set(prev.map((file) => `${file.name}\u0000${file.size}`));
+      const fresh = selected.filter((file) => {
+        const key = `${file.name}\u0000${file.size}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      if (fresh.length === 0) return prev;
+      return [
+        ...prev,
+        ...fresh.map((file) => {
+          const id = generateId();
+          // Persist the bytes (plus eagerly extracted text for documents) so
+          // the attachment survives restarts and stays in context on replay.
+          if (file.type.startsWith("image/")) {
+            void putFileBlob(id, file);
+          } else {
+            void extractFileText(file)
+              .then((text) => putFileBlob(id, file, { extractedText: text }))
+              .catch(() => {});
+          }
+          return {
+            id,
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            previewUrl: file.type.startsWith("image/")
+              ? URL.createObjectURL(file)
+              : undefined,
+            file,
+          };
+        }),
+      ];
+    });
   };
 
   const addFolderPath = (path: string) => {
     const name = path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
-    setFiles((prev) => [...prev, {
-      id: generateId(), name, size: 0, type: "inode/directory", folderPath: path,
-    }]);
-    setChatMode("task");
-    autoModeRef.current = "none";
-    if (activeSessionId) updateSession(activeSessionId, { chat_mode: "task" });
+    setFiles((prev) => {
+      // The same folder drop can arrive via both the native and webview paths.
+      if (prev.some((file) => file.folderPath === path)) return prev;
+      return [...prev, {
+        id: generateId(), name, size: 0, type: "inode/directory", folderPath: path,
+      }];
+    });
   };
 
   const pickFolder = async () => {
@@ -1364,6 +1409,9 @@ export function ChatView() {
     };
     const onDrop = (e: DragEvent) => {
       if (!hasFiles(e.dataTransfer)) return;
+      // A composer already handled this drop (it preventDefaults and stops
+      // propagation) — never attach the same files twice.
+      if (e.defaultPrevented) return;
       e.preventDefault();
       fileDropCounter.current = 0;
       setFileDropOverlay(false);
@@ -1378,9 +1426,22 @@ export function ChatView() {
     window.addEventListener("dragleave", onDragLeave);
     window.addEventListener("drop", onDrop);
     let unlistenNative: (() => void) | undefined;
+    let unlistenCancelled = false;
     if ("__TAURI_INTERNALS__" in window) {
       void getCurrentWindow().onDragDropEvent(async (event) => {
         const payload = event.payload;
+        // Native drag & drop: the webview's HTML5 drop events are disabled
+        // (tauri.conf dragDropEnabled), so the drop overlay is driven from
+        // these window events instead of the DOM listeners above.
+        if (payload.type === "enter" || payload.type === "over") {
+          setFileDropOverlay(true);
+          return;
+        }
+        if (payload.type === "leave") {
+          setFileDropOverlay(false);
+          setDraggingFiles(false);
+          return;
+        }
         if (payload.type !== "drop") return;
         fileDropCounter.current = 0;
         setFileDropOverlay(false);
@@ -1400,9 +1461,16 @@ export function ChatView() {
             toast.error(error instanceof Error ? error.message : `Could not attach ${path}`);
           }
         }
-      }).then((unlisten) => { unlistenNative = unlisten; });
+      }).then((unlisten) => {
+        // The effect can unmount while the listener promise is still pending
+        // (StrictMode double-mount) — tear the late listener down instead of
+        // leaking a second one that would fire every drop twice.
+        if (unlistenCancelled) unlisten();
+        else unlistenNative = unlisten;
+      });
     }
     return () => {
+      unlistenCancelled = true;
       window.removeEventListener("dragenter", onDragEnter);
       window.removeEventListener("dragover", onDragOver);
       window.removeEventListener("dragleave", onDragLeave);
@@ -1411,7 +1479,7 @@ export function ChatView() {
     };
   }, []);
 
-  /** HTML5 drag & drop from Finder onto a composer (Tauri dragDropEnabled is off). */
+  /** HTML5 drag & drop from Finder onto a composer (browser dev; the Tauri build drops natively). */
   const composerDropHandlers = {
     onDragOver: (e: React.DragEvent) => {
       if (!e.dataTransfer.types.includes("Files")) return;
@@ -1424,6 +1492,8 @@ export function ChatView() {
     },
     onDrop: (e: React.DragEvent) => {
       e.preventDefault();
+      // Keep the window listener from handling (and double-adding) this drop.
+      e.stopPropagation();
       setDraggingFiles(false);
       addFiles(Array.from(e.dataTransfer?.files ?? []));
     },
@@ -1453,11 +1523,11 @@ export function ChatView() {
   ) => {
     const text = (overrideText ?? inputText).trim();
     if ((!text && files.length === 0) || agent?.isRunning) return;
+    if (blockIfRunActiveElsewhere(activeSessionId)) return;
 
-    // Agent-style runs — agent-tab sessions plus chat-tab Task mode — run
-    // isolated from universal memory and never run the research/council
-    // pipelines. Task mode reuses the standalone task context, so a task runs
-    // the same as it did on the Agents tab.
+    // Agent-style runs — every chat-tab send except the special learn/
+    // research/council modes, plus every agent-tab session — run the full
+    // agentic task context, isolated from universal memory.
     const arc = isAgentTab
       ? await agentRunContext({
           agentId:
@@ -1468,9 +1538,9 @@ export function ChatView() {
             ? !!overrides.setup
             : pendingSetup || activeSession?.isSetup === true,
         })
-      : chatMode === "task"
-        ? await agentRunContext({})
-        : null;
+      : chatMode === "learn" || chatMode === "research" || chatMode === "council"
+        ? null
+        : await agentRunContext({});
     if (arc?.taskProfile.sandbox && hasFolderAttachment) {
       arc.taskProfile.sandbox.allowedDirectories = [...new Set([
         ...(arc.taskProfile.sandbox.allowedDirectories ?? []),
@@ -1843,6 +1913,9 @@ export function ChatView() {
             ghostTranscript,
           );
         }
+        requestPostRunSuggestion(sessionId, provider, runModelName, ghostTranscript, {
+          allowModes: !isAgentTab,
+        });
       }
 
       // Auto-extract durable memories (background, best-effort). Agent-mode
@@ -1862,6 +1935,21 @@ export function ChatView() {
 
   const handleStop = () => {
     agent?.stop();
+  };
+
+  /**
+   * Refuse to start a run while another app context is mid-run in this chat:
+   * its in-progress record is fresh and unfinalized (another window/instance,
+   * or a device syncing in). Starting anyway would interleave two runs into
+   * one session. Returns true when the send was blocked.
+   */
+  const blockIfRunActiveElsewhere = (sessionId: string | null | undefined): boolean => {
+    if (!sessionId) return false;
+    if (!findActiveRunMessage(loadMessages(sessionId))) return false;
+    toast.error(
+      "This chat is already running in another app window or on another device — wait for it to finish, or stop it there first.",
+    );
+    return true;
   };
 
   // Sending while a structured-input form is pending switches back to free
@@ -1954,6 +2042,7 @@ export function ChatView() {
   const handleSaveEdit = async (msg: ChatMessage) => {
     const text = inputText.trim();
     if (!text || !activeSessionId) return;
+    if (blockIfRunActiveElsewhere(activeSessionId)) return;
     const editedFiles = files;
 
     const arc = isAgentTab
@@ -1961,9 +2050,9 @@ export function ChatView() {
           agentId: activeSession?.agentId,
           isSetup: activeSession?.isSetup === true,
         })
-      : chatMode === "task"
-        ? await agentRunContext({})
-        : null;
+      : chatMode === "learn" || chatMode === "research" || chatMode === "council"
+        ? null
+        : await agentRunContext({});
     const runModelName = arc?.model ?? selectedModel;
     const provider = runModelName ? findProviderForModel(runModelName) : null;
     if (!provider) {
@@ -2080,6 +2169,8 @@ export function ChatView() {
           workEndedAt: ctrl.workEndedAt,
           workDurationMs: ctrl.workDurationMs,
           workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
+          artifacts: ctrl.artifacts.length ? [...ctrl.artifacts] : undefined,
+          files: ctrl.files.length ? [...ctrl.files] : undefined,
         });
       }, 2500);
 
@@ -2111,7 +2202,7 @@ export function ChatView() {
         inProgressMsgIds.current.delete(activeSessionId);
       }
 
-      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0;
+      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0 || (result.files?.length ?? 0) > 0;
       if (hasOutput) {
         updateMessage(activeSessionId, assistantMsg.id, {
           content: result.content,
@@ -2122,6 +2213,8 @@ export function ChatView() {
           workEndedAt: result.workEndedAt,
           workDurationMs: result.workDurationMs,
           workSegments: result.workSegments,
+          artifacts: result.artifacts?.length ? result.artifacts : undefined,
+          files: result.files?.length ? result.files : undefined,
         });
       } else {
         deleteMessage(activeSessionId, assistantMsg.id);
@@ -2135,15 +2228,16 @@ export function ChatView() {
 
   const handleRegenerate = async (msg: ChatMessage) => {
     if (!activeSessionId || agent?.isRunning) return;
+    if (blockIfRunActiveElsewhere(activeSessionId)) return;
 
     const arc = isAgentTab
       ? await agentRunContext({
           agentId: activeSession?.agentId,
           isSetup: activeSession?.isSetup === true,
         })
-      : chatMode === "task"
-        ? await agentRunContext({})
-        : null;
+      : chatMode === "learn" || chatMode === "research" || chatMode === "council"
+        ? null
+        : await agentRunContext({});
     const runModelName = arc?.model ?? selectedModel;
     const provider = runModelName ? findProviderForModel(runModelName) : null;
     if (!provider) {
@@ -2218,6 +2312,8 @@ export function ChatView() {
           workEndedAt: ctrl.workEndedAt,
           workDurationMs: ctrl.workDurationMs,
           workSegments: ctrl.workSegments.length ? [...ctrl.workSegments] : undefined,
+          artifacts: ctrl.artifacts.length ? [...ctrl.artifacts] : undefined,
+          files: ctrl.files.length ? [...ctrl.files] : undefined,
         });
       }, 2500);
 
@@ -2249,7 +2345,7 @@ export function ChatView() {
         inProgressMsgIds.current.delete(activeSessionId);
       }
 
-      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0;
+      const hasOutput = result.content || (result.activities?.length ?? 0) > 0 || (result.reasoningStreams?.length ?? 0) > 0 || (result.reasoning?.length ?? 0) > 0 || (result.artifacts?.length ?? 0) > 0 || (result.files?.length ?? 0) > 0;
       if (hasOutput) {
         updateMessage(activeSessionId, assistantMsg.id, {
           content: result.content,
@@ -2260,6 +2356,8 @@ export function ChatView() {
           workEndedAt: result.workEndedAt,
           workDurationMs: result.workDurationMs,
           workSegments: result.workSegments,
+          artifacts: result.artifacts?.length ? result.artifacts : undefined,
+          files: result.files?.length ? result.files : undefined,
         });
       } else {
         deleteMessage(activeSessionId, assistantMsg.id);
@@ -2306,9 +2404,12 @@ export function ChatView() {
   const applySessionChatMode = (sessionId: string | null) => {
     const stored = getSessionChatMode(sessionId);
     // "temporary" used to be stored as the chat mode; it's a whole-chat flag
-    // now, orthogonal to the mode.
+    // now, orthogonal to the mode. "task" (the removed Agentic toggle) maps
+    // back to the default mode — every send is agentic now.
     setTemporary(stored === "temporary" || getSessionTemporary(sessionId));
-    setChatMode(stored && stored !== "temporary" ? stored : "none");
+    setChatMode(
+      stored && stored !== "temporary" && stored !== "task" ? stored : "none",
+    );
     // New empty chat: honor "temporary chats by default".
     if (!sessionId && settings.temporaryByDefault) setTemporary(true);
     autoModeRef.current = "none";
@@ -2502,6 +2603,82 @@ export function ChatView() {
     });
   };
 
+  // App-wide keyboard shortcuts: ⌘1/⌘2 jump to the Chat / Agents page, ⌘N
+  // starts a new chat, Ctrl+Tab / Ctrl+Shift+Tab cycle through the open chats
+  // and "/" focuses the composer. The handlers go through a ref so the
+  // listener attaches once and still sees fresh state.
+  const appShortcutsRef = useRef({
+    switchTab,
+    handleNewChat,
+    selectSession,
+    sessions,
+    activeSessionId,
+    activeTab,
+    pendingLeave,
+  });
+  appShortcutsRef.current = {
+    switchTab,
+    handleNewChat,
+    selectSession,
+    sessions,
+    activeSessionId,
+    activeTab,
+    pendingLeave,
+  };
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const s = appShortcutsRef.current;
+      const mod = e.metaKey || e.ctrlKey;
+      if (mod && !e.shiftKey && !e.altKey && (e.key === "1" || e.key === "2")) {
+        e.preventDefault();
+        const tab = e.key === "1" ? "chat" : "agent";
+        if (s.activeTab !== tab) s.switchTab(tab);
+        else setView("chat");
+        return;
+      }
+      if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "n") {
+        e.preventDefault();
+        s.handleNewChat();
+        return;
+      }
+      // "/" activates the composer (new chat or open chat). Match the physical
+      // key too: on non-US layouts e.key is often not "/" (e.g. a Polish
+      // layout puts "/" on Shift+7), while e.code stays layout-independent.
+      // Typing elsewhere (inputs, textareas, editable content) keeps the slash.
+      if ((e.key === "/" || e.code === "Slash") && !mod && !e.altKey) {
+        const target = e.target as HTMLElement | null;
+        if (
+          target &&
+          (target.tagName === "INPUT" ||
+            target.tagName === "TEXTAREA" ||
+            target.isContentEditable)
+        ) {
+          return;
+        }
+        const textarea = sessionTextareaRef.current ?? emptyTextareaRef.current;
+        if (!textarea) return;
+        e.preventDefault();
+        textarea.focus();
+        return;
+      }
+      if (e.ctrlKey && !e.metaKey && !e.altKey && e.key === "Tab") {
+        e.preventDefault();
+        e.stopPropagation();
+        // A leave-temporary-chat dialog owns the navigation while it's open.
+        if (s.pendingLeave) return;
+        const list = s.sessions.filter((session) => !session.movedToAgent);
+        if (list.length === 0) return;
+        const idx = list.findIndex((session) => session.id === s.activeSessionId);
+        const next = e.shiftKey
+          ? list[idx <= 0 ? list.length - 1 : idx - 1]
+          : list[idx === -1 || idx === list.length - 1 ? 0 : idx + 1];
+        s.selectSession(next.id);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   /**
    * Start a new session with an agent (sidebar agent → ⋯ → New session):
    * opens the agent's console on its new-session page. The first send
@@ -2680,11 +2857,19 @@ export function ChatView() {
   const formatTime = (date: Date) =>
     date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
+  // ⌘U opens the file picker, ⌘J the folder picker. pickFolder goes through a
+  // ref so the listener can attach once without going stale.
+  const pickFolderRef = useRef(pickFolder);
+  pickFolderRef.current = pickFolder;
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "u") {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      if (e.key === "u") {
         e.preventDefault();
         fileInputRef.current?.click();
+      } else if (e.key === "j") {
+        e.preventDefault();
+        void pickFolderRef.current();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
@@ -2745,49 +2930,64 @@ export function ChatView() {
   };
 
   // A discrete slider uses only the effort values published for this model.
-  // A separate off position is offered only for known toggle API dialects.
+  // There is no "Default" slot: an unset session resolves to the model's
+  // middle tier and the slider shows that exact level. A separate off
+  // position is offered only for known toggle API dialects; toggle-only
+  // models (no effort scale) get an explicit On/Off pair instead.
+  const reasoningProtocol = reasoningToggleProtocolForBaseUrl(
+    selectedModelProvider?.baseUrl ?? "",
+    selectedModelLabel?.name ?? "",
+  );
   const reasoningOptions: Array<{ value: ReasoningEffort; label: string }> = (() => {
     if (!reasoningSupport?.reasoning) return [];
-    const opts: Array<{ value: ReasoningEffort; label: string }> = [
-      { value: "default", label: "Default" },
-    ];
+    const opts: Array<{ value: ReasoningEffort; label: string }> = [];
     const values = [...reasoningSupport.efforts];
-    if (
-      reasoningSupport.toggle &&
-      reasoningToggleProtocolForBaseUrl(selectedModelProvider?.baseUrl ?? "", selectedModelLabel?.name ?? "") &&
-      !values.includes("none")
-    ) values.push("none");
+    if (reasoningSupport.toggle && reasoningProtocol && !values.includes("none")) {
+      values.push("none");
+    }
     values.sort((a, b) => reasoningEffortRank(a) - reasoningEffortRank(b));
     for (const v of values) opts.push({ value: v, label: reasoningLabel(v) });
+    if (opts.length === 0 && reasoningSupport.toggle && reasoningProtocol) {
+      opts.push({ value: "none", label: reasoningLabel("none") });
+      opts.push({ value: "default", label: reasoningLabel("default") });
+    }
     return opts;
   })();
   const thinkingBudget = reasoningSupport?.thinkingBudget;
   const requestedBudgetMatch = reasoningEffort.match(/^budget:(\d+)$/);
   const requestedBudget = requestedBudgetMatch ? Number(requestedBudgetMatch[1]) : undefined;
-  const selectedBudget = thinkingBudget && requestedBudget !== undefined
-    ? Math.max(thinkingBudget.min, Math.min(thinkingBudget.max, requestedBudget))
+  // Unset sessions resolve to the middle of the published token range, so a
+  // fresh chat always shows (and sends) a concrete budget.
+  const defaultBudget = thinkingBudget
+    ? Math.round((thinkingBudget.min + thinkingBudget.max) / 2)
     : undefined;
-  const hasBudgetToggle = Boolean(
-    thinkingBudget &&
-    reasoningSupport?.toggle &&
-    reasoningToggleProtocolForBaseUrl(selectedModelProvider?.baseUrl ?? "", selectedModelLabel?.name ?? ""),
-  );
-  const budgetSliderMin = hasBudgetToggle ? -2 : -1;
+  const selectedBudget = thinkingBudget
+    ? requestedBudget !== undefined
+      ? Math.max(thinkingBudget.min, Math.min(thinkingBudget.max, requestedBudget))
+      : defaultBudget
+    : undefined;
+  const hasBudgetToggle = Boolean(thinkingBudget && reasoningSupport?.toggle && reasoningProtocol);
+  const budgetSliderMin = hasBudgetToggle ? -2 : 0;
   const budgetSliderValue = reasoningEffort === "none" && hasBudgetToggle
     ? -2
     : selectedBudget !== undefined && thinkingBudget
       ? Math.round(((selectedBudget - thinkingBudget.min) / (thinkingBudget.max - thinkingBudget.min)) * 100)
-      : -1;
-  const budgetDisplay = selectedBudget !== undefined
-    ? `${selectedBudget.toLocaleString()} tokens`
-    : reasoningEffort === "none" && hasBudgetToggle
-      ? "Off"
+      : 0;
+  const budgetDisplay = reasoningEffort === "none" && hasBudgetToggle
+    ? "Off"
+    : selectedBudget !== undefined
+      ? `${selectedBudget.toLocaleString()} tokens`
       : "Default";
+  // The slider position reflects the level that will actually be sent: an
+  // unset ("default") session shows the model's middle tier.
+  const resolvedDefaultEffort = resolveDefaultReasoningEffort(reasoningSupport);
   const selectedReasoningEffort = reasoningOptions.some((option) => option.value === reasoningEffort)
     ? reasoningEffort
-    : reasoningOptions.find(
-        (option) => option.value === sanitizeReasoningEffort(reasoningEffort, reasoningSupport),
-      )?.value ?? "default";
+    : reasoningOptions.some((option) => option.value === resolvedDefaultEffort)
+      ? resolvedDefaultEffort!
+      : reasoningOptions.find(
+          (option) => option.value === sanitizeReasoningEffort(reasoningEffort, reasoningSupport),
+        )?.value ?? "default";
   const selectedReasoningIndex = Math.max(
     0,
     reasoningOptions.findIndex((option) => option.value === selectedReasoningEffort),
@@ -2796,6 +2996,20 @@ export function ChatView() {
     ? (selectedReasoningIndex / (reasoningOptions.length - 1)) * 100
     : 0;
   const budgetSliderPercent = ((budgetSliderValue - budgetSliderMin) / (100 - budgetSliderMin)) * 100;
+  // Compact "which level is it on" label shown next to the model name in the
+  // composer (e.g. "GLM 5.3 · Medium").
+  const effortButtonLabel = (() => {
+    if (!reasoningSupport?.reasoning) return null;
+    if (thinkingBudget) {
+      if (reasoningEffort === "none" && hasBudgetToggle) return "Off";
+      if (selectedBudget === undefined) return null;
+      return selectedBudget >= 1000
+        ? `${Math.round(selectedBudget / 1000)}k tokens`
+        : `${selectedBudget} tokens`;
+    }
+    if (reasoningOptions.length === 0) return null;
+    return reasoningLabel(selectedReasoningEffort);
+  })();
   const sliderLabelStyle = (percent: number) => ({
     left: `${percent}%`,
     transform: percent <= 8 ? "translateX(0)" : percent >= 92 ? "translateX(-100%)" : "translateX(-50%)",
@@ -2847,8 +3061,6 @@ export function ChatView() {
               const value = Number(event.currentTarget.value);
               if (value === -2 && hasBudgetToggle) {
                 changeReasoningEffort("none");
-              } else if (value === -1) {
-                changeReasoningEffort("default");
               } else {
                 const tokens = Math.round(
                   thinkingBudget.min + (value / 100) * (thinkingBudget.max - thinkingBudget.min),
@@ -2865,8 +3077,12 @@ export function ChatView() {
           </div>
           </div>
         </>
-      ) : reasoningOptions.length <= 1 ? (
+      ) : reasoningOptions.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">This provider does not expose a compatible thinking toggle.</p>
+      ) : reasoningOptions.length === 1 ? (
+        <p className="mt-2 text-xs text-muted-foreground">
+          Thinking is fixed at {reasoningOptions[0].label} for this model.
+        </p>
       ) : (
         <>
           <div className="mb-2 flex items-center justify-between">
@@ -2965,14 +3181,10 @@ export function ChatView() {
               ? modelNameFor(selectedModelLabel)
               : "Select model"}
           </span>
-          {["high", "xhigh", "max"].includes(selectedReasoningEffort) && (
-            <SignalHigh className="size-3.5 shrink-0 text-red-500" />
-          )}
-          {selectedReasoningEffort === "medium" && (
-            <SignalMedium className="size-3.5 shrink-0 text-yellow-500" />
-          )}
-          {["low", "minimal"].includes(selectedReasoningEffort) && (
-            <SignalLow className="size-3.5 shrink-0 text-green-500" />
+          {effortButtonLabel && (
+            <span className="shrink-0 text-sm text-muted-foreground/60">
+              {effortButtonLabel}
+            </span>
           )}
         </button>
       </DropdownMenuTrigger>
@@ -3019,7 +3231,7 @@ export function ChatView() {
         variant="ghost"
         aria-label={`Toggle ${label} mode`}
         title={title}
-        disabled={disabled || hasFolderAttachment}
+        disabled={disabled}
         onClick={() => {
           // Manual toggle: wins over auto-detection and persists to the
           // session so the mode survives reloads (learn stays on until off).
@@ -3059,14 +3271,28 @@ export function ChatView() {
         <UsersRound />,
         "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
       )}
-      {modeToggle(
-        "task",
-        "Agentic",
-        "Agentic mode - plan and execute hands-on work with terminal, coding agents, and file deliverables",
-        <Workflow />,
-        "bg-blue-500/15 text-blue-500 hover:bg-blue-500/25 hover:text-blue-500",
-      )}
     </>
+  );
+
+  // Temporary chat toggle in the + menu — a check-on-the-right item that
+  // stays open when clicked (like the mode toggles, in blue when active).
+  const temporaryMenuItem = !isAgentTab && (
+    <DropdownMenuItem
+      disabled={messages.length > 0}
+      onSelect={(e) => {
+        e.preventDefault();
+        toggleTemporary(!isTemporary);
+      }}
+      className={
+        isTemporary
+          ? "bg-blue-500/15 text-blue-500 focus:bg-blue-500/25 focus:text-blue-500"
+          : undefined
+      }
+    >
+      <ClockFading className={isTemporary ? "text-blue-500" : undefined} />
+      Temporary chat
+      {isTemporary && <Check className="ml-auto size-4 text-blue-500" />}
+    </DropdownMenuItem>
   );
 
   const renderMessage = (msg: ChatMessage) => {
@@ -3220,6 +3446,10 @@ export function ChatView() {
                   workEndedAt={msg.workEndedAt}
                   workDurationMs={msg.workDurationMs}
                   workSegments={msg.workSegments}
+                  // A record from another app context (window/instance/device)
+                  // that is still being written renders as working, not as a
+                  // finished "Worked for" summary that keeps growing.
+                  live={isRunRecordActive(msg)}
                   onOpenArtifact={handleOpenArtifactFromContent}
                 />
               )}
@@ -4328,8 +4558,16 @@ export function ChatView() {
                       }
                       // Ghost suggestion: Tab accepts it into the box (it
                       // comes back if the text is deleted), Escape dismisses
-                      // it until the next reply.
-                      if (e.key === "Tab" && ghostSuggestion && !e.shiftKey) {
+                      // it until the next reply. Plain Tab only — Ctrl+Tab
+                      // (chat cycling) and other modified Tabs pass through.
+                      if (
+                        e.key === "Tab" &&
+                        ghostSuggestion &&
+                        !e.shiftKey &&
+                        !e.ctrlKey &&
+                        !e.metaKey &&
+                        !e.altKey
+                      ) {
                         e.preventDefault();
                         setInputText(ghostSuggestion);
                         return;
@@ -4370,7 +4608,7 @@ export function ChatView() {
                       <DropdownMenuContent side="top" align="start">
                         <DropdownMenuSub>
                           <DropdownMenuSubTrigger>
-                            <FolderPlus />
+                            <PackagePlus />
                             Add to Project
                           </DropdownMenuSubTrigger>
                           <DropdownMenuSubContent>
@@ -4387,32 +4625,16 @@ export function ChatView() {
                             ))}
                           </DropdownMenuSubContent>
                         </DropdownMenuSub>
-                        {!isAgentTab && (
-                          <div
-                            className="flex items-center justify-between gap-2 px-2 py-1.5 text-sm"
-                            data-disabled={messages.length > 0 ? "" : undefined}
-                          >
-                            <span className="flex items-center gap-2">
-                              <ClockFading className="size-4" />
-                              Temporary chat
-                            </span>
-                            <Switch
-                              size="sm"
-                              aria-label="Temporary chat"
-                              checked={isTemporary}
-                              disabled={messages.length > 0}
-                              onCheckedChange={toggleTemporary}
-                            />
-                          </div>
-                        )}
+                        <DropdownMenuItem onClick={() => void pickFolder()}>
+                          <FolderPlus />
+                          Add folder
+                          <DropdownMenuShortcut>⌘J</DropdownMenuShortcut>
+                        </DropdownMenuItem>
+                        {temporaryMenuItem}
                         <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
                           <Paperclip />
                           Add files
                           <DropdownMenuShortcut>⌘U</DropdownMenuShortcut>
-                        </DropdownMenuItem>
-                        <DropdownMenuItem onClick={() => void pickFolder()}>
-                          <Folder />
-                          Add folder for agent
                         </DropdownMenuItem>
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -4997,7 +5219,7 @@ export function ChatView() {
                     <DropdownMenuContent side="top" align="start">
                       <DropdownMenuSub>
                         <DropdownMenuSubTrigger>
-                          <FolderPlus />
+                          <PackagePlus />
                           Add to Project
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent>
@@ -5014,29 +5236,16 @@ export function ChatView() {
                           ))}
                         </DropdownMenuSubContent>
                       </DropdownMenuSub>
-                      {!isAgentTab && (
-                        <div className="flex items-center justify-between gap-2 px-2 py-1.5 text-sm">
-                          <span className="flex items-center gap-2">
-                            <ClockFading className="size-4" />
-                            Temporary chat
-                          </span>
-                          <Switch
-                            size="sm"
-                            aria-label="Temporary chat"
-                            checked={isTemporary}
-                            disabled={messages.length > 0}
-                            onCheckedChange={toggleTemporary}
-                          />
-                        </div>
-                      )}
+                      <DropdownMenuItem onClick={() => void pickFolder()}>
+                        <FolderPlus />
+                        Add folder
+                        <DropdownMenuShortcut>⌘J</DropdownMenuShortcut>
+                      </DropdownMenuItem>
+                      {temporaryMenuItem}
                       <DropdownMenuItem onClick={() => fileInputRef.current?.click()}>
                         <Paperclip />
                         Add files
                         <DropdownMenuShortcut>⌘U</DropdownMenuShortcut>
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => void pickFolder()}>
-                        <Folder />
-                        Add folder for agent
                       </DropdownMenuItem>
                     </DropdownMenuContent>
                   </DropdownMenu>
@@ -5322,9 +5531,12 @@ export function ChatView() {
       autoModeRef.current = "none";
     }
 
-    // Task mode runs the standalone task context, isolated from universal
-    // memory like any agent-style run (see handleSend).
-    const arc = chatMode === "task" ? await agentRunContext({}) : null;
+    // Every default chat-tab send runs the standalone task context, isolated
+    // from universal memory like any agent-style run (see handleSend).
+    const arc =
+      chatMode === "learn" || chatMode === "research" || chatMode === "council"
+        ? null
+        : await agentRunContext({});
 
     const mode: AgentMode = arc
       ? arc.mode
@@ -5508,6 +5720,16 @@ export function ChatView() {
               ],
             );
           }
+          requestPostRunSuggestion(
+            newSession.id,
+            provider,
+            selectedModel,
+            [
+              { role: "user", content: text },
+              { role: "assistant", content: result.content },
+            ],
+            { allowModes: true },
+          );
         }
 
         if (!arc && settings.autoMemory && !isTemporary && result.content) {

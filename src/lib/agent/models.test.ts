@@ -2,15 +2,22 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // models.ts pulls getProviderApiKey (localStorage-backed) and the models.dev
 // catalog (network) — replace both so the test runs hermetically in node.
-// The reasoning sanitizer stays real; the catalog lookup is stubbed to a miss
-// so efforts pass through verbatim unless the GLM mapping rewrites them.
+// The reasoning sanitizer and default resolver stay real; the catalog lookup
+// is stubbed with a small support table per model name.
+const mocks = vi.hoisted(() => ({
+  support: {
+    "glm-5.3": { reasoning: true, efforts: ["low", "high", "max"], toggle: true },
+    "gpt-4o": { reasoning: true, efforts: ["low", "medium", "high"], toggle: false },
+  } as Record<string, unknown>,
+}));
 vi.mock("@/lib/llm", () => ({ getProviderApiKey: async () => "test-key" }));
 vi.mock("@/lib/model-capabilities", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/model-capabilities")>();
   return {
     ...actual,
     getModelOutputLimit: async () => 8192,
-    getModelReasoning: async () => null,
+    getModelReasoning: async (_provider: unknown, modelName: string) =>
+      mocks.support[modelName] ?? null,
   };
 });
 
@@ -40,9 +47,13 @@ async function effortKwargs(modelName: string, effort?: ReasoningEffort): Promis
 }
 
 describe("createChatModel reasoning_effort", () => {
-  it("sends reasoning_effort for GLM on default (provider would otherwise think at max)", async () => {
-    const kwargs = await effortKwargs("glm-5.3", "default");
-    expect(kwargs.reasoning_effort).toBe("low");
+  it("resolves a fresh session to the model's middle tier, not the provider default", async () => {
+    // GLM's low/high/max scale: middle = high — the previous behavior forced
+    // the lowest tier here, which made thinking invisible.
+    expect((await effortKwargs("glm-5.3", "default")).reasoning_effort).toBe("high");
+    expect((await effortKwargs("glm-5.3")).reasoning_effort).toBe("high");
+    // A scale with an explicit medium picks medium.
+    expect((await effortKwargs("gpt-4o", "default")).reasoning_effort).toBe("medium");
   });
 
   it("maps GLM efforts onto the low/high/max enum the provider accepts", async () => {
@@ -51,17 +62,45 @@ describe("createChatModel reasoning_effort", () => {
     expect((await effortKwargs("glm-5.3", "high")).reasoning_effort).toBe("high");
     expect((await effortKwargs("glm-5.3", "xhigh")).reasoning_effort).toBe("max");
     expect((await effortKwargs("glm-5.3", "max")).reasoning_effort).toBe("max");
-    expect((await effortKwargs("glm-5.3")).reasoning_effort).toBe("low");
   });
 
-  it("sends nothing for non-GLM models on default (provider default applies)", async () => {
-    const kwargs = await effortKwargs("gpt-4o", "default");
-    expect(kwargs.reasoning_effort).toBeUndefined();
-  });
-
-  it("passes explicit non-GLM efforts through as reasoning_effort", async () => {
+  it("passes explicit efforts through as reasoning_effort", async () => {
     expect((await effortKwargs("gpt-4o", "high")).reasoning_effort).toBe("high");
     expect((await effortKwargs("gpt-4o", "low")).reasoning_effort).toBe("low");
+  });
+
+  it("sends nothing for models the catalog knows no reasoning support for", async () => {
+    const kwargs = await effortKwargs("no-such-model", "default");
+    expect(kwargs.reasoning_effort).toBeUndefined();
+  });
+});
+
+describe("createChatModel toggle-only reasoning defaults", () => {
+  async function toggleKwargs(baseUrl: string, modelName = "toggle-model") {
+    mocks.support[modelName] = { reasoning: true, efforts: [], toggle: true };
+    try {
+      const model = await createChatModel({ ...provider, baseUrl }, modelName, "default");
+      if (!("modelKwargs" in model)) throw new Error("Expected an OpenAI-compatible model");
+      return model.modelKwargs ?? {};
+    } finally {
+      delete mocks.support[modelName];
+    }
+  }
+
+  it("explicitly enables thinking on DeepSeek-dialect hosts", async () => {
+    expect(await toggleKwargs("https://api.deepseek.com/v1")).toEqual({
+      thinking: { type: "enabled" },
+    });
+  });
+
+  it("explicitly enables reasoning on OpenRouter", async () => {
+    expect(await toggleKwargs("https://openrouter.ai/api/v1")).toEqual({
+      reasoning: { enabled: true },
+    });
+  });
+
+  it("leaves the provider default in charge for unknown dialects", async () => {
+    expect(await toggleKwargs("https://api.example.com/v1")).toEqual({});
   });
 });
 

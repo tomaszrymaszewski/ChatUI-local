@@ -761,8 +761,28 @@ export function isReasoningEffortSupported(
 }
 
 /**
+ * The effort a fresh session starts on when no level has been chosen yet:
+ * the middle tier of the model's published scale (preferring "medium" when
+ * the catalog lists it, otherwise the rank middle — ties prefer deeper
+ * thinking). Without a scale there is no level to show, so undefined is
+ * returned and callers fall back to provider default / explicit toggle
+ * enables. This is what makes "unset" mean a real, visible thinking level
+ * instead of whatever (often off/minimal) default the provider applies.
+ */
+export function resolveDefaultReasoningEffort(
+  support: ModelReasoningSupport | null,
+): string | undefined {
+  if (!support?.reasoning) return undefined;
+  const scale = support.efforts.filter((effort) => effort !== "none");
+  if (scale.length === 0) return undefined;
+  if (scale.includes("medium")) return "medium";
+  const sorted = [...scale].sort((a, b) => reasoningEffortRank(a) - reasoningEffortRank(b));
+  return sorted[Math.ceil((sorted.length - 1) / 2)];
+}
+
+/**
  * Clamp a requested effort to what the model actually accepts:
- * - "default"/unset → undefined (send nothing, provider default)
+ * - "default"/unset → undefined (caller resolves the model's middle tier)
  * - unknown/unsupported model → undefined (use provider default)
  * - valid value → verbatim
  * - invalid value → nearest valid value by rank (ties prefer deeper thinking)

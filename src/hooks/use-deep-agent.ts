@@ -10,6 +10,7 @@ import { buildRunThoughts, toHistoryMessage, resolveContextWindow } from "@/lib/
 import { getModelCost, priceUsage, type ModelPrices } from "@/lib/model-capabilities";
 import { ensureDeliverablesDir } from "@/lib/deliverables";
 import { loadMessages } from "@/hooks/use-messages";
+import { findActiveRunMessage } from "@/lib/run-state";
 import { loadUserSettings } from "@/hooks/use-user-settings";
 import { notifyIfBackground } from "@/lib/notify";
 import { scheduleKnowledgeSweep } from "@/lib/knowledge-index";
@@ -254,6 +255,8 @@ export interface AgentControllerApi {
   run: (opts: DeepAgentRunOptions) => Promise<AgentRunResult>;
   submitInput: (values: Record<string, unknown>) => void;
   skipInput: () => void;
+  /** Show a suggestion card (post-run suggestion system, not the agent). */
+  showSuggestion: (suggestion: SuggestionRequest) => void;
   dismissSuggestion: () => void;
   approveCommand: (id: string) => void;
   rejectCommand: (id: string) => void;
@@ -732,6 +735,17 @@ class AgentController implements AgentControllerApi {
   };
 
   run = async (opts: DeepAgentRunOptions): Promise<AgentRunResult> => {
+    // One run per chat across contexts: another app window/instance (or a
+    // device syncing in) may already be streaming into this session. Its
+    // in-progress record is fresh and unfinalized — refuse to start a second
+    // run that would interleave with it. Stale records (dead context) don't
+    // block: they age out of the liveness window.
+    if (findActiveRunMessage(loadMessages(this.sessionId))) {
+      this.resetState();
+      throw new Error(
+        "This chat is already running in another app window or on another device — wait for it to finish, or stop it there first.",
+      );
+    }
     this.resetState();
     const workStartedAt = Date.now();
     this.workStartedAt = workStartedAt;
@@ -762,8 +776,9 @@ class AgentController implements AgentControllerApi {
       const mode = opts.mode ?? "chat";
       // Mode-aware effort: research/council pipelines deliberate deeper by
       // default. A user-selected effort always wins; "default" (or unset)
-      // picks "high" for the deep pipelines and stays untouched for plain
-      // chat/task runs (GLM maps "high" to its "max" tier in models.ts).
+      // picks "high" for the deep pipelines and stays "default" for plain
+      // chat/task runs, where models.ts resolves it to the model's middle
+      // thinking tier.
       const reasoningEffort =
         opts.reasoningEffort && opts.reasoningEffort !== "default"
           ? opts.reasoningEffort
@@ -808,7 +823,8 @@ class AgentController implements AgentControllerApi {
       } else {
         // Knowledge retrieval (RAG): top hits from the persistent index ride
         // along in the instructions; their ids are remembered so the agent's
-        // search_knowledge tool can look beyond them.
+        // search_knowledge tool can look beyond them, and matched skill names
+        // steer which skills get advertised to the model.
         let instructions = opts.instructions;
         const retrieval = await retrieveKnowledgeContext(lastUserText(opts.messages));
         setRetrievedDocIds(retrieval.ids);
@@ -841,6 +857,7 @@ class AgentController implements AgentControllerApi {
           enableFileTools: opts.taskProfile?.enableFileTools,
           enableComputerUse: opts.taskProfile?.enableComputerUse,
           skillNames: opts.taskProfile?.skillNames,
+          relevantSkills: retrieval.skillNames,
           mcpNames: opts.taskProfile?.mcpNames,
           sandbox,
           deliverablesDir,
@@ -1024,6 +1041,12 @@ class AgentController implements AgentControllerApi {
     this.inputResolverRef?.({ cancelled: true });
     this.inputResolverRef = null;
     this.pendingInput = null;
+    this.notify();
+  };
+
+  /** Post-run suggestion system: shows a card the model never emitted itself. */
+  showSuggestion = (suggestion: SuggestionRequest) => {
+    this.pendingSuggestion = suggestion;
     this.notify();
   };
 

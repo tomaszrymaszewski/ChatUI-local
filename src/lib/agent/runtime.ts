@@ -111,6 +111,8 @@ export interface AgentSessionOptions {
   enableComputerUse?: boolean;
   /** Restrict loaded skills to these names (sandboxed agents). undefined = all installed. */
   skillNames?: string[];
+  /** Task-relevant skill names (RAG hits, relevance order) — advertised before the MRU fill. */
+  relevantSkills?: string[];
   /** Restrict MCP connectors to these connector store keys. undefined = all enabled; [] = none. */
   mcpNames?: string[];
   /** Saved-agent runs: identity + filesystem sandbox + chat-history access. */
@@ -130,7 +132,7 @@ You are a helpful assistant in a local chat app. Answer exactly what the user as
 
 const RICH_FORMAT_PROMPT = `
 You can generate rich content inline in your markdown replies:
-- Math and symbols: LaTeX in $$…$$ delimiters only (KaTeX) — $$E = mc^2$$ inline or $$…$$ on its own line for block math; a single $ is always a literal dollar sign, never math. LaTeX tables are supported.
+- Math and symbols: LaTeX in $$…$$ delimiters (KaTeX) — $$E = mc^2$$ inline or $$…$$ on its own line for block math. Single $…$ also renders as math; prefer $$…$$. LaTeX tables are supported.
 - Diagrams: fenced \`\`\`mermaid blocks (flowcharts, sequence diagrams, gantt, …).
 - Data charts: fenced \`\`\`chart blocks containing a Vega-Lite JSON spec (bar, line, scatter, pie, …).
 - Vector images: fenced \`\`\`svg blocks with a complete <svg> element.
@@ -152,8 +154,9 @@ Other tools:
   exact path from the skill list (limit=1000). They are NOT real disk paths — shell commands (cat)
   will not find them; read_local_file understands /skills/ paths too. Each skill's real folder on
   disk is stated in a "Disk location" note at the top of its SKILL.md — run its scripts and read
-  its supporting files from there (run_python / run_command). Only recently used skills are listed;
-  if a skill you expect is missing from the list, call search_skills — it sees the full library.
+  its supporting files from there (run_python / run_command). Only a few skills (the most
+  relevant to this task, then the most recently used) are listed; if a skill you expect is
+  missing from the list, call search_skills — it sees the full library.
 - When you need specific structured parameters from the user (research topic and depth, a code
   task spec, document requirements), call request_structured_input with a short form instead of
   asking in prose.
@@ -166,44 +169,21 @@ Other tools:
   invisible to the user until you share them: call share_files with the absolute paths and a
   download card is attached to your message. Never say a file is "ready to download" without
   calling share_files first.
-- Automations: for recurring or future work ("every weekday at 9am …", "weekly on Monday …",
+`.trim();
+
+/**
+ * Automations guidance — dedicated (saved) agents only. Chat-tab and
+ * standalone task runs have no scheduling tools, so the text (and the tools
+ * themselves, see buildAgentTools) never reach them.
+ */
+const AUTOMATIONS_PROMPT = `
+Automations:
+- For recurring or future work ("every weekday at 9am …", "weekly on Monday …",
   "in 2 hours remind me to …", "every morning …"), set it up with schedule_task (a self-contained
   prompt or a multi-step workflow via create_workflow) instead of only answering in the moment.
   Confirm the cadence with the user before creating. Runs happen only while the app is open;
   the user manages everything in the Agent Console's Automations section (list_schedules,
   update_schedule to pause/adjust, delete_schedule to remove).
-`.trim();
-
-const SUGGESTIONS_PROMPT = `
-Chat modes — the user can activate special modes by starting their message with a keyword:
-- "discuss …"  → Discuss mode (a panel of agents deliberating, chairman synthesizes the answer)
-- "teach me …" or "i want to learn …" → Learn mode (structured tutoring with a comprehension check)
-- "research …" → Research mode (multi-round, search-driven cited report)
-You can also suggest a mode to the user via the suggest tool when their request would clearly benefit from one.
-
-Skills and connectors — proactive discovery:
-- Every catalog skill is discoverable and installs on demand — the user never downloads anything.
-  When the user's task might benefit from a capability (creating Word/Excel/PPT/PDF files, frontend
-  design, testing, etc.), call search_skills to find the matching skill and use it directly. If the
-  best match is NOT installed yet, search_skills installs it on the spot and returns its SKILL.md —
-  follow it in this run. Only if that install fails, call suggest with kind=skill to show an install card.
-- Similarly, when the user wants to interact with an external app (email, calendar, docs, project
-  tracker, etc.), call search_connectors to find one. Connectors that are connected or need no
-  sign-in are usable IMMEDIATELY: list their tools with list_mcp_tools, call them with call_mcp_tool —
-  in this run, no restart needed. For a connector that needs sign-in, call suggest with kind=connector
-  — the card lets the user connect and sign in with one click, and afterwards call_mcp_tool works in
-  the same run. Connectors that surface in the "Relevant knowledge" context work the same way. For
-  Google Workspace (Gmail, Google Calendar, Google Docs, Drive) and Microsoft 365 (Outlook, Excel,
-  Word), the Zapier connector covers all of them — search for "gmail", "office", or "google" to find it.
-- Never suggest something that is already installed or connected (the search results show status).
-- After calling suggest, continue your reply naturally — the card is shown to the user automatically.
-
-Task mode — handing off hands-on work:
-- When the conversation clearly turns into hands-on work — running terminal
-  commands, editing local files, multi-step local execution, or producing a deliverable that needs
-  tools the chat doesn't have — call suggest with kind=mode and target="task". The card turns on
-  Task mode for this conversation with its full history. Only suggest this once per
-  conversation, and never when you can already complete the request yourself.
 `.trim();
 
 const TASK_MANAGER_PROMPT = `
@@ -218,10 +198,10 @@ Working style:
   /skills/ when a task matches one; search_skills finds the whole catalog and installs a
   matching skill on the spot — use it instead of asking the user to download anything.
 - Connectors (external apps) work the same way: search_connectors finds them, connected or
-  auth-free ones are usable immediately via list_mcp_tools + call_mcp_tool in this run, and a
-  connector needing sign-in gets a suggest kind=connector card — after the user connects,
-  call_mcp_tool works in the same run. The most recently used connectors also expose native
-  mcp__… tools.
+  auth-free ones are usable immediately via list_mcp_tools + call_mcp_tool in this run. A
+  connector that needs sign-in must be connected by the user first — tell them which one and
+  that they can connect it in Settings → Connectors. The most recently used connectors also
+  expose native mcp__… tools.
 - Be transparent: say what you are about to do, and report what you did.
 `.trim();
 
@@ -231,6 +211,11 @@ Local execution:
   file operations, git, builds, tests, system inspection — anything a terminal can do. Prefer
   short, safe, targeted commands, and explain why each is needed. The user approves commands
   depending on their settings; if one is denied, don't retry it.
+- Pro apps with a command line (Blender, ffmpeg, ImageMagick, Pandoc, LibreOffice, …) are driven
+  headlessly through run_command, not the GUI — e.g. write a script with write_local_file, then
+  run \`blender --background --python script.py\` to build/render/export without opening a window.
+  Check \`command -v <tool>\` first when you're unsure it's installed; if it isn't, tell the user
+  (suggest brew install …) instead of guessing.
 - run_python runs Python for calculations and data processing.
 - open_app opens a Mac app by name so the user can continue there; run_applescript automates
   scriptable Mac apps (Mail, Calendar, Finder, Music, …) and returns the result. Both need user
@@ -309,8 +294,8 @@ function buildAgentSandboxPrompt(sandbox: AgentSandbox): string {
     "- Self-configuration: when the user asks you to change your own setup by chatting " +
       "(instructions, purpose, model, connectors, terminal/web/read-chats permissions), call " +
       "update_agent with only the fields that change. When you merely think a change would " +
-      "help, propose it with suggest (kind=agent_config + agent_patch) so the user can apply " +
-      "it with one click. Folder, project, and knowledge-file access is user-only — never " +
+      "help, propose it in your reply and wait for the user's go-ahead before applying it. " +
+      "Folder, project, and knowledge-file access is user-only — never " +
       "claim to change it yourself.",
   );
   return lines.join("\n");
@@ -331,8 +316,9 @@ decisions. Do not skip to creation early.
 2. Inputs: where its material comes from (which apps, files, folders, accounts, formats).
 3. Rhythm: one-off on demand, or recurring — how often, on what trigger, at what time.
 4. Scope: what is explicitly NOT its job. Record at least one non-goal before creating.
-5. Integrations: call search_connectors for capabilities that match the purpose, and show
-   the best matches with suggest cards. Never suggest anything already connected. Skills need
+5. Integrations: call search_connectors for capabilities that match the purpose and pick the
+   best matches for the agent. In your final message, tell the user which connectors to connect
+   in Settings → Connectors — never pick anything already connected. Skills need
    no setup — every agent automatically discovers installed skills when it needs them, so do
    not interview about skills.
 6. Permissions: every agent always gets terminal/command access and web
@@ -365,7 +351,9 @@ function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
     if (opts.enableComputerUse) {
       parts.push(
         "For websites and browser interfaces, use the shared computer_* browser tools first. List/select a browser tab with computer_select_window; open sites with computer_navigate; inspect pages with computer_accessibility_tree, then use computer_click, computer_type, computer_keypress, or computer_scroll. Use computer_screenshot when a visual check helps. " +
-          "These tools operate in an isolated headless browser session, and the user can keep using their own apps and browser while you work. Never take over the user's visible mouse or keyboard.",
+          "These tools operate in an isolated headless browser session, and the user can keep using their own apps and browser while you work. Never take over the user's visible mouse or keyboard. " +
+          "When a service has no connected connector (email, calendar, docs, …), use its website through these tools instead of giving up — the browser profile is persistent, so a sign-in the user did once stays signed in across runs. " +
+          "If you hit a login wall or the browser reports the profile is in use, ask the user to sign in once via Settings → Connectors → \"Browser sign-in\" (and to close that window afterwards), then retry.",
       );
     }
     if (opts.enableFileTools) {
@@ -382,6 +370,9 @@ function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
     if (base) parts.push(base);
   }
   parts.push(RICH_FORMAT_PROMPT);
+  if (opts.sandbox?.agentId) {
+    parts.push(AUTOMATIONS_PROMPT);
+  }
   if (opts.deliverablesDir) {
     parts.push(
       `Deliverables folder: ${opts.deliverablesDir}\n` +
@@ -390,7 +381,6 @@ function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
         `path so a download card appears in the chat.`,
     );
   }
-  if (opts.toolProfile !== "task") parts.push(SUGGESTIONS_PROMPT);
   return parts.join("\n\n");
 }
 
@@ -607,7 +597,7 @@ export function toolCallArgsPreview(name: string, input: unknown): string | unde
   if (name === "read_local_file") {
     return typeof args.path === "string" ? args.path : undefined;
   }
-  // Fallback (MCP tools, suggest, schedules, …): compact JSON, tightly capped.
+  // Fallback (MCP tools, schedules, …): compact JSON, tightly capped.
   try {
     const json = JSON.stringify(input);
     if (json.length <= ARGS_PREVIEW_JSON_CHARS) return json;
@@ -650,18 +640,14 @@ export class DeepAgentSession {
     // On-demand proxy for the non-hot connectors — including ones connected
     // mid-run from a suggestion card (usable in the SAME run).
     const mcpProxy = createMcpProxy(opts.projectDir, opts.mcpNames);
-    let skillFiles = await loadSkillFiles(opts.projectDir);
-    if (opts.skillNames) {
-      // Sandboxed agents only see the skills chosen at setup time.
-      const allowed = new Set(opts.skillNames);
-      skillFiles = Object.fromEntries(
-        Object.entries(skillFiles).filter(([path]) => {
-          const m = path.match(/^\/skills\/([^/]+)\/SKILL\.md$/);
-          return !m || allowed.has(m[1]);
-        }),
-      );
-    }
-    skillFiles = withBuiltinSkill(skillFiles);
+    const skillFiles = withBuiltinSkill(
+      await loadSkillFiles(opts.projectDir, {
+        relevantNames: opts.relevantSkills,
+        // Sandboxed agents only see the skills chosen at setup time — the
+        // cap applies within their allowed set.
+        onlyNames: opts.skillNames,
+      }),
+    );
     const historyBudget = await resolveHistoryBudget(opts.provider, opts.modelName);
     const compactionTokens = await resolveCompactionThreshold(opts.provider, opts.modelName);
 

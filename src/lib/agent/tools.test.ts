@@ -59,16 +59,34 @@ describe("buildAgentTools file tools", () => {
 });
 
 describe("automation tools", () => {
-  it("are available in the plain chat profile", () => {
+  const AUTOMATION_TOOLS = [
+    "schedule_task",
+    "list_schedules",
+    "update_schedule",
+    "delete_schedule",
+    "create_workflow",
+    "delete_workflow",
+  ];
+
+  it("are hidden from non-dedicated runs (plain chat profile, no sandbox)", () => {
     const names = buildAgentTools(true, () => null, "chat").map((t) => t.name);
-    for (const name of [
-      "schedule_task",
-      "list_schedules",
-      "update_schedule",
-      "delete_schedule",
-      "create_workflow",
-      "delete_workflow",
-    ]) {
+    for (const name of AUTOMATION_TOOLS) {
+      expect(names).not.toContain(name);
+    }
+  });
+
+  it("are hidden from standalone task runs (no sandbox) too", () => {
+    const names = buildAgentTools(true, () => null, "task", false).map((t) => t.name);
+    for (const name of AUTOMATION_TOOLS) {
+      expect(names).not.toContain(name);
+    }
+  });
+
+  it("are available to dedicated (saved) agents", () => {
+    const names = buildAgentTools(true, () => null, "task", false, {
+      agentId: "agent-1",
+    }).map((t) => t.name);
+    for (const name of AUTOMATION_TOOLS) {
       expect(names).toContain(name);
     }
   });

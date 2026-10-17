@@ -6,8 +6,8 @@ import { isAnthropicProvider } from "@/lib/providers/anthropic";
 import {
   getModelOutputLimit,
   getModelReasoning,
-  reasoningEffortRank,
   reasoningToggleProtocolForBaseUrl,
+  resolveDefaultReasoningEffort,
   sanitizeReasoningEffort,
 } from "@/lib/model-capabilities";
 
@@ -38,17 +38,27 @@ function reasoningRequestFields(
 ): Record<string, unknown> {
   if (!support?.reasoning) return {};
 
-  let effort = sanitizeReasoningEffort(requestedEffort, support);
-  // GLM providers default to the deepest setting. For a fresh session, start
-  // at the model's actual lowest thinking level rather than inventing an enum.
-  if (
-    /glm/i.test(modelName) &&
-    (!requestedEffort || requestedEffort === "default") &&
-    support.efforts.length > 0
-  ) {
-    effort = support.efforts
-      .filter((value) => value !== "none")
-      .sort((a, b) => reasoningEffortRank(a) - reasoningEffortRank(b))[0];
+  const explicit = Boolean(requestedEffort && requestedEffort !== "default");
+  // A fresh session ("default"/unset) starts at the model's middle tier so
+  // the model actually thinks at a visible level, instead of the provider's
+  // default — which for several hosts is minimal or thinking-off entirely.
+  let effort = explicit
+    ? sanitizeReasoningEffort(requestedEffort, support)
+    : resolveDefaultReasoningEffort(support);
+  if (!effort && !explicit && support.toggle) {
+    // Toggle-only models have no scale to pick a level from; turn thinking on
+    // explicitly where the wire format is known, otherwise leave the
+    // provider's default in charge.
+    const protocol = reasoningToggleProtocolForBaseUrl(provider.baseUrl, modelName);
+    if (protocol === "deepseek") return { thinking: { type: "enabled" } };
+    if (protocol === "openrouter") return { reasoning: { enabled: true } };
+    return {};
+  }
+  if (!effort && !explicit && support.thinkingBudget) {
+    // Budget-only models: unset resolves to the middle of the published
+    // range — the same level the slider displays.
+    const { min, max } = support.thinkingBudget;
+    effort = `budget:${Math.round((min + max) / 2)}`;
   }
   const budget = effort?.match(/^budget:(\d+)$/);
   if (budget && support.thinkingBudget) {
@@ -314,7 +324,13 @@ export async function createChatModel(
   // use the provider default instead of sending a possibly invalid value.
   const support = await getModelReasoning(provider, modelName).catch(() => null);
   if (isAnthropicProvider(provider.baseUrl)) {
-    const effort = sanitizeReasoningEffort(reasoningEffort, support);
+    // Same "unset = middle tier" rule as the OpenAI-compatible path, so a
+    // fresh Claude session thinks at a visible level instead of the API
+    // default (no thinking).
+    const effort =
+      reasoningEffort && reasoningEffort !== "default"
+        ? sanitizeReasoningEffort(reasoningEffort, support)
+        : resolveDefaultReasoningEffort(support);
     const budget = effort?.match(/^budget:(\d+)$/);
     const model = modelName.toLowerCase();
     const supportsAdaptiveThinking =

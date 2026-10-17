@@ -602,7 +602,7 @@ async function connectorDocs(): Promise<RawSourceDoc[]> {
       : "Not connected yet.";
     const guidance = connected
       ? ""
-      : " If this would help with the user's request, propose connecting it with the suggest tool (kind=connector) — the user can connect and sign in with one click.";
+      : " If this would help with the user's request, tell the user to connect it in Settings → Connectors.";
     const summary = `${e.name}. ${e.tagline} Category: ${e.category}. Vendor: ${e.vendor}. Auth: ${e.auth}.${keywords} ${state}${guidance}`;
     docs.push({
       sourceType: "connector",

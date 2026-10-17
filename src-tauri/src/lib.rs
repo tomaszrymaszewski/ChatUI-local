@@ -996,10 +996,27 @@ fn browser_mcp_log_path() -> Option<PathBuf> {
     chat_ui_base_dir().ok().map(|b| b.join("logs").join("browser-mcp.log"))
 }
 
+/// A `Command` for the user's login shell in interactive mode
+/// (`$SHELL -lic`). GUI-launched apps get a minimal PATH, and plain
+/// `sh -lc` only reads /etc/profile + ~/.profile — zsh users keep their
+/// PATH (homebrew, nvm, fnm, …) in ~/.zprofile/~/.zshrc, which load only
+/// for an interactive login zsh. Without this, `node`, `npx`, and
+/// homebrew CLIs like `blender` are "not found" inside the packaged app
+/// even though they work fine in Terminal. Falls back to /bin/zsh when
+/// $SHELL is unset.
+fn login_shell_command() -> Command {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/bin/zsh".to_string());
+    let mut cmd = Command::new(shell);
+    cmd.arg("-lic");
+    cmd
+}
+
 /// npx resolves through the user's login-shell PATH (same approach as run_node).
 fn npx_exists() -> bool {
-    Command::new("sh")
-        .arg("-lc")
+    login_shell_command()
         .arg("command -v npx")
         .output()
         .map(|o| o.status.success())
@@ -1023,8 +1040,8 @@ fn spawn_browser_mcp() -> Result<(), String> {
         return Err("npx was not found — install Node.js to use the browser connector".to_string());
     }
 
-    let mut cmd = Command::new("sh");
-    cmd.arg("-lc").arg(format!(
+    let mut cmd = login_shell_command();
+    cmd.arg(format!(
         // exec replaces the shell with npx, so the tracked PID is the server
         // process and not just a wrapper. --browser chrome uses the installed
         // Google Chrome (no separate Chromium download); the profile is
@@ -1102,6 +1119,104 @@ async fn browser_mcp_start() -> Result<(), String> {
 async fn browser_mcp_stop() -> Result<(), String> {
     kill_tracked_browser_mcp();
     Ok(())
+}
+
+/// `mcp-chrome-<sha256(root)[:7]>` token for one root path — must match
+/// @playwright/mcp's createHash (sha256 hex, first 7 chars).
+fn browser_profile_hash_token(root: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(root.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{:02x}", b)).collect::<String>()[..7].to_string()
+}
+
+/// Persistent Chrome profile folder the built-in Playwright MCP derives for
+/// the agent browser: `<cache>/ms-playwright-mcp/mcp-chrome-<sha256(root)[:7]>`
+/// where root is the first MCP root the app declares (the home folder — see
+/// the roots handler in src/lib/agent/mcp.ts). Prefers that exact folder;
+/// when it doesn't exist yet (derivation drift across MCP versions), falls
+/// back to the newest existing `mcp-chrome-*` profile.
+fn browser_mcp_profile_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let cache = if cfg!(target_os = "macos") {
+        home.join("Library").join("Caches")
+    } else {
+        home.join(".cache")
+    }
+    .join("ms-playwright-mcp");
+
+    let token = browser_profile_hash_token(&home.to_string_lossy());
+    let exact = cache.join(format!("mcp-chrome-{}", token));
+    if exact.is_dir() {
+        return Some(exact);
+    }
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(entries) = fs::read_dir(&cache) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("mcp-chrome-") || !path.is_dir() {
+                continue;
+            }
+            if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                if newest.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
+                    newest = Some((modified, path));
+                }
+            }
+        }
+    }
+    Some(newest.map(|(_, path)| path).unwrap_or(exact))
+}
+
+/// Open the agent browser's persistent Chrome profile in headed mode so the
+/// user can sign in to websites (Gmail, …) by hand once; the profile keeps
+/// the session for later headless agent runs. The headless MCP server is
+/// stopped first — a Chrome profile only allows one instance — and restarts
+/// lazily on the next agent use. The user should close the window when done;
+/// while it stays open, the headless server cannot start on that profile.
+#[tauri::command]
+async fn browser_login_open(url: Option<String>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        kill_tracked_browser_mcp();
+        std::thread::sleep(Duration::from_millis(400));
+
+        let profile = browser_mcp_profile_dir()
+            .ok_or_else(|| "Could not locate the browser profile folder".to_string())?;
+        fs::create_dir_all(&profile)
+            .map_err(|e| format!("Could not create {}: {}", profile.display(), e))?;
+        let profile_str = profile.to_string_lossy().to_string();
+
+        // A SIGKILLed MCP server can leave its Chrome child holding the
+        // profile lock; clear any leftovers on this profile only.
+        let _ = Command::new("pkill")
+            .arg("-f")
+            .arg(format!("user-data-dir={}", profile_str))
+            .output();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let browser = browser_app_candidates()
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .or_else(|| find_headless_browser().map(PathBuf::from))
+            .ok_or_else(|| "No Chrome/Chromium browser found".to_string())?;
+
+        let mut cmd = Command::new(&browser);
+        cmd.arg(format!("--user-data-dir={}", profile_str));
+        cmd.arg("--no-first-run");
+        let target = url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("about:blank");
+        cmd.arg(target);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.spawn()
+            .map_err(|e| format!("Could not open the browser: {}", e))?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// POST to a local MCP server from the Rust side (CORS-free). Like
@@ -2148,9 +2263,9 @@ fn coding_agent_available(id: &str) -> Option<String> {
             }
         }
     }
-    // Fall back to PATH.
-    if Command::new("which")
-        .arg(id)
+    // Fall back to the user's full login-shell PATH.
+    if login_shell_command()
+        .arg(format!("command -v {}", id))
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
@@ -2357,8 +2472,7 @@ fn find_headless_browser() -> Option<String> {
         }
     }
     for name in browser_path_names() {
-        let found = Command::new("sh")
-            .arg("-lc")
+        let found = login_shell_command()
             .arg(format!("command -v {}", name))
             .output()
             .ok()
@@ -2617,6 +2731,77 @@ async fn run_python(
     .map_err(|e| e.to_string())?
 }
 
+/// Recognize text in a single image with macOS's built-in Vision framework
+/// (VNRecognizeTextRequest) — on-device, no external OCR tools to install.
+/// Used as the fallback for scanned (image-only) PDFs when the chat model has
+/// no vision: the webview renders each page to JPEG with pdf.js and sends it
+/// here as base64. Accepts a bare base64 payload or a `data:image/…;base64,`
+/// URL. Returns the recognized lines joined by newlines ("" when none).
+#[tauri::command]
+async fn ocr_image(image_base64: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || ocr_image_blocking(&image_base64))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[cfg(target_os = "macos")]
+fn ocr_image_blocking(image_base64: &str) -> Result<String, String> {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2::{AnyThread, ClassType};
+    use objc2_foundation::{NSArray, NSData, NSDictionary};
+    use objc2_vision::{
+        VNImageOption, VNImageRequestHandler, VNRecognizeTextRequest, VNRequest,
+        VNRequestTextRecognitionLevel,
+    };
+
+    let bytes = base64_standard_decode(strip_data_url_base64(image_base64))?;
+    if bytes.is_empty() {
+        return Err("OCR: the image payload is empty".into());
+    }
+
+    let data = NSData::with_bytes(&bytes);
+    let request = VNRecognizeTextRequest::new();
+    request.setRecognitionLevel(VNRequestTextRecognitionLevel::Accurate);
+    request.setUsesLanguageCorrection(true);
+
+    let handler = VNImageRequestHandler::initWithData_options(
+        VNImageRequestHandler::alloc(),
+        &data,
+        &NSDictionary::<VNImageOption, AnyObject>::new(),
+    );
+    // The request is only borrowed for the call, so results() below still
+    // reads from our own instance.
+    let requests: Retained<NSArray<VNRequest>> =
+        NSArray::from_slice(&[request.as_super().as_super()]);
+    handler
+        .performRequests_error(&requests)
+        .map_err(|err| format!("OCR failed: {}", err))?;
+
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(observations) = request.results() {
+        for observation in observations.to_vec() {
+            if let Some(candidate) = observation.topCandidates(1).to_vec().first() {
+                lines.push(candidate.string().to_string());
+            }
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn ocr_image_blocking(_image_base64: &str) -> Result<String, String> {
+    Err("OCR is only available on macOS.".into())
+}
+
+/// Bare base64 payload behind an optional `data:image/…;base64,` URL prefix.
+fn strip_data_url_base64(image_base64: &str) -> &str {
+    image_base64
+        .rsplit_once(";base64,")
+        .map(|(_, rest)| rest)
+        .unwrap_or(image_base64)
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandRunResult {
@@ -2629,8 +2814,9 @@ pub struct CommandRunResult {
 /// Run a shell command for agent-mode tasks (the run_command tool). Same
 /// safety pattern as run_python: pipes drained on separate threads, try_wait
 /// polling, kill on timeout so a runaway command cannot hang the IPC call.
-/// The command runs through a login shell (`sh -lc`) so the user's PATH
-/// (homebrew, nvm, …) is available, optionally in a working directory.
+/// The command runs through the user's interactive login shell
+/// (`$SHELL -lic`) so the full PATH (homebrew, nvm, …) is available,
+/// optionally in a working directory.
 #[tauri::command]
 async fn run_command(
     command: String,
@@ -2649,8 +2835,8 @@ async fn run_command(
             }
         }
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-lc").arg(&command);
+        let mut cmd = login_shell_command();
+        cmd.arg(&command);
         if let Some(dir) = cwd.as_deref() {
             cmd.current_dir(dir);
         }
@@ -2727,9 +2913,10 @@ pub struct NodeRunResult {
 }
 
 /// Run a Node.js script with the user's system node (the agent's run_node
-/// tool — skills like pptx expect Node). Spawned through a login shell
-/// (`sh -lc`) so homebrew/nvm PATHs resolve — GUI apps get a minimal PATH —
-/// and `exec` replaces the shell so the timeout kill reaches node itself.
+/// tool — skills like pptx expect Node). Spawned through the user's
+/// interactive login shell (`$SHELL -lic`) so homebrew/nvm/fnm PATHs resolve
+/// — GUI apps get a minimal PATH — and `exec` replaces the shell so the
+/// timeout kill reaches node itself.
 /// NODE_PATH points at the app-owned node-libs folder so skill scripts can
 /// `require("pptxgenjs")` without any project setup. Same safety pattern as
 /// run_python: pipes drained on separate threads, try_wait polling, kill on
@@ -2760,8 +2947,8 @@ async fn run_node(
         fs::write(&script_path, &code)
             .map_err(|e| format!("Failed to write temp script: {}", e))?;
 
-        let mut cmd = Command::new("sh");
-        cmd.arg("-lc")
+        let mut cmd = login_shell_command();
+        cmd
             // exec replaces the shell with node, so kill() on the child
             // reaches node and not just the wrapper shell.
             .arg(format!("exec node '{}'", script_path.display()));
@@ -4113,6 +4300,32 @@ mod tests {
     }
 
     #[test]
+    fn ocr_payload_strips_data_url_prefix() {
+        assert_eq!(super::strip_data_url_base64("QUJD"), "QUJD");
+        assert_eq!(
+            super::strip_data_url_base64("data:image/jpeg;base64,QUJD"),
+            "QUJD"
+        );
+        // A bare payload (no URL prefix) is returned unchanged.
+        assert_eq!(super::strip_data_url_base64("QQ==\n"), "QQ==\n");
+    }
+
+    #[test]
+    fn browser_profile_hash_token_matches_node_derivation() {
+        // Expected values from Node: crypto.createHash("sha256")
+        //   .update(root).digest("hex").slice(0, 7)
+        // (the derivation @playwright/mcp uses for mcp-chrome-<token>).
+        assert_eq!(super::browser_profile_hash_token("/Users/tester"), "9b64359");
+    }
+
+    #[test]
+    fn ocr_rejects_empty_or_invalid_payloads() {
+        assert!(super::ocr_image_blocking("").is_err());
+        assert!(super::ocr_image_blocking("data:image/png;base64,").is_err());
+        assert!(super::ocr_image_blocking("!!!not-base64!!!").is_err());
+    }
+
+    #[test]
     fn write_file_base64_creates_parents_and_writes_bytes() {
         let dir = std::env::temp_dir().join(format!("chatui-wfb64-{}-{}", std::process::id(), std::path::Path::new(&std::env::temp_dir()).exists() as u8));
         let path = dir.join("nested/att.bin");
@@ -4992,9 +5205,11 @@ pub fn run() {
             headroom_stop,
             browser_mcp_start,
             browser_mcp_stop,
+            browser_login_open,
             mcp_http_post,
             relaunch_app,
             run_python,
+            ocr_image,
             run_command,
             run_node,
             open_app,
@@ -5065,3 +5280,4 @@ pub fn run() {
         _ => {}
     });
 }
+

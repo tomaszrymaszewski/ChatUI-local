@@ -444,7 +444,7 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                   <div className="flex flex-col gap-0.5">
                     <span className="text-sm">Prompt suggestions</span>
                     <span className="text-xs text-muted-foreground">
-                      Follow-up ghost text in chats and starter prompts for agents
+                      Follow-up ghost text, skill/connector cards, and starter prompts for agents
                     </span>
                   </div>
                   <Switch

@@ -16,6 +16,7 @@ import { searchKnowledgeIndex } from "@/lib/knowledge-index";
 import { getModelCapabilities } from "@/lib/model-capabilities";
 import { getFileBlob, getFileText, setFileText } from "@/lib/attachment-store";
 import { writeBinaryFile } from "@/lib/deliverables";
+import { ocrAvailable, ocrImageDataUrl } from "@/lib/ocr";
 
 interface Attachable {
   name: string;
@@ -50,7 +51,30 @@ const INLINE_THRESHOLD = 6000;
 const MAX_INLINE_CHARS = 12000;
 const RAG_TOP_K = 6;
 /** Scanned-PDF pages rendered as images (first N pages only). */
-const MAX_SCANNED_PAGES = 10;/**
+const MAX_SCANNED_PAGES = 10;
+
+/**
+ * OCR rendered PDF pages on-device (macOS Vision, via the Rust shell) and
+ * join the page texts. Used when a scanned PDF meets a model without vision,
+ * so the document's text still reaches the model. Returns "" when nothing
+ * could be recognized (or OCR is unavailable).
+ */
+async function ocrScannedPdfPages(pageDataUrls: string[]): Promise<string> {
+  if (!ocrAvailable()) return "";
+  const pages: string[] = [];
+  for (const url of pageDataUrls) {
+    try {
+      const text = await ocrImageDataUrl(url);
+      if (text.trim()) pages.push(text.trim());
+    } catch (err) {
+      console.warn("On-device OCR failed for a scanned PDF page:", err);
+      return "";
+    }
+  }
+  return pages.join("\n\n");
+}
+
+/**
  * Build the text context for one extracted document: inlined when small,
  * chunked + embedded + top-K retrieved when large. Shared by the live send
  * path and the history-replay/project-context paths (which pass cached text).
@@ -147,6 +171,16 @@ export async function prepareAttachmentContext(
       if (isPdfFile(doc)) {
         const urls = await pdfPagesToDataUrls(doc.file!, MAX_SCANNED_PAGES);
         if (urls.length > 0) {
+          const check = caps ?? (await getModelCapabilities(provider, modelName));
+          if (!check.vision) {
+            // No vision: OCR the rendered pages on-device (macOS Vision) so
+            // the document's text still reaches the model.
+            const ocrText = await ocrScannedPdfPages(urls);
+            if (ocrText) {
+              docContext += await documentTextContext(doc.name, ocrText, userText);
+              continue;
+            }
+          }
           scannedImages.push(...urls.map((url) => ({ name: doc.name, url })));
           docContext += `\n\n--- ${doc.name} (scanned document — ${urls.length} page${urls.length > 1 ? "s" : ""} attached as images) ---`;
           continue;
@@ -235,9 +269,20 @@ export async function rebuildAttachmentContent(
     }
     if (!text) {
       if (isPdfFile(a)) {
-        // Scanned PDF — render pages as images for vision models.
-        if (!caps.vision) continue;
-        const urls = await pdfPagesToDataUrls(new File([blob], a.name, { type: a.type }), MAX_SCANNED_PAGES);
+        const file = new File([blob], a.name, { type: a.type });
+        if (!caps.vision) {
+          // Scanned PDF without vision: OCR the pages on-device and cache
+          // the text so later replays skip the (slower) render + OCR.
+          const urls = await pdfPagesToDataUrls(file, MAX_SCANNED_PAGES);
+          const ocrText = urls.length > 0 ? await ocrScannedPdfPages(urls) : "";
+          if (ocrText) {
+            void setFileText(a.storageId!, ocrText);
+            docContext += await documentTextContext(a.name, ocrText, message.content, a.storageId);
+          }
+          continue;
+        }
+        // Vision model: render the pages as images.
+        const urls = await pdfPagesToDataUrls(file, MAX_SCANNED_PAGES);
         imageUrls.push(...urls);
         docContext += `\n\n--- ${a.name} (scanned document — pages attached as images) ---`;
         continue;

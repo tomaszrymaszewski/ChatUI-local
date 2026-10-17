@@ -12,6 +12,11 @@ export interface KnowledgeRetrieval {
   block: string;
   /** Hit ids that were injected — search_knowledge excludes them. */
   ids: string[];
+  /**
+   * Skill names of skill hits, in relevance order — the run's skill
+   * advertiser puts these in front of the MRU fill.
+   */
+  skillNames: string[];
 }
 
 function hitDate(hit: KnowledgeHit): string | null {
@@ -123,13 +128,21 @@ export async function retrieveKnowledgeContext(
   opts: { limit?: number; excludeIds?: string[]; maxChars?: number } = {},
 ): Promise<KnowledgeRetrieval> {
   if (!query.trim()) {
-    return { block: "", ids: [] };
+    return { block: "", ids: [], skillNames: [] };
   }
   const hits = await searchKnowledgeIndex(query, {
     limit: opts.limit ?? 5,
     excludeIds: opts.excludeIds,
   });
+  const skillNames = [
+    ...new Set(
+      hits
+        .filter((h) => h.sourceType === "skill" || h.sourceType === "skill_doc")
+        .map((h) => h.sourceRef)
+        .filter(Boolean),
+    ),
+  ];
   const block = buildKnowledgeBlock(hits, opts.maxChars ?? 3000);
-  if (!block) return { block: "", ids: [] };
-  return { block, ids: hits.map((h) => h.id) };
+  if (!block) return { block: "", ids: [], skillNames };
+  return { block, ids: hits.map((h) => h.id), skillNames };
 }

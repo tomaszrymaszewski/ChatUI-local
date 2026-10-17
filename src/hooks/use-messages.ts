@@ -5,6 +5,7 @@ import type { Artifact } from "@/lib/artifacts";
 import { deleteFileBlob } from "@/lib/attachment-store";
 import { evictRebuildableCaches } from "@/lib/storage-pressure";
 import { listBigKeys, readBigKey, removeBigKey, writeBigKey } from "@/lib/idb-store";
+import { isRunRecordActive } from "@/lib/run-state";
 
 function storageKey(sessionId: string) {
   return `chatui:messages:${sessionId}`;
@@ -30,6 +31,7 @@ export function loadMessages(sessionId: string): Message[] {
       role: string;
       content: string;
       timestamp: string;
+      updatedAt?: number;
       model?: string;
       attachments?: any[];
       session_id?: string;
@@ -46,33 +48,54 @@ export function loadMessages(sessionId: string): Message[] {
       files?: SharedFile[];
     }>;
     const recoveredAt = Date.now();
-    return data.map((m) => ({
-      id: m.id,
-      role: m.role as Message["role"],
-      content: m.content,
-      timestamp: new Date(m.timestamp),
-      model: m.model,
-      attachments: m.attachments ?? [],
-      session_id: m.session_id,
-      parent_id: m.parent_id ?? null,
-      is_temporary: m.is_temporary ?? false,
-      reasoning: m.reasoning,
-      reasoningStreams: m.reasoningStreams,
-      workStartedAt: m.workStartedAt,
-      workEndedAt: m.workEndedAt ?? (m.workStartedAt !== undefined ? recoveredAt : undefined),
-      workDurationMs: m.workDurationMs ?? (m.workStartedAt !== undefined ? Math.max(0, (m.workEndedAt ?? recoveredAt) - m.workStartedAt) : undefined),
-      workSegments: m.workSegments?.map((segment) => segment.endedAt === undefined
-        ? { ...segment, endedAt: recoveredAt, endTextOffset: m.content.length }
-        : segment),
-      artifacts: m.artifacts,
-      files: m.files,
-      // A message loaded from storage is never mid-run, so any activity that was
-      // still "running" when the app quit/crashed is settled to "done" to avoid
-      // permanently-pulsing chips and stuck-open sub-agent boxes.
-      activities: m.activities?.map((a) =>
-        a.status === "running" ? { ...a, status: "done" as const } : a,
-      ),
-    }));
+    return data.map((m) => {
+      const base = {
+        id: m.id,
+        role: m.role as Message["role"],
+        content: m.content,
+        timestamp: new Date(m.timestamp),
+        updatedAt: m.updatedAt,
+        model: m.model,
+        attachments: m.attachments ?? [],
+        session_id: m.session_id,
+        parent_id: m.parent_id ?? null,
+        is_temporary: m.is_temporary ?? false,
+        reasoning: m.reasoning,
+        reasoningStreams: m.reasoningStreams,
+        workStartedAt: m.workStartedAt,
+        artifacts: m.artifacts,
+        files: m.files,
+      };
+      // A record can be mid-run when another app context (another window,
+      // instance, or device syncing in) is streaming into this session —
+      // keep it exactly as stored so it renders as "working" and blocks a
+      // second run here. Only stale unfinalized records (dead context) are
+      // settled, so loading animations always terminate.
+      const live = isRunRecordActive({ ...base, workEndedAt: m.workEndedAt, workSegments: m.workSegments });
+      if (live) {
+        return {
+          ...base,
+          workEndedAt: m.workEndedAt,
+          workDurationMs: m.workDurationMs,
+          workSegments: m.workSegments,
+          activities: m.activities,
+        };
+      }
+      return {
+        ...base,
+        workEndedAt: m.workEndedAt ?? (m.workStartedAt !== undefined ? recoveredAt : undefined),
+        workDurationMs: m.workDurationMs ?? (m.workStartedAt !== undefined ? Math.max(0, (m.workEndedAt ?? recoveredAt) - m.workStartedAt) : undefined),
+        workSegments: m.workSegments?.map((segment) => segment.endedAt === undefined
+          ? { ...segment, endedAt: recoveredAt, endTextOffset: m.content.length }
+          : segment),
+        // A settled message is never mid-run, so any activity that was still
+        // "running" when the app quit/crashed is settled to "done" to avoid
+        // permanently-pulsing chips and stuck-open sub-agent boxes.
+        activities: m.activities?.map((a) =>
+          a.status === "running" ? { ...a, status: "done" as const } : a,
+        ),
+      };
+    });
   } catch {
     return [];
   }
@@ -85,6 +108,7 @@ function serializeMessages(messages: Message[]) {
       role: m.role,
       content: m.content,
       timestamp: m.timestamp.toISOString(),
+      updatedAt: m.updatedAt,
       model: m.model,
       // data: preview URLs (base64 screenshots) are the biggest payload here
       // by far and are rebuildable from the IndexedDB blob store on load, so
@@ -221,9 +245,10 @@ export function updateMessageHeadless(
 ) {
   const loaded = loadMessages(sessionId);
   if (!loaded.some((m) => m.id === messageId)) return;
+  const stamped = { ...updates, updatedAt: Date.now() };
   saveMessages(
     sessionId,
-    loaded.map((m) => (m.id === messageId ? { ...m, ...updates } : m)),
+    loaded.map((m) => (m.id === messageId ? { ...m, ...stamped } : m)),
   );
   window.dispatchEvent(new Event(MESSAGES_EVENT));
 }
@@ -264,11 +289,13 @@ export function useMessages(sessionId: string | null) {
       reasoningStreams?: ReasoningStream[],
     ) => {
       const id = crypto.randomUUID();
+      const now = Date.now();
       const msg: Message = {
         id,
         role,
         content,
-        timestamp: new Date(),
+        timestamp: new Date(now),
+        updatedAt: now,
         model,
         attachments: attachments ?? [],
         session_id: sessionId,
@@ -303,10 +330,13 @@ export function useMessages(sessionId: string | null) {
         Pick<Message, "content" | "reasoning" | "activities" | "reasoningStreams" | "artifacts" | "files" | "workStartedAt" | "workEndedAt" | "workDurationMs" | "workSegments">
       >,
     ) => {
+      // Every write bumps updatedAt: sync merges message records by it, so
+      // the freshest version of a record always wins deterministically.
+      const stamped = { ...updates, updatedAt: Date.now() };
       setMessages((prev) => {
         if (prev.some((m) => m.id === messageId)) {
           const next = prev.map((m) =>
-            m.id === messageId ? { ...m, ...updates } : m,
+            m.id === messageId ? { ...m, ...stamped } : m,
           );
           saveMessages(sessionId, next);
           return next;
@@ -315,7 +345,7 @@ export function useMessages(sessionId: string | null) {
         if (loaded.some((m) => m.id === messageId)) {
           saveMessages(
             sessionId,
-            loaded.map((m) => (m.id === messageId ? { ...m, ...updates } : m)),
+            loaded.map((m) => (m.id === messageId ? { ...m, ...stamped } : m)),
           );
         }
         return prev;

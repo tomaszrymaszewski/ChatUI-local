@@ -57,19 +57,6 @@ describe("detectModeTrigger", () => {
     expect(detectModeTrigger("researcher found something")).toBeNull();
   });
 
-  // ── task → task ──────────────────────────────────────────────────────
-  it("detects 'task' as task", () => {
-    expect(detectModeTrigger("task reorganize my downloads")).toBe("task");
-  });
-
-  it("detects 'Task' case-insensitively", () => {
-    expect(detectModeTrigger("Task clean up the desktop")).toBe("task");
-  });
-
-  it("does NOT trigger on 'tasks' (word boundary)", () => {
-    expect(detectModeTrigger("tasks for today")).toBeNull();
-  });
-
   // ── no trigger ───────────────────────────────────────────────────────
   it("returns null for empty string", () => {
     expect(detectModeTrigger("")).toBeNull();
@@ -81,6 +68,10 @@ describe("detectModeTrigger", () => {
 
   it("returns null for normal text", () => {
     expect(detectModeTrigger("what is the capital of France?")).toBeNull();
+  });
+
+  it("returns null for 'task' (task mode was removed — all sends are agentic)", () => {
+    expect(detectModeTrigger("task reorganize my downloads")).toBeNull();
   });
 
   it("returns null when trigger is not the first word", () => {

@@ -46,7 +46,7 @@ beforeEach(() => {
   });
   vi.stubGlobal(
     "fetch",
-    vi.fn(async () => ({ json: async () => FAKE_CATALOG })),
+    vi.fn(async () => ({ ok: true, json: async () => FAKE_CATALOG })),
   );
 });
 
@@ -166,12 +166,13 @@ describe("reasoning effort validation", () => {
     toggle: false,
   };
 
-  it("treats default and unknown models as always supported", async () => {
+  it("treats default as always supported, unknown support as unavailable", async () => {
     const mod = await load();
     expect(mod.isReasoningEffortSupported(support, "default")).toBe(true);
     expect(mod.isReasoningEffortSupported(support, "xhigh")).toBe(true);
     expect(mod.isReasoningEffortSupported(support, "medium")).toBe(false);
-    expect(mod.isReasoningEffortSupported(null, "anything")).toBe(true);
+    // Unknown support must not be guessed at.
+    expect(mod.isReasoningEffortSupported(null, "anything")).toBe(false);
   });
 
   it("accepts none on toggle-only models, rejects effort scales there", async () => {
@@ -181,11 +182,11 @@ describe("reasoning effort validation", () => {
     expect(mod.isReasoningEffortSupported(toggleOnly, "low")).toBe(false);
   });
 
-  it("drops default and passes unknown support through verbatim", async () => {
+  it("drops default and drops requests for unknown support", async () => {
     const mod = await load();
     expect(mod.sanitizeReasoningEffort("default", support)).toBeUndefined();
     expect(mod.sanitizeReasoningEffort(undefined, support)).toBeUndefined();
-    expect(mod.sanitizeReasoningEffort("medium", null)).toBe("medium");
+    expect(mod.sanitizeReasoningEffort("medium", null)).toBeUndefined();
   });
 
   it("keeps valid values and clamps invalid ones to the nearest", async () => {
@@ -206,6 +207,49 @@ describe("reasoning effort validation", () => {
     expect(mod.sanitizeReasoningEffort("high", toggleOnly)).toBeUndefined();
     const alwaysOn = { reasoning: true, efforts: [], toggle: false };
     expect(mod.sanitizeReasoningEffort("high", alwaysOn)).toBeUndefined();
+  });
+});
+
+describe("default reasoning effort resolution", () => {
+  it("prefers medium when the scale lists it", async () => {
+    const mod = await load();
+    expect(
+      mod.resolveDefaultReasoningEffort({
+        reasoning: true,
+        efforts: ["minimal", "low", "medium", "high"],
+        toggle: false,
+      }),
+    ).toBe("medium");
+  });
+
+  it("picks the rank middle otherwise, ignoring none and biasing deeper", async () => {
+    const mod = await load();
+    expect(
+      mod.resolveDefaultReasoningEffort({
+        reasoning: true,
+        efforts: ["low", "high", "max"],
+        toggle: true,
+      }),
+    ).toBe("high");
+    // Even scales bias to the deeper of the two middle tiers.
+    expect(
+      mod.resolveDefaultReasoningEffort({
+        reasoning: true,
+        efforts: ["none", "low", "high"],
+        toggle: true,
+      }),
+    ).toBe("high");
+  });
+
+  it("returns undefined without a scale or reasoning support", async () => {
+    const mod = await load();
+    expect(
+      mod.resolveDefaultReasoningEffort({ reasoning: true, efforts: [], toggle: true }),
+    ).toBeUndefined();
+    expect(
+      mod.resolveDefaultReasoningEffort({ reasoning: false, efforts: ["low"], toggle: false }),
+    ).toBeUndefined();
+    expect(mod.resolveDefaultReasoningEffort(null)).toBeUndefined();
   });
 });
 
@@ -230,7 +274,7 @@ describe("catalog slimming", () => {
   it("strips unread fields before caching, keeps lookups working", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () => ({ json: async () => FAT_CATALOG })),
+      vi.fn(async () => ({ ok: true, json: async () => FAT_CATALOG })),
     );
     const mod = await load();
     const tokens = await mod.getModelContextWindow(
