@@ -3,6 +3,7 @@ import {
   buildRunDigest,
   buildRunThoughts,
   estimateMessageTokens,
+  findLatestRunThoughts,
   MAX_HISTORY_TOKENS,
   resolveCompactionThreshold,
   resolveHistoryBudget,
@@ -281,6 +282,58 @@ describe("buildRunThoughts", () => {
     expect(thoughts).toContain("## Research: X\nfindings X");
     expect(thoughts).toContain("[~] Draft");
     expect(thoughts).toContain("## Report (markdown)");
+  });
+});
+
+describe("findLatestRunThoughts", () => {
+  const run = (id: string, content: string, reasoning: string): Message =>
+    storedMsg({ id, content, reasoning });
+
+  it("returns the newest visible run's thoughts", () => {
+    const messages = [
+      run("a1", "first answer", "thought one"),
+      run("a2", "second answer", "thought two"),
+    ];
+    const allowed = new Set(["a1", "a2"]);
+    expect(findLatestRunThoughts(messages, allowed)).toContain("thought two");
+  });
+
+  it("never surfaces a regenerated-away reply (hidden sibling)", () => {
+    // a1 was regenerated into a2: only a2 is on the visible path.
+    const messages = [
+      run("a1", "old answer", "HIDDEN-THOUGHTS"),
+      run("a2", "new answer", "visible thoughts"),
+    ];
+    const allowed = new Set(["a2"]);
+    const thoughts = findLatestRunThoughts(messages, allowed);
+    expect(thoughts).toContain("visible thoughts");
+    expect(thoughts).not.toContain("HIDDEN-THOUGHTS");
+  });
+
+  it("falls back past a visible run without metadata", () => {
+    const messages = [
+      run("a1", "older answer", "older thoughts"),
+      storedMsg({ id: "a2", content: "plain answer" }),
+    ];
+    const thoughts = findLatestRunThoughts(messages, new Set(["a1", "a2"]));
+    expect(thoughts).toContain("older thoughts");
+  });
+
+  it("skips the in-progress message of the current run", () => {
+    const messages = [
+      run("a1", "older answer", "older thoughts"),
+      run("a2", "streaming", "current thoughts"),
+    ];
+    const thoughts = findLatestRunThoughts(messages, new Set(["a1", "a2"]), "a2");
+    expect(thoughts).toContain("older thoughts");
+    expect(thoughts).not.toContain("current thoughts");
+  });
+
+  it("reports nothing when no visible run carries thoughts", () => {
+    const messages = [run("a1", "old answer", "HIDDEN-THOUGHTS")];
+    expect(findLatestRunThoughts(messages, new Set(["other"]))).toBe(
+      "No recorded thought process was found in this chat yet.",
+    );
   });
 });
 

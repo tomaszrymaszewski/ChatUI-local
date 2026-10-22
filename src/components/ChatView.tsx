@@ -1757,8 +1757,9 @@ export function ChatView() {
 
       // Manual compaction: the summarized prefix is swapped for one summary
       // turn before the outgoing message (no-op without a compaction record).
+      const visibleMessageIds = activePath.map((n) => n.message.id);
       const runHistory = compactHistoryMessages(
-        activePath.map((n) => n.message.id),
+        visibleMessageIds,
         historyMessages,
         loadSessionCompaction(sessionId),
       );
@@ -1816,6 +1817,7 @@ export function ChatView() {
           taskProfile: arc?.taskProfile,
           availableModels: allModels.map((m) => ({ name: m.name, providerId: m.providerId, displayName: m.displayName })),
           providers,
+          visibleMessageIds,
         });
       } finally {
         clearInterval(saveInterval);
@@ -2186,6 +2188,9 @@ export function ChatView() {
           webFetchEnabled: arc ? arc.webFetch : webFetchEnabled,
           projectDir: currentProjectDirectory,
           taskProfile: arc?.taskProfile,
+          // The replayed path — a reply being regenerated (or the message being
+          // edited) is a hidden sibling and must not reach the agent.
+          visibleMessageIds: pathToParent.map((n) => n.message.id),
         });
       } finally {
         clearInterval(saveInterval);
@@ -2329,6 +2334,9 @@ export function ChatView() {
           webFetchEnabled: arc ? arc.webFetch : webFetchEnabled,
           projectDir: currentProjectDirectory,
           taskProfile: arc?.taskProfile,
+          // The replayed path — a reply being regenerated (or the message being
+          // edited) is a hidden sibling and must not reach the agent.
+          visibleMessageIds: pathToParent.map((n) => n.message.id),
         });
       } finally {
         clearInterval(saveInterval);

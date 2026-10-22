@@ -17,6 +17,25 @@ import type { TopLevelSpec as VegaLiteSpec } from "vega-lite";
 // exported from the package index). Type-only imports — no bundle impact.
 export type ChartSpec = VegaLiteSpec | VegaSpec;
 
+/**
+ * Charts render in a full-width message column; a fixed `width` (models almost
+ * always set one) leaves a wide white gutter around the plot. Single-view
+ * Vega-Lite specs are stretched with width:"container" so the chart fills the
+ * block — vega re-evaluates it on window resize. Composed specs (concat/
+ * facet/repeat) ignore top-level width and Vega specs size their own canvas,
+ * so those keep the author's sizing.
+ */
+export function makeChartResponsive(spec: ChartSpec): ChartSpec {
+  const record = spec as Record<string, unknown>;
+  const schema = typeof record.$schema === "string" ? record.$schema : "";
+  if (/vega\/v\d/.test(schema) && !schema.includes("vega-lite")) return spec;
+  if (["concat", "hconcat", "vconcat", "facet", "repeat"].some((key) => key in record)) {
+    return spec;
+  }
+  if (!("mark" in record || "layer" in record)) return spec;
+  return { ...record, width: "container" } as ChartSpec;
+}
+
 export function parseChartSpec(spec: string): ChartSpec {
   const trimmed = spec.trim();
   try {

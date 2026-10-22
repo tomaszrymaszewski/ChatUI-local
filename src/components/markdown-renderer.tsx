@@ -14,9 +14,21 @@ import remarkGfm from "remark-gfm";
 import rehypeKatex from "rehype-katex";
 import { Highlight, Prism, themes } from "prism-react-renderer";
 import { useTheme } from "next-themes";
-import { FileCode } from "lucide-react";
+import { FileCode, Loader2, MoreHorizontal } from "lucide-react";
+import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { parseChartSpec } from "@/lib/chart-spec";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { makeChartResponsive, parseChartSpec } from "@/lib/chart-spec";
+import {
+  copyDiagramPng,
+  downloadDiagramPng,
+  downloadDiagramSvg,
+} from "@/lib/diagram-export";
 
 interface MarkdownRendererProps {
   content: string;
@@ -145,6 +157,90 @@ function FallbackBlock({
   );
 }
 
+/** Three-dot menu in a diagram's top-right corner: save SVG/PNG, copy as image. */
+function DiagramMenu({
+  name,
+  getSvg,
+}: {
+  name: string;
+  getSvg: () => Promise<string> | string;
+}) {
+  const [busy, setBusy] = useState(false);
+
+  const run = async (action: (svg: string) => Promise<void>) => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await action(await getSvg());
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Diagram export failed");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          className="absolute right-1.5 top-1.5 z-10 flex size-7 items-center justify-center rounded-md border border-border bg-background opacity-0 shadow-lg transition-opacity hover:bg-accent focus-visible:opacity-100 group-hover/diagram:opacity-100 data-[state=open]:opacity-100"
+          title="Save or copy diagram"
+          aria-label="Save or copy diagram"
+        >
+          {busy ? (
+            <Loader2 className="size-3.5 animate-spin text-muted-foreground" />
+          ) : (
+            <MoreHorizontal className="size-3.5 text-muted-foreground" />
+          )}
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem onClick={() => run(async (svg) => downloadDiagramSvg(svg, name))}>
+          Save as SVG
+        </DropdownMenuItem>
+        <DropdownMenuItem onClick={() => run((svg) => downloadDiagramPng(svg, name))}>
+          Save as PNG
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onClick={() =>
+            run(async (svg) => {
+              await copyDiagramPng(svg);
+              toast.success("Copied to clipboard as PNG");
+            })
+          }
+        >
+          Copy as PNG
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+let mermaidExportSeq = 0;
+
+async function renderMermaidSvg(
+  id: string,
+  code: string,
+  htmlLabels: boolean,
+): Promise<string> {
+  const { default: mermaid } = await import("mermaid");
+  mermaid.initialize({
+    startOnLoad: false,
+    securityLevel: "strict",
+    theme: "neutral",
+    // htmlLabels measure in the DOM (accurate widths) for the on-screen
+    // diagram; export re-renders without them because foreignObject markup
+    // taints the raster canvas ("Tainted canvases may not be exported").
+    htmlLabels,
+    // wrap keeps long labels inside their node boxes instead of clipping the
+    // endings; padding adds breathing room around measured text.
+    wrap: true,
+    flowchart: { padding: 12 },
+  });
+  const rendered = await mermaid.render(id, code);
+  return rendered.svg;
+}
+
 function MermaidBlock({ code }: { code: string }) {
   const rawId = useId();
   const id = useMemo(() => `mermaid-${rawId.replace(/[^a-zA-Z0-9]/g, "")}`, [rawId]);
@@ -163,20 +259,8 @@ function MermaidBlock({ code }: { code: string }) {
     const timer = setTimeout(() => {
       (async () => {
         try {
-          const { default: mermaid } = await import("mermaid");
-          mermaid.initialize({
-            startOnLoad: false,
-            securityLevel: "strict",
-            theme: "neutral",
-            // htmlLabels measure in the DOM (accurate widths); wrap keeps long
-            // labels inside their node boxes instead of clipping the endings;
-            // padding adds breathing room around measured text.
-            htmlLabels: true,
-            wrap: true,
-            flowchart: { padding: 12 },
-          });
-          const rendered = await mermaid.render(id, code);
-          if (!cancelled) setSvg(rendered.svg);
+          const rendered = await renderMermaidSvg(id, code, true);
+          if (!cancelled) setSvg(rendered);
         } catch (err) {
           if (!cancelled) setError(err instanceof Error ? err.message : String(err));
         }
@@ -197,10 +281,18 @@ function MermaidBlock({ code }: { code: string }) {
     );
   }
   return (
-    <div
-      className="my-2 overflow-x-auto rounded-lg bg-white p-3 [&_svg]:max-w-full"
-      dangerouslySetInnerHTML={{ __html: svg }}
-    />
+    <div className="group/diagram relative my-2 overflow-x-auto rounded-lg bg-white p-3">
+      {/* w-full + max-w-none! scale the diagram into the full block width
+          (mermaid caps its SVG at the natural size with an inline max-width). */}
+      <div
+        className="[&_svg]:w-full [&_svg]:max-w-none!"
+        dangerouslySetInnerHTML={{ __html: svg }}
+      />
+      <DiagramMenu
+        name="diagram"
+        getSvg={() => renderMermaidSvg(`${id}-export-${++mermaidExportSeq}`, code, false)}
+      />
+    </div>
   );
 }
 
@@ -221,7 +313,7 @@ function VegaBlock({ spec }: { spec: string }) {
     const timer = setTimeout(() => {
       (async () => {
         try {
-          const parsed = parseChartSpec(spec);
+          const parsed = makeChartResponsive(parseChartSpec(spec));
           const { default: embed } = await import("vega-embed");
           if (cancelled || !ref.current) return;
           const result = await embed(ref.current, parsed, {
@@ -248,9 +340,25 @@ function VegaBlock({ spec }: { spec: string }) {
 
   if (error) return <FallbackBlock label="Chart failed to render" code={spec} error={error} />;
   return (
-    <div className="my-2 overflow-x-auto rounded-lg bg-white p-3">
-      <div ref={ref} className={done ? undefined : "hidden"} />
-      {!done && <div className="text-xs text-muted-foreground">Rendering chart…</div>}
+    <div className="group/diagram relative my-2 overflow-x-auto rounded-lg bg-white p-3">
+      {/* display:block defeats vega-embed's injected `.vega-embed{display:inline-block}`:
+          an inline-block wrapper shrink-wraps to 0 while the chart is still
+          embedding, and width:"container" charts measure exactly that. Kept in
+          layout (invisible, not display:none) so the measurement is real. */}
+      <div ref={ref} style={{ display: "block" }} className={done ? undefined : "invisible"} />
+      {!done && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-xs text-muted-foreground">
+          Rendering chart…
+        </div>
+      )}
+      <DiagramMenu
+        name="chart"
+        getSvg={() => {
+          const svgEl = ref.current?.querySelector("svg");
+          if (!svgEl) throw new Error("The chart is still rendering");
+          return new XMLSerializer().serializeToString(svgEl);
+        }}
+      />
     </div>
   );
 }
@@ -258,10 +366,14 @@ function VegaBlock({ spec }: { spec: string }) {
 function SvgBlock({ svg }: { svg: string }) {
   const { resolvedTheme } = useTheme();
   const dark = resolvedTheme === "dark";
+  const cleaned = useMemo(
+    () =>
+      svg
+        .replace(/<script[\s\S]*?<\/script>/gi, "")
+        .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, ""),
+    [svg],
+  );
   const doc = useMemo(() => {
-    const cleaned = svg
-      .replace(/<script[\s\S]*?<\/script>/gi, "")
-      .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, "");
     // Dark mode flips the diagram at the CSS layer (the LLM keeps drawing for
     // a light background): invert swaps black↔white and hue-rotate puts the
     // hues back, so dark colors become their light counterparts (a black line
@@ -272,15 +384,18 @@ function SvgBlock({ svg }: { svg: string }) {
       ? "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:transparent}svg{max-width:100%;max-height:100%;filter:invert(1) hue-rotate(180deg)}"
       : "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:transparent}svg{max-width:100%;max-height:100%}";
     return `<!DOCTYPE html><html><head><style>${style}</style></head><body>${cleaned}</body></html>`;
-  }, [svg, dark]);
+  }, [cleaned, dark]);
   return (
-    <iframe
-      title="Inline SVG"
-      sandbox=""
-      srcDoc={doc}
-      className="my-2 w-full rounded-lg bg-background"
-      style={{ height: 360 }}
-    />
+    <div className="group/diagram relative my-2">
+      <iframe
+        title="Inline SVG"
+        sandbox=""
+        srcDoc={doc}
+        className="w-full rounded-lg bg-background"
+        style={{ height: 360 }}
+      />
+      <DiagramMenu name="diagram" getSvg={() => cleaned} />
+    </div>
   );
 }
 

@@ -31,7 +31,8 @@ import {
   normalizePath,
   type AgentSandbox,
 } from "@/lib/agent/sandbox";
-import type { AgentConfigPatch, AgentSchedule, ScheduleCadence } from "@/types";
+import type { AgentConfigPatch, AgentSchedule, ScheduleCadence, Message } from "@/types";
+import { getVisibleMessages } from "@/lib/message-tree";
 import { getRunContext, getRetrievedDocIds, type RunContext } from "@/lib/agent/run-context";
 import {
   computeNextRun,
@@ -1251,14 +1252,18 @@ export function buildAgentTools(
             if (session_id) {
               const session = sessions.find((s) => s.id === session_id);
               if (!session) return `No chat found with id "${session_id}". Use search_chats with a query to find the right id first.`;
-              let messages: Array<{ role?: string; content?: string }> = [];
+              let messages: Message[] = [];
               try {
                 messages = JSON.parse(
                   readBigKey(`chatui:messages:${session_id}`) ?? "[]",
-                );
+                ) as Message[];
               } catch {
                 return `Could not read the messages of "${session.title}".`;
               }
+              // Only the messages the user sees — hidden branch siblings (a
+              // regenerated-away reply, an edited-away message) are not part of
+              // the conversation and must not reach the agent.
+              messages = getVisibleMessages(messages);
               const MAX_MSGS = 40;
               const body = messages
                 .filter((m) => (m.role === "user" || m.role === "assistant") && m.content)
@@ -1279,7 +1284,12 @@ export function buildAgentTools(
               let snippet = "";
               let raw: string | null = null;
               try {
-                raw = readBigKey(`chatui:messages:${session.id}`);
+                const stored = JSON.parse(
+                  readBigKey(`chatui:messages:${session.id}`) ?? "[]",
+                ) as Message[];
+                // Search only what the user sees (hidden branch siblings are
+                // not part of the conversation).
+                raw = JSON.stringify(getVisibleMessages(stored));
               } catch {
                 raw = null;
               }

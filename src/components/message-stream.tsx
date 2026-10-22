@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   Check,
   ChevronDown,
@@ -10,6 +10,7 @@ import {
 import { ActivityIcon, Favicon, formatToolName } from "@/components/activity-icon";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import type { ActivityItem, ReasoningStream, TodoItem, WorkSegment } from "@/lib/agent/types";
+import { chunkStreamingMarkdown, splitTextAtWorkEnds } from "@/lib/work-segments";
 import { cn } from "@/lib/utils";
 
 function ActivityChip({ item }: { item: ActivityItem }) {
@@ -452,6 +453,36 @@ function WorkSummary({
   );
 }
 
+/**
+ * Live-streamed markdown. The controller publishes ~20 updates/sec while a
+ * run streams, and re-parsing the whole message through remark + KaTeX +
+ * Prism on every tick is superlinear in length — past a few dozen KB of
+ * math-heavy content a single parse takes seconds, the main thread never
+ * idles, and the app freezes (scrolling still works: it is composited).
+ * Same failure mode as unbounded live reasoning (MAX_LIVE_REASONING_CHARS).
+ * Chunking at safe block boundaries lets the memoized MarkdownRenderer skip
+ * every completed chunk, so only the live tail re-parses per tick. Chunk
+ * boundaries never move as content grows (see chunkStreamingMarkdown), so
+ * index keys are stable. Finished messages render through the non-live
+ * paths below, uncut.
+ */
+function LiveMarkdown({
+  content,
+  onOpenArtifact,
+}: {
+  content: string;
+  onOpenArtifact?: (content: string, language: string) => void;
+}) {
+  const chunks = useMemo(() => chunkStreamingMarkdown(content), [content]);
+  return (
+    <>
+      {chunks.map((chunk, i) => (
+        <MarkdownRenderer key={i} content={chunk} onOpenArtifact={onOpenArtifact} />
+      ))}
+    </>
+  );
+}
+
 export interface MessageStreamProps {
   content: string;
   activities?: ActivityItem[];
@@ -548,7 +579,7 @@ export const MessageStream = memo(function MessageStream({
         <div className={className}>
           {todos && todos.length > 0 && <TodoList todos={todos} />}
           {entries.map((entry) => entry.kind === "text" ? (
-            <MarkdownRenderer key={entry.key} content={entry.text} onOpenArtifact={onOpenArtifact} />
+            <LiveMarkdown key={entry.key} content={entry.text} onOpenArtifact={onOpenArtifact} />
           ) : (
             <WorkSummary
               key={entry.segment.id}
@@ -563,6 +594,12 @@ export const MessageStream = memo(function MessageStream({
     }
 
     const summarySegment = segments[0];
+    // The text generated after each work block renders as its own markdown
+    // block: joined into one string, parts separated by different workings
+    // re-flow into a single paragraph. Later parts get a 15px top margin —
+    // 1.5x the renderer's my-2.5 paragraph gap (margins collapse, so the
+    // visual seam is exactly 1.5x the normal paragraph spacing).
+    const textParts = splitTextAtWorkEnds(content, segments);
     return (
       <div className={className}>
         <WorkSummary
@@ -574,7 +611,14 @@ export const MessageStream = memo(function MessageStream({
           live={false}
         />
         {todos && todos.length > 0 && <TodoList todos={todos} />}
-        {content && <MarkdownRenderer content={content} onOpenArtifact={onOpenArtifact} />}
+        {textParts.map((part, index) => (
+          <MarkdownRenderer
+            key={index}
+            content={part}
+            className={index > 0 ? "mt-[15px]" : undefined}
+            onOpenArtifact={onOpenArtifact}
+          />
+        ))}
       </div>
     );
   }
@@ -710,7 +754,11 @@ export const MessageStream = memo(function MessageStream({
       {chunks.map((chunk, i) => (
         <div key={i}>
           {chunk.activity && <ActivityChip item={chunk.activity} />}
-          {chunk.text && <MarkdownRenderer content={chunk.text} onOpenArtifact={onOpenArtifact} />}
+          {chunk.text && (live ? (
+            <LiveMarkdown content={chunk.text} onOpenArtifact={onOpenArtifact} />
+          ) : (
+            <MarkdownRenderer content={chunk.text} onOpenArtifact={onOpenArtifact} />
+          ))}
         </div>
       ))}
     </div>

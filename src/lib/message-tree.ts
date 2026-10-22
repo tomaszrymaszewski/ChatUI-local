@@ -73,3 +73,15 @@ export function getSiblings(
   const currentIndex = siblings.findIndex((s) => s.message.id === message.id);
   return { siblings, currentIndex };
 }
+
+/**
+ * The thread's visible messages: the last-child chain from the newest root —
+ * the same path ChatView renders before the user switches branches
+ * (selectedChildMap starts empty). Hidden siblings are excluded: a reply that
+ * was regenerated away, or a message edited into a new sibling, is not part of
+ * what the user sees.
+ */
+export function getVisibleMessages(messages: Message[]): Message[] {
+  const { roots, nodeMap } = buildMessageTree(messages);
+  return getActivePath(roots, nodeMap, new Map()).map((node) => node.message);
+}

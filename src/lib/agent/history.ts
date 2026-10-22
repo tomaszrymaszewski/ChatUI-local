@@ -248,6 +248,31 @@ export function buildRunThoughts(meta: AgentMessageRunMeta): string {
   return `${THOUGHTS_PREAMBLE}\n\n${parts.join("\n\n")}`;
 }
 
+/**
+ * The most recent previous run's thought process among the messages the user
+ * can actually see — the backing for get_task_thoughts. `allowed` is the
+ * thread's visible path (see getVisibleMessages): a reply that was regenerated
+ * away is a hidden sibling and must never be replayed to the agent. `skipId`
+ * is the in-progress message this run streams into, which is not "previous"
+ * work. Returns the same "nothing recorded" line as an empty thread.
+ */
+export function findLatestRunThoughts(
+  messages: Message[],
+  allowed: Set<string>,
+  skipId?: string | null,
+): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "assistant" || m.id === skipId) continue;
+    if (!allowed.has(m.id)) continue;
+    const meta = toHistoryMessage(m).meta;
+    if (!meta) continue;
+    const thoughts = buildRunThoughts(meta);
+    if (thoughts) return thoughts;
+  }
+  return "No recorded thought process was found in this chat yet.";
+}
+
 function expandAssistantMessage(m: AgentMessage): AgentMessage {
   if (m.role !== "assistant" || !m.meta || typeof m.content !== "string") return m;
   const digest = buildRunDigest(m.meta);

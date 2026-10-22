@@ -6,10 +6,11 @@ import { DeepAgentSession, type AgentMessage } from "@/lib/agent/runtime";
 import { runDeepResearch } from "@/lib/agent/deep-research";
 import { runDiscuss } from "@/lib/agent/discuss";
 import { setRetrievedDocIds } from "@/lib/agent/run-context";
-import { buildRunThoughts, toHistoryMessage, resolveContextWindow } from "@/lib/agent/history";
+import { findLatestRunThoughts, resolveContextWindow } from "@/lib/agent/history";
 import { getModelCost, priceUsage, type ModelPrices } from "@/lib/model-capabilities";
 import { ensureDeliverablesDir } from "@/lib/deliverables";
 import { loadMessages } from "@/hooks/use-messages";
+import { getVisibleMessages } from "@/lib/message-tree";
 import { findActiveRunMessage } from "@/lib/run-state";
 import { loadUserSettings } from "@/hooks/use-user-settings";
 import { notifyIfBackground } from "@/lib/notify";
@@ -67,6 +68,14 @@ export interface DeepAgentRunOptions {
    * auto-denied, so an unattended run can never hang on the UI.
    */
   unattended?: boolean;
+  /**
+   * Ids of the thread's stored messages replayed into this run's history — the
+   * only thread messages the run may reference (get_task_thoughts scans just
+   * these). Callers pass the visible path, so hidden branch siblings — a reply
+   * being regenerated, an edited-away message — never surface to the agent.
+   * Omitted by headless runs, which fall back to the thread's visible path.
+   */
+  visibleMessageIds?: string[];
 }
 
 /**
@@ -316,6 +325,11 @@ class AgentController implements AgentControllerApi {
    * shadow the previous run's thoughts.
    */
   inProgressMessageId: string | null = null;
+  /**
+   * This run's visible thread (DeepAgentRunOptions.visibleMessageIds); null
+   * for headless runs, which fall back to the thread's default visible path.
+   */
+  private visibleMessageIds: Set<string> | null = null;
   private reasoningStartRef: number | null = null;
   private reasoningMsRef = 0;
   private reasoningStreamsRef = new Map<string, { text: string; label: string; startTime: number; endTime?: number; seq: number; workSegmentId: string }>();
@@ -722,16 +736,15 @@ class AgentController implements AgentControllerApi {
    * interruption pulls the complete reasoning here instead.
    */
   private loadThoughts = async (): Promise<string> => {
-    const messages = loadMessages(this.sessionId);
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const m = messages[i];
-      if (m.role !== "assistant" || m.id === this.inProgressMessageId) continue;
-      const meta = toHistoryMessage(m).meta;
-      if (!meta) continue;
-      const thoughts = buildRunThoughts(meta);
-      if (thoughts) return thoughts;
-    }
-    return "No recorded thought process was found in this chat yet.";
+    const stored = loadMessages(this.sessionId);
+    // Only messages the user can see: the path the caller replayed, or the
+    // thread's default visible path for headless runs. A reply that was
+    // regenerated away (or an edited-away message) is a hidden sibling, so its
+    // thought process must never be handed to the agent.
+    const allowed = this.visibleMessageIds
+      ? this.visibleMessageIds
+      : new Set(getVisibleMessages(stored).map((m) => m.id));
+    return findLatestRunThoughts(stored, allowed, this.inProgressMessageId);
   };
 
   run = async (opts: DeepAgentRunOptions): Promise<AgentRunResult> => {
@@ -747,6 +760,7 @@ class AgentController implements AgentControllerApi {
       );
     }
     this.resetState();
+    this.visibleMessageIds = opts.visibleMessageIds ? new Set(opts.visibleMessageIds) : null;
     const workStartedAt = Date.now();
     this.workStartedAt = workStartedAt;
     this.workSegmentCounter = 1;
