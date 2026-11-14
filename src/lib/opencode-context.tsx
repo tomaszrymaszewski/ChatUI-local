@@ -662,9 +662,11 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
     };
   }, [config, serving, refreshSessions, handlePermission]);
 
-  return (
-    <OpenCodeContext.Provider
-      value={{
+  // Memoized: this provider wraps the whole ChatView tree and re-renders with
+  // it on every keystroke; a fresh value object each time made React walk the
+  // entire tree looking for consumers (even through memoized subtrees).
+  const value = useMemo<OpenCodeContextValue>(
+    () => ({
         installed,
         serving,
         installing,
@@ -708,9 +710,53 @@ export function OpenCodeProvider({ children }: { children: ReactNode }) {
         pendingPermissions,
         replyToPermission,
         todos,
-      }}
-    >
-      {children}
-    </OpenCodeContext.Provider>
+    }),
+    [
+      installed,
+      serving,
+      installing,
+      starting,
+      startError,
+      activeDirectory,
+      install,
+      startServe,
+      sessions,
+      activeSessionId,
+      selectSession,
+      messages,
+      isBusy,
+      loadingMessages,
+      agents,
+      selectedAgent,
+      setSelectedAgent,
+      directories,
+      activeDirPath,
+      pendingDir,
+      selectDirectory,
+      clearPendingDir,
+      createSession,
+      deleteSession,
+      renameSession,
+      sendMessage,
+      sendNewMessage,
+      abort,
+      refreshSessions,
+      setDirectories,
+      providers,
+      selectedModel,
+      setSelectedModel,
+      selectedModelInfo,
+      sessionTokens,
+      sessionCost,
+      contextLimit,
+      compactSession,
+      autoPermissions,
+      setAutoPermissions,
+      pendingPermissions,
+      replyToPermission,
+      todos,
+    ],
   );
+
+  return <OpenCodeContext.Provider value={value}>{children}</OpenCodeContext.Provider>;
 }

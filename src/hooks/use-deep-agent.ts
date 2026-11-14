@@ -372,7 +372,9 @@ class AgentController implements AgentControllerApi {
 
   private publishActivities() {
     this.activities = Array.from(this.activitiesRef.values());
-    this.notify();
+    // Batched like tokens: tool-call bursts (parallel sub-agents, searches)
+    // otherwise re-render the whole chat once per activity event.
+    this.scheduleNotify();
   }
 
   private publishReasoningStreams() {

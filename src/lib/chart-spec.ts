@@ -59,3 +59,44 @@ export function parseChartSpec(spec: string): ChartSpec {
         );
   }
 }
+
+/**
+ * Text and axis colors for a dark chat background. Vega-Lite's defaults are
+ * black and would vanish on it.
+ */
+const DARK_CHART_CONFIG: Record<string, Record<string, string>> = {
+  axis: {
+    labelColor: "#a3a3a3",
+    titleColor: "#e5e5e5",
+    domainColor: "#525252",
+    tickColor: "#525252",
+    gridColor: "#333333",
+  },
+  legend: { labelColor: "#a3a3a3", titleColor: "#e5e5e5" },
+  header: { labelColor: "#a3a3a3", titleColor: "#e5e5e5" },
+  title: { color: "#fafafa", subtitleColor: "#a3a3a3" },
+  text: { color: "#fafafa" },
+  rule: { color: "#737373" },
+};
+
+/**
+ * Themes a chart for the chat background. The canvas is always transparent
+ * (Vega-Lite paints white by default). In dark mode the default text and axis
+ * colors get light replacements. Colors the spec sets itself win.
+ */
+export function themeChartSpec(spec: ChartSpec, dark: boolean): ChartSpec {
+  const record = spec as Record<string, unknown>;
+  const themed: Record<string, unknown> = { ...record, background: "transparent" };
+  if (!dark) return themed as ChartSpec;
+  const author = (record.config ?? {}) as Record<string, unknown>;
+  const config: Record<string, unknown> = { ...author };
+  for (const [section, defaults] of Object.entries(DARK_CHART_CONFIG)) {
+    const own = author[section];
+    config[section] = {
+      ...defaults,
+      ...(own !== null && typeof own === "object" ? (own as object) : {}),
+    };
+  }
+  themed.config = config;
+  return themed as ChartSpec;
+}

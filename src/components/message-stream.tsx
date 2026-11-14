@@ -9,6 +9,7 @@ import {
 } from "lucide-react";
 import { ActivityIcon, Favicon, formatToolName } from "@/components/activity-icon";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
+import { ToolCallDetails } from "@/components/tool-call-details";
 import type { ActivityItem, ReasoningStream, TodoItem, WorkSegment } from "@/lib/agent/types";
 import { chunkStreamingMarkdown, splitTextAtWorkEnds } from "@/lib/work-segments";
 import { cn } from "@/lib/utils";
@@ -107,25 +108,10 @@ function ActivityChip({ item }: { item: ActivityItem }) {
         )}
       </button>
       {expanded && hasExpandable && (
-        <div
-          className={cn(
-            "mt-0.5 ml-5 rounded-md border bg-muted/30 p-2 text-[11px]",
-            item.status === "error" ? "border-red-500/30 text-red-500/80" : "text-muted-foreground",
-          )}
-        >
-          {item.argsPreview && (
-            <div className="max-h-40 overflow-y-auto">
-              <pre className="whitespace-pre-wrap break-all font-mono">{item.argsPreview}</pre>
-            </div>
-          )}
-          {item.argsPreview && item.detail && <div className="my-1.5 border-t" />}
-          {item.detail && (
-            <div className="max-h-32 overflow-y-auto">
-              <pre className="whitespace-pre-wrap break-all font-sans">{item.detail}</pre>
-            </div>
-          )}
+        <div className="mt-1 ml-5 flex flex-col gap-2">
+          <ToolCallDetails item={item} />
           {item.output && (
-            <div className="mt-2 border-t pt-2">
+            <div className="border-t pt-2">
               <MarkdownRenderer content={item.output} className="text-xs" />
             </div>
           )}
@@ -477,7 +463,14 @@ function LiveMarkdown({
   return (
     <>
       {chunks.map((chunk, i) => (
-        <MarkdownRenderer key={i} content={chunk} onOpenArtifact={onOpenArtifact} />
+        <MarkdownRenderer
+          key={i}
+          content={chunk}
+          // Only the tail can still be streaming, so only it may show a
+          // pending diagram instead of a parse error.
+          streaming={i === chunks.length - 1}
+          onOpenArtifact={onOpenArtifact}
+        />
       ))}
     </>
   );

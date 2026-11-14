@@ -14,7 +14,7 @@ import remarkGfm from "remark-gfm";
 import rehypeKatex from "rehype-katex";
 import { Highlight, Prism, themes } from "prism-react-renderer";
 import { useTheme } from "next-themes";
-import { FileCode, Loader2, MoreHorizontal } from "lucide-react";
+import { ChevronDown, ChevronRight, FileCode, Loader2, MoreHorizontal } from "lucide-react";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
 import {
@@ -23,17 +23,20 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { makeChartResponsive, parseChartSpec } from "@/lib/chart-spec";
+import { makeChartResponsive, parseChartSpec, themeChartSpec } from "@/lib/chart-spec";
 import {
   copyDiagramPng,
   downloadDiagramPng,
   downloadDiagramSvg,
+  stripSvgBackground,
 } from "@/lib/diagram-export";
 
 interface MarkdownRendererProps {
   content: string;
   className?: string;
   onOpenArtifact?: (content: string, language: string) => void;
+  /** The content is still arriving: a diagram that does not parse yet shows as pending. */
+  streaming?: boolean;
 }
 
 function normalizeLatexDelimiters(content: string): string {
@@ -137,6 +140,17 @@ function getCodeChild(
   return found;
 }
 
+/** One readable line from a render error. Renderers quote the offending token in braces, which the chat never shows. */
+function describeRenderError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const first = raw
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  return (first ?? "").replace(/[{}]/g, "").replace(/\s+/g, " ").slice(0, 200);
+}
+
+/** A diagram that failed: the reason on one line, the source behind a toggle. */
 function FallbackBlock({
   code,
   error,
@@ -146,13 +160,23 @@ function FallbackBlock({
   error?: string | null;
   label: string;
 }) {
+  const [showSource, setShowSource] = useState(false);
   return (
-    <div className="my-2 rounded-lg border bg-muted/30 p-3 text-[13px]">
-      <div className="mb-1 font-medium text-destructive">
-        {label}
-        {error ? `: ${error.split("\n")[0].slice(0, 200)}` : ""}
-      </div>
-      <pre className="overflow-x-auto whitespace-pre-wrap text-muted-foreground">{code}</pre>
+    <div className="my-2 text-xs">
+      <p className="text-red-500/90">{error ? `${label}: ${error}` : label}</p>
+      <button
+        type="button"
+        onClick={() => setShowSource((open) => !open)}
+        className="mt-1 inline-flex items-center gap-1 text-muted-foreground transition-colors hover:text-foreground"
+      >
+        {showSource ? <ChevronDown className="size-3" /> : <ChevronRight className="size-3" />}
+        {showSource ? "Hide source" : "Show source"}
+      </button>
+      {showSource && (
+        <pre className="mt-1.5 max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted/50 p-2.5 font-mono text-[11px] text-muted-foreground">
+          {code}
+        </pre>
+      )}
     </div>
   );
 }
@@ -218,30 +242,51 @@ function DiagramMenu({
 
 let mermaidExportSeq = 0;
 
-async function renderMermaidSvg(
+// mermaid keeps one global configuration that a render reads while it is in
+// flight, so a second initialize() (another diagram, a theme switch, an
+// export) can change settings under a render that already started. Renders
+// therefore run one at a time.
+let mermaidQueue: Promise<unknown> = Promise.resolve();
+
+/** Renders mermaid source to SVG markup. Exports always pass dark: false, the light theme. */
+function renderMermaidSvg(
   id: string,
   code: string,
-  htmlLabels: boolean,
+  options: { htmlLabels: boolean; dark: boolean },
 ): Promise<string> {
-  const { default: mermaid } = await import("mermaid");
-  mermaid.initialize({
-    startOnLoad: false,
-    securityLevel: "strict",
-    theme: "neutral",
-    // htmlLabels measure in the DOM (accurate widths) for the on-screen
-    // diagram; export re-renders without them because foreignObject markup
-    // taints the raster canvas ("Tainted canvases may not be exported").
-    htmlLabels,
-    // wrap keeps long labels inside their node boxes instead of clipping the
-    // endings; padding adds breathing room around measured text.
-    wrap: true,
-    flowchart: { padding: 12 },
+  const run = mermaidQueue.then(async () => {
+    const { default: mermaid } = await import("mermaid");
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: options.dark ? "dark" : "neutral",
+      // htmlLabels measure in the DOM (accurate widths) for the on-screen
+      // diagram; export re-renders without them because foreignObject markup
+      // taints the raster canvas ("Tainted canvases may not be exported").
+      htmlLabels: options.htmlLabels,
+      // wrap keeps long labels inside their node boxes instead of clipping the
+      // endings; padding adds breathing room around measured text.
+      wrap: true,
+      flowchart: { padding: 12 },
+    });
+    try {
+      const rendered = await mermaid.render(id, code);
+      return rendered.svg;
+    } catch (err) {
+      // A failed render leaves its temporary containers in <body>, mermaid's
+      // error graphic included. Remove them so nothing stray stays in the page.
+      document.getElementById(`d${id}`)?.remove();
+      document.getElementById(`i${id}`)?.remove();
+      throw err;
+    }
   });
-  const rendered = await mermaid.render(id, code);
-  return rendered.svg;
+  mermaidQueue = run.catch(() => undefined);
+  return run;
 }
 
-function MermaidBlock({ code }: { code: string }) {
+function MermaidBlock({ code, streaming }: { code: string; streaming?: boolean }) {
+  const { resolvedTheme } = useTheme();
+  const dark = resolvedTheme === "dark";
   const rawId = useId();
   const id = useMemo(() => `mermaid-${rawId.replace(/[^a-zA-Z0-9]/g, "")}`, [rawId]);
   const [svg, setSvg] = useState<string | null>(null);
@@ -251,6 +296,7 @@ function MermaidBlock({ code }: { code: string }) {
   // changes on every tick and each change would otherwise re-run mermaid's
   // synchronous main-thread layout on partial source. The timer resets with
   // every code change, so rendering only starts once the source is stable.
+  // A theme switch re-renders, so the diagram always matches the chat theme.
   useEffect(() => {
     // A render attempted during a streaming pause can fail on partial source;
     // that transient error must not stick once the full code arrives.
@@ -259,10 +305,10 @@ function MermaidBlock({ code }: { code: string }) {
     const timer = setTimeout(() => {
       (async () => {
         try {
-          const rendered = await renderMermaidSvg(id, code, true);
-          if (!cancelled) setSvg(rendered);
+          const rendered = await renderMermaidSvg(id, code, { htmlLabels: true, dark });
+          if (!cancelled) setSvg(stripSvgBackground(rendered));
         } catch (err) {
-          if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+          if (!cancelled) setError(describeRenderError(err));
         }
       })();
     }, 300);
@@ -270,18 +316,19 @@ function MermaidBlock({ code }: { code: string }) {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [code, id]);
+  }, [code, id, dark]);
 
-  if (error) return <FallbackBlock label="Diagram failed to render" code={code} error={error} />;
-  if (!svg) {
-    return (
-      <div className="my-2 rounded-lg border bg-muted/30 p-3 text-xs text-muted-foreground">
-        Rendering diagram…
-      </div>
-    );
+  // While the fence still streams, a failed parse is expected: show the pending
+  // state and report the error only once the source is complete.
+  if (error && !streaming) {
+    return <FallbackBlock label="Diagram failed to render" code={code} error={error} />;
   }
+  if (!svg) return <p className="my-2 text-xs text-muted-foreground">Rendering diagram…</p>;
+  // Transparent wrapper: no background or border, so the chat background shows
+  // through. tracking-normal: the chat's letter-spacing would otherwise reach
+  // the label HTML, which mermaid measured without it, and clip the labels.
   return (
-    <div className="group/diagram relative my-2 overflow-x-auto rounded-lg bg-white p-3">
+    <div className="group/diagram relative my-2 overflow-x-auto p-3 tracking-normal">
       {/* w-full + max-w-none! scale the diagram into the full block width
           (mermaid caps its SVG at the natural size with an inline max-width). */}
       <div
@@ -290,57 +337,105 @@ function MermaidBlock({ code }: { code: string }) {
       />
       <DiagramMenu
         name="diagram"
-        getSvg={() => renderMermaidSvg(`${id}-export-${++mermaidExportSeq}`, code, false)}
+        getSvg={() =>
+          renderMermaidSvg(`${id}-export-${++mermaidExportSeq}`, code, {
+            htmlLabels: false,
+            dark: false,
+          })
+        }
       />
     </div>
   );
 }
 
-function VegaBlock({ spec }: { spec: string }) {
+/** Embeds a chart for export and returns its SVG in the light theme, since an export is a light document. */
+async function renderChartSvg(spec: string, width: number): Promise<string> {
+  const { default: embed } = await import("vega-embed");
+  const host = document.createElement("div");
+  host.style.cssText = `position:fixed;left:-10000px;top:0;width:${Math.max(320, width)}px`;
+  document.body.appendChild(host);
+  try {
+    const result = await embed(host, themeChartSpec(makeChartResponsive(parseChartSpec(spec)), false), {
+      actions: false,
+      renderer: "svg",
+    });
+    try {
+      return await result.view.toSVG();
+    } finally {
+      result.finalize();
+    }
+  } finally {
+    host.remove();
+  }
+}
+
+function VegaBlock({ spec, streaming }: { spec: string; streaming?: boolean }) {
+  const { resolvedTheme } = useTheme();
+  const dark = resolvedTheme === "dark";
   const ref = useRef<HTMLDivElement>(null);
+  // The chart on screen. Each embed goes into its own host element, so the
+  // next chart can draw before the previous one is removed: no blank frame
+  // while the spec streams in or the theme switches.
+  const liveRef = useRef<{ host: HTMLDivElement; finalize: () => void } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+
+  useEffect(
+    () => () => {
+      liveRef.current?.finalize();
+      liveRef.current?.host.remove();
+      liveRef.current = null;
+    },
+    [],
+  );
 
   // Debounced like MermaidBlock: while a ```chart fence streams in, every tick
   // holds partial JSON and parsing it can only fail ("Unterminated string").
   // The timer resets with every change so embedding starts once stable, and a
-  // transient failure never sticks past the next tick.
+  // transient failure never sticks past the next tick. A theme switch re-embeds.
   useEffect(() => {
     setError(null);
-    setDone(false);
     let cancelled = false;
-    let finalize: (() => void) | undefined;
     const timer = setTimeout(() => {
       (async () => {
+        const container = ref.current;
+        if (!container) return;
+        let host: HTMLDivElement | null = null;
         try {
-          const parsed = makeChartResponsive(parseChartSpec(spec));
+          const parsed = themeChartSpec(makeChartResponsive(parseChartSpec(spec)), dark);
           const { default: embed } = await import("vega-embed");
-          if (cancelled || !ref.current) return;
-          const result = await embed(ref.current, parsed, {
-            actions: false,
-            renderer: "svg",
-          });
+          if (cancelled) return;
+          host = document.createElement("div");
+          host.style.display = "block";
+          container.appendChild(host);
+          const result = await embed(host, parsed, { actions: false, renderer: "svg" });
           if (cancelled) {
             result.finalize();
+            host.remove();
             return;
           }
-          finalize = () => result.finalize();
+          const previous = liveRef.current;
+          liveRef.current = { host, finalize: () => result.finalize() };
+          previous?.finalize();
+          previous?.host.remove();
           setDone(true);
         } catch (err) {
-          if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+          host?.remove();
+          if (!cancelled) setError(describeRenderError(err));
         }
       })();
     }, 300);
     return () => {
       cancelled = true;
       clearTimeout(timer);
-      finalize?.();
     };
-  }, [spec]);
+  }, [spec, dark]);
 
-  if (error) return <FallbackBlock label="Chart failed to render" code={spec} error={error} />;
+  if (error && !streaming) {
+    return <FallbackBlock label="Chart failed to render" code={spec} error={error} />;
+  }
   return (
-    <div className="group/diagram relative my-2 overflow-x-auto rounded-lg bg-white p-3">
+    <div className="group/diagram relative my-2 overflow-x-auto p-3 tracking-normal">
       {/* display:block defeats vega-embed's injected `.vega-embed{display:inline-block}`:
           an inline-block wrapper shrink-wraps to 0 while the chart is still
           embedding, and width:"container" charts measure exactly that. Kept in
@@ -353,11 +448,7 @@ function VegaBlock({ spec }: { spec: string }) {
       )}
       <DiagramMenu
         name="chart"
-        getSvg={() => {
-          const svgEl = ref.current?.querySelector("svg");
-          if (!svgEl) throw new Error("The chart is still rendering");
-          return new XMLSerializer().serializeToString(svgEl);
-        }}
+        getSvg={() => renderChartSvg(spec, ref.current?.clientWidth ?? 0)}
       />
     </div>
   );
@@ -368,9 +459,11 @@ function SvgBlock({ svg }: { svg: string }) {
   const dark = resolvedTheme === "dark";
   const cleaned = useMemo(
     () =>
-      svg
-        .replace(/<script[\s\S]*?<\/script>/gi, "")
-        .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, ""),
+      stripSvgBackground(
+        svg
+          .replace(/<script[\s\S]*?<\/script>/gi, "")
+          .replace(/<foreignObject[\s\S]*?<\/foreignObject>/gi, ""),
+      ),
     [svg],
   );
   const doc = useMemo(() => {
@@ -378,8 +471,7 @@ function SvgBlock({ svg }: { svg: string }) {
     // a light background): invert swaps black↔white and hue-rotate puts the
     // hues back, so dark colors become their light counterparts (a black line
     // turns white on the chat background, dark blue becomes light blue). The
-    // document background stays transparent so the iframe element's
-    // bg-background (the chat background, not black) shows through.
+    // document background stays transparent so the chat background shows through.
     const style = dark
       ? "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:transparent}svg{max-width:100%;max-height:100%;filter:invert(1) hue-rotate(180deg)}"
       : "html,body{margin:0;height:100%}body{display:flex;align-items:center;justify-content:center;background:transparent}svg{max-width:100%;max-height:100%}";
@@ -391,7 +483,7 @@ function SvgBlock({ svg }: { svg: string }) {
         title="Inline SVG"
         sandbox=""
         srcDoc={doc}
-        className="w-full rounded-lg bg-background"
+        className="block w-full"
         style={{ height: 360 }}
       />
       <DiagramMenu name="diagram" getSvg={() => cleaned} />
@@ -498,6 +590,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
   content,
   className,
   onOpenArtifact,
+  streaming,
 }: MarkdownRendererProps) {
   const normalizedContent = useMemo(
     () => processCitations(normalizeLatexDelimiters(content)),
@@ -514,14 +607,14 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
         if (info) {
           const text = info.text.replace(/\n$/, "");
           const open = onOpenArtifactRef.current;
-          if (info.lang === "mermaid") return <MermaidBlock code={text} />;
+          if (info.lang === "mermaid") return <MermaidBlock code={text} streaming={streaming} />;
           if (
             info.lang === "chart" ||
             info.lang === "vega" ||
             info.lang === "vega-lite" ||
             info.lang === "vegalite"
           ) {
-            return <VegaBlock spec={text} />;
+            return <VegaBlock spec={text} streaming={streaming} />;
           }
           if (info.lang === "svg") return <SvgBlock svg={text} />;
           if (info.lang) {
@@ -556,7 +649,7 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({
         return <Anchor {...props} />;
       },
     }),
-    [],
+    [streaming],
   );
 
   return (

@@ -153,10 +153,15 @@ export async function prepareAttachmentContext(
   let docContext = "";
   const pathNotes: string[] = [];
   for (const doc of documents) {
+    const text = await extractFileText(doc.file!);
     // Agent runs with disk access: the file lands in the run's deliverables
     // folder and is expressed as a path the agent reads itself — its content
-    // is never inlined, so oversized documents cost nothing up front.
-    if (opts?.filePathsDir && doc.file) {
+    // is never inlined, so oversized documents cost nothing up front. But a
+    // scanned (image-only) PDF has no extractable text, so a disk path is
+    // useless there (read_local_file → pdftotext returns nothing); fall
+    // through to render its pages for vision / on-device OCR instead.
+    const scannedPdf = !text && isPdfFile(doc);
+    if (opts?.filePathsDir && doc.file && !scannedPdf) {
       const dest = `${opts.filePathsDir}/attachments/${attachmentDiskName(doc)}`;
       if (await writeBinaryFile(dest, doc.file)) {
         pathNotes.push(
@@ -166,7 +171,6 @@ export async function prepareAttachmentContext(
         continue;
       }
     }
-    const text = await extractFileText(doc.file!);
     if (!text) {
       if (isPdfFile(doc)) {
         const urls = await pdfPagesToDataUrls(doc.file!, MAX_SCANNED_PAGES);

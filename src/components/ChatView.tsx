@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
@@ -162,6 +162,7 @@ import {
 import { fetchRegistrySkills } from "@/lib/skill-registry";
 import { useAgents } from "@/hooks/use-agents";
 import { useAgentController, getAgentController, useRunningSessionIds, disposeAgentController, type AgentControllerApi } from "@/hooks/use-deep-agent";
+import { useStableCallbacks } from "@/hooks/use-stable-callbacks";
 import { useScheduler } from "@/hooks/use-scheduler";
 import type { ActivityItem, AgentMode, AgentRunResult, SharedFile, TodoItem } from "@/lib/agent/types";
 import { WidgetStack, TasksWidget, FilesWidget, ContextWidget } from "@/components/agent-widgets";
@@ -276,6 +277,29 @@ function streamSaveSignature(ctrl: AgentControllerApi): string {
     ctrl.workSegments.map((segment) => `${segment.id}:${segment.endedAt ?? ""}:${segment.endTextOffset ?? ""}:${segment.thinking?.length ?? 0}`).join(","),
   ].join("|");
 }
+
+// ChatView owns the composer text and the streaming agent subscription, so it
+// re-renders on every keystroke and every ~50 ms streaming tick. The sidebar
+// (one row per session) and the persisted message list are memoized so those
+// renders stay cheap; their handlers come from useStableCallbacks.
+const MemoAppSidebar = memo(AppSidebar);
+
+/**
+ * Re-runs `render` only when an entry of `deps` changes (Object.is), else
+ * keeps the previous output; `deps: null` re-renders every time. Whatever
+ * `render` reads must be in `deps` or be stable (refs, state setters,
+ * useStableCallbacks proxies).
+ */
+const MemoSlot = memo(
+  function MemoSlot({ render }: { render: () => React.ReactNode; deps: readonly unknown[] | null }) {
+    return <>{render()}</>;
+  },
+  (prev, next) =>
+    prev.deps !== null &&
+    next.deps !== null &&
+    prev.deps.length === next.deps.length &&
+    prev.deps.every((dep, i) => Object.is(dep, next.deps![i])),
+);
 
 type PendingFile = MessageAttachment & { file?: File };
 
@@ -400,26 +424,44 @@ export function ChatView() {
   // height is derived from scrollHeight on every change; the line height is
   // read from computed style so it holds at both the text-base (mobile) and
   // text-sm breakpoints.
-  const resizeComposerEl = useCallback((el: HTMLTextAreaElement | null) => {
+  // Text + width each composer was last measured at. Appending (typing at
+  // the end) at the same width can only grow the box, and scrollHeight
+  // already reports overflowing content, so the `height: auto` reset — which
+  // relayouts the whole chat column, ~2 ms per keystroke on a long chat —
+  // only runs when text was removed or replaced, the width changed, or on
+  // mount / window resize.
+  const composerMeasured = useRef(new WeakMap<HTMLTextAreaElement, { text: string; width: number }>());
+  const resizeComposerEl = useCallback((el: HTMLTextAreaElement | null, force = false) => {
     if (!el) return;
     const style = getComputedStyle(el);
     const lineHeight = parseFloat(style.lineHeight) || 20;
     const padding = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
     const maxHeight = lineHeight * MAX_COMPOSER_LINES + padding;
-    el.style.height = "auto";
+    const width = el.clientWidth;
+    const measured = composerMeasured.current.get(el);
+    if (
+      force ||
+      !measured ||
+      measured.width !== width ||
+      !el.value.startsWith(measured.text)
+    ) {
+      el.style.height = "auto";
+    }
+    composerMeasured.current.set(el, { text: el.value, width });
     el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
     el.style.overflowY = el.scrollHeight > maxHeight ? "auto" : "hidden";
   }, []);
-  const resizeComposer = useCallback(() => {
-    resizeComposerEl(sessionTextareaRef.current);
-    resizeComposerEl(emptyTextareaRef.current);
+  const resizeComposer = useCallback((force = false) => {
+    resizeComposerEl(sessionTextareaRef.current, force);
+    resizeComposerEl(emptyTextareaRef.current, force);
   }, [resizeComposerEl]);
   useLayoutEffect(() => {
     resizeComposer();
   }, [inputText, resizeComposer]);
   useEffect(() => {
-    window.addEventListener("resize", resizeComposer);
-    return () => window.removeEventListener("resize", resizeComposer);
+    const onResize = () => resizeComposer(true);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
   }, [resizeComposer]);
   // Warm the models.dev catalog once so the Thinking menu and the model
   // capability disclaimers can read real options synchronously; the tick
@@ -441,7 +483,9 @@ export function ChatView() {
   // Tappable answers for the assistant's clarifying questions, same keys.
   const optionCache = useRef(new Map<string, string[]>());
   const optionInflight = useRef(new Set<string>());
-  const [, bumpGhost] = useState(0);
+  // The tick is read by the memoized message list (question options live in
+  // optionCache, a ref, so the bump is how a fresh set reaches the list).
+  const [ghostTick, bumpGhost] = useState(0);
 
   const capCache = <T,>(map: Map<string, T>) => {
     if (map.size > 30) {
@@ -1073,11 +1117,16 @@ export function ChatView() {
   const sessionViewActive = !!activeSession && (!isAgentTab || agentConsoleFocus === "session");
   const widgetsVisible = sessionViewActive && !artifactPanel && !widgetsHidden;
   const [widgetsFit, setWidgetsFit] = useState(true);
-  const [sessionWidth, setSessionWidth] = useState(0);
+  // Only the yes/no answer is state: storing the raw width re-rendered the
+  // whole app on every frame of the sidebar and panel width transitions.
+  const [sessionFitsWidgets, setSessionFitsWidgets] = useState(false);
   useEffect(() => {
     const el = sessionContainerRef.current;
     if (!el) return;
-    const update = () => setSessionWidth(el.clientWidth);
+    const update = () =>
+      setSessionFitsWidgets(
+        el.clientWidth - CONTAINER_PADDING_PX - WIDGETS_RESERVED_PX >= CHAT_MIN_WIDTH_PX,
+      );
     update();
     const ro = new ResizeObserver(update);
     ro.observe(el);
@@ -1086,8 +1135,7 @@ export function ChatView() {
   const reserveWidgetsSpace =
     widgetsVisible &&
     widgetsFit &&
-    sessionWidth > 0 &&
-    sessionWidth - CONTAINER_PADDING_PX - WIDGETS_RESERVED_PX >= CHAT_MIN_WIDTH_PX;
+    sessionFitsWidgets;
 
   useEffect(() => {
     // Leaving a session mid-edit cancels it and brings back the stashed draft.
@@ -3303,7 +3351,97 @@ export function ChatView() {
     </DropdownMenuItem>
   );
 
+  // Stable proxies for everything a rendered message calls back into: the
+  // message list is memoized (MemoSlot below), so its JSX must never hold a
+  // closure over a past render's state (handleStartEdit stashes inputText).
+  const messageHandlers = useStableCallbacks({
+    handleBranchNavigate,
+    handleStartEdit,
+    handleCopyMessage,
+    handleRegenerate,
+    toggleRawOutput,
+    handleOpenSharedFile,
+    handleRevealSharedFile,
+    handleDownloadSharedFile,
+  });
+
+  // Same for the sidebar (memoized as MemoAppSidebar).
+  const sidebarHandlers = useStableCallbacks({
+    selectSession,
+    handleNewChat,
+    handleDeleteSession,
+    renameChat: (id: string, title: string) => updateSession(id, { title }),
+    handleMoveSessionToAgent,
+    openSettings,
+    exitSettings: () => setView("chat"),
+    openProjects: () => setView("projects"),
+    openHistory: () => setView("history"),
+    comingSoon,
+    switchTab,
+    handleOpenDashboard,
+    handleOpenAgentConsole,
+    handleStartAgentSession,
+    handleDeleteAgent,
+    changeAgentConsoleTab: (tab: AgentConsoleTab) => {
+      setAgentConsoleTab(tab);
+      setAgentConsoleComposing(false);
+      // The panel takes over the main area even with a session open —
+      // the session keeps running and stays one click away.
+      setAgentConsoleFocus("panel");
+    },
+    closeAgentConsole,
+    enterAgentCompose,
+    openAccount: () => setView("account"),
+    connectAccount: () => setAccountOpen(true),
+    handleAccountSignOut,
+  });
+
+  /**
+   * Everything renderMessage reads besides the message itself and stable
+   * values. A memoized message re-renders only when one of these changes.
+   */
+  const messageRenderDeps = (msg: ChatMessage): unknown[] => {
+    const isEditing = editingMessageId === msg.id;
+    // The tree is only read through getSiblings (branch arrows): keying on
+    // the sibling position instead of nodeMap/roots keeps a write to one
+    // message (e.g. the streaming crash-save) from re-rendering all of them.
+    const { siblings, currentIndex } = getSiblings(nodeMap, msg, roots);
+    return [
+      msg,
+      siblings.length,
+      currentIndex,
+      editingMessageId,
+      isEditing ? inputText : null,
+      isEditing ? files : null,
+      showRawOutput,
+      lastAssistantId,
+      ghostTick,
+      settings.promptSuggestions,
+      activeSession?.chatMode,
+      chatMode,
+      agent?.isRunning,
+      agent?.pendingInput,
+      agent?.pendingApprovals.length,
+      agent?.pendingSuggestion,
+      attachmentPreviews,
+      providers,
+      // Time-based (90 s freshness window): re-evaluated on every ChatView
+      // render, exactly as often as before memoization.
+      isRunRecordActive(msg),
+    ];
+  };
+
   const renderMessage = (msg: ChatMessage) => {
+    const {
+      handleBranchNavigate,
+      handleStartEdit,
+      handleCopyMessage,
+      handleRegenerate,
+      toggleRawOutput,
+      handleOpenSharedFile,
+      handleRevealSharedFile,
+      handleDownloadSharedFile,
+    } = messageHandlers;
     const { siblings, currentIndex } = getSiblings(nodeMap, msg, roots);
     const hasBranches = siblings.length > 1;
     const isEditing = editingMessageId === msg.id;
@@ -3631,7 +3769,7 @@ export function ChatView() {
       className="relative h-dvh min-h-0 overflow-hidden bg-sidebar"
       style={{ "--sidebar-width-icon": "1px" } as React.CSSProperties}
     >
-      <AppSidebar
+      <MemoAppSidebar
         sessions={sessions}
         activeSessionId={activeSessionId}
         view={view}
@@ -3642,47 +3780,41 @@ export function ChatView() {
         )}
         settingsTab={settingsTab}
         activeTab={activeTab}
-        onSelectSession={selectSession}
-        onNewChat={handleNewChat}
-        onDeleteChat={handleDeleteSession}
-        onRenameChat={(id, title) => updateSession(id, { title })}
-        onMoveSessionToAgent={handleMoveSessionToAgent}
-        onSettings={openSettings}
+        onSelectSession={sidebarHandlers.selectSession}
+        onNewChat={sidebarHandlers.handleNewChat}
+        onDeleteChat={sidebarHandlers.handleDeleteSession}
+        onRenameChat={sidebarHandlers.renameChat}
+        onMoveSessionToAgent={sidebarHandlers.handleMoveSessionToAgent}
+        onSettings={sidebarHandlers.openSettings}
         onSettingsTabChange={setSettingsTab}
-        onExitSettings={() => setView("chat")}
-        onProjects={() => setView("projects")}
-        onHistory={() => setView("history")}
-        onComingSoon={comingSoon}
-        onTabChange={switchTab}
-        onOpenDashboard={handleOpenDashboard}
+        onExitSettings={sidebarHandlers.exitSettings}
+        onProjects={sidebarHandlers.openProjects}
+        onHistory={sidebarHandlers.openHistory}
+        onComingSoon={sidebarHandlers.comingSoon}
+        onTabChange={sidebarHandlers.switchTab}
+        onOpenDashboard={sidebarHandlers.handleOpenDashboard}
         agents={agents}
-        onOpenAgentConsole={handleOpenAgentConsole}
-        onStartAgentSession={handleStartAgentSession}
-        onDeleteAgent={handleDeleteAgent}
+        onOpenAgentConsole={sidebarHandlers.handleOpenAgentConsole}
+        onStartAgentSession={sidebarHandlers.handleStartAgentSession}
+        onDeleteAgent={sidebarHandlers.handleDeleteAgent}
         onOpenAgentSettings={setAgentSettingsId}
         projects={projects}
         runningIds={runningIds}
         activeAgentConsole={activeAgentConsole}
         agentConsoleTab={agentConsoleTab}
-        onAgentConsoleTabChange={(tab) => {
-          setAgentConsoleTab(tab);
-          setAgentConsoleComposing(false);
-          // The panel takes over the main area even with a session open —
-          // the session keeps running and stays one click away.
-          setAgentConsoleFocus("panel");
-        }}
-        onExitAgentConsole={closeAgentConsole}
+        onAgentConsoleTabChange={sidebarHandlers.changeAgentConsoleTab}
+        onExitAgentConsole={sidebarHandlers.closeAgentConsole}
         agentSessions={activeAgentSessions}
         agentConsoleComposing={agentConsoleComposing}
-        onNewAgentSession={activeAgentConsole ? enterAgentCompose : undefined}
+        onNewAgentSession={activeAgentConsole ? sidebarHandlers.enterAgentCompose : undefined}
         accountEmail={accountProfile?.email ?? null}
         accountName={accountProfile?.name ?? null}
         accountAvatarUrl={accountProfile?.avatarUrl ?? null}
         accountTab={accountTab}
         onAccountTabChange={setAccountTab}
-        onOpenAccount={() => setView("account")}
-        onConnectAccount={() => setAccountOpen(true)}
-        onSignOut={handleAccountSignOut}
+        onOpenAccount={sidebarHandlers.openAccount}
+        onConnectAccount={sidebarHandlers.connectAccount}
+        onSignOut={sidebarHandlers.handleAccountSignOut}
       />
 
       <div className="fixed left-21 top-[11.75px] z-50 flex items-center gap-1 text-neutral-400 dark:text-neutral-500">
@@ -4352,7 +4484,14 @@ export function ChatView() {
                         agent?.isRunning &&
                         node.message.id === inProgressMsgIds.current.get(activeSessionId ?? "")
                       ) {
+                        // Wrapped in MemoSlot (never memoized: deps null) so
+                        // the element type at this key matches the persisted
+                        // message's — a type change would remount the item.
                         return (
+                          <MemoSlot
+                            key={node.message.id}
+                            deps={null}
+                            render={() => (
                           <MessageScrollerItem
                             key={node.message.id}
                             messageId={node.message.id}
@@ -4414,9 +4553,17 @@ export function ChatView() {
                               </MessageContent>
                             </Message>
                           </MessageScrollerItem>
+                            )}
+                          />
                         );
                       }
-                      const rendered = renderMessage(node.message);
+                      const rendered = (
+                        <MemoSlot
+                          key={node.message.id}
+                          deps={messageRenderDeps(node.message)}
+                          render={() => renderMessage(node.message)}
+                        />
+                      );
                       if (compactionRecord && index === compactionAnchor) {
                         return (
                           <Fragment key={node.message.id}>
