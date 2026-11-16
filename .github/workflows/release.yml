@@ -95,6 +95,8 @@ jobs:
           releaseBody: |
             ## Highlights
 
+            - Computer Use (macOS): agents can operate your desktop through the open-computer-use CLI. A new onboarding step and Settings panel walk you through installing it and granting Accessibility and Screen Recording permissions.
+            - MCP tool support in agent runs: MCP servers from your catalog are available to the agent, with OAuth sign-in for servers that need it.
             - Agents everywhere: every chat-tab send runs the Deep Agents runtime, and a post-run suggestion system proposes skills, connectors, and modes as you go.
             - On-device OCR for scanned PDFs (macOS Vision) — PDFs, images, and documents work fully offline.
             - Browser sign-in for agent runs (Gmail, etc.), plus shell/PATH fixes so homebrew and nvm tools work in the packaged app.
@@ -107,9 +109,6 @@ jobs:
 
             **macOS note:** if macOS says AI Studio is "damaged" (happens with unsigned builds),
             run `xattr -cr "/Applications/AI Studio.app"` in Terminal once, then open the app normally.
-
-            **Windows note:** if SmartScreen says "Windows protected your PC", click
-            **More info → Run anyway** to install.
           releaseDraft: true
           prerelease: false
           updaterJsonPreferNsis: true
@@ -125,4 +124,5 @@ jobs:
       - name: Publish release after all platform builds finish
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: gh release edit "$GITHUB_REF_NAME" --draft=false
