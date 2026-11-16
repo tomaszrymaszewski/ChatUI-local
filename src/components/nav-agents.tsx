@@ -1,13 +1,10 @@
 import { useState } from "react";
 import {
-  Bot,
-  Check,
+  LayoutDashboard,
   MoreHorizontal,
-  Pencil,
   Plus,
   Settings2,
   Trash2,
-  UserMinus,
 } from "lucide-react"
 import { AgentAvatar } from "@/components/agent-avatar"
 
@@ -16,9 +13,6 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuSeparator,
-  DropdownMenuSub,
-  DropdownMenuSubContent,
-  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -31,14 +25,12 @@ import {
 } from "@/components/ui/dialog"
 import {
   SidebarGroup,
-  SidebarGroupLabel,
   SidebarMenu,
   SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
   useSidebar,
 } from "@/components/ui/sidebar"
-import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import type { AgentDefinition, ChatSession } from "@/types"
 import { Spinner } from "@/components/ui/spinner"
@@ -86,12 +78,9 @@ export function NavAgents({
   agents,
   sessions,
   activeSessionId,
-  onOpenAgentConsole,
-  onStartAgentSession,
-  onSelectSession,
-  onDeleteSession,
-  onRenameSession,
-  onMoveSessionToAgent,
+  onOpenAgentChat,
+  onOpenAgentDashboard,
+  onOpenMainDashboard,
   onDeleteAgent,
   onOpenAgentSettings,
   runningIds,
@@ -100,233 +89,126 @@ export function NavAgents({
   agents: AgentDefinition[]
   sessions: ChatSession[]
   activeSessionId: string | null
-  onOpenAgentConsole: (agentId: string) => void
-  onStartAgentSession: (agentId: string) => void
-  onSelectSession: (id: string) => void
-  onDeleteSession: (id: string) => void
-  onRenameSession?: (id: string, title: string) => void
-  onMoveSessionToAgent?: (sessionId: string, agentId: string | null) => void
+  /** Click on an agent — open its most recent conversation. */
+  onOpenAgentChat: (agentId: string) => void
+  /** "Dashboard" in the agent's overflow menu — open its per-agent console. */
+  onOpenAgentDashboard: (agentId: string) => void
+  /** The "New" button under the agents — open the main fleet dashboard. */
+  onOpenMainDashboard: () => void
   onDeleteAgent: (id: string) => void
   onOpenAgentSettings?: (id: string) => void
   runningIds?: Set<string>
   activeAgentId?: string | null
 }) {
   const { isMobile } = useSidebar()
-  const [renameTarget, setRenameTarget] = useState<{ id: string; title: string } | null>(null)
-  const [renameDraft, setRenameDraft] = useState("")
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null)
   const deleteSessionCount = deleteTarget
     ? sessions.filter((s) => s.agentId === deleteTarget.id).length
     : 0
 
-  const agentNameFor = (agentId?: string) =>
-    agents.find((a) => a.id === agentId)?.name
+  const latestSessionFor = (agentId: string) =>
+    sessions.find((s) => s.agentId === agentId)?.id ?? null
 
-  const handleStartRename = (id: string, currentTitle: string) => {
-    setRenameTarget({ id, title: currentTitle })
-    setRenameDraft(currentTitle)
-  }
-
-  const handleCommitRename = () => {
-    if (!renameTarget) return
-    const trimmed = renameDraft.trim()
-    if (trimmed && onRename) {
-      onRename(renameTarget.id, trimmed)
-    }
-    setRenameTarget(null)
-    setRenameDraft("")
-  }
-
-  const onRename = onRenameSession
+  const hasRunningSession = (agentId: string) =>
+    sessions.some((s) => s.agentId === agentId && runningIds?.has(s.id))
 
   return (
     <>
       <SidebarGroup className="group-data-[collapsible=icon]:hidden">
-        <SidebarGroupLabel>Agents</SidebarGroupLabel>
-        <SidebarMenu>
-          {agents.map((agent) => (
-            <SidebarMenuItem key={agent.id}>
-              <SidebarMenuButton
-                onClick={() => onOpenAgentConsole(agent.id)}
-                tooltip={agent.purpose || agent.name}
-              >
-                <AgentAvatar seed={agent.id} className="size-4" />
-                <span className="truncate">{agent.name}</span>
-              </SidebarMenuButton>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <SidebarMenuAction showOnHover>
-                    <MoreHorizontal />
-                    <span className="sr-only">More</span>
-                  </SidebarMenuAction>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent
-                  className="w-44 rounded-lg"
-                  side={isMobile ? "bottom" : "right"}
-                  align={isMobile ? "end" : "start"}
-                >
-                  <DropdownMenuItem onClick={() => onStartAgentSession(agent.id)}>
-                    <Plus className="text-muted-foreground" />
-                    <span>New session</span>
-                  </DropdownMenuItem>
-                  {onOpenAgentSettings && (
-                    <DropdownMenuItem onClick={() => onOpenAgentSettings(agent.id)}>
-                      <Settings2 className="text-muted-foreground" />
-                      <span>Settings…</span>
-                    </DropdownMenuItem>
-                  )}
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    variant="destructive"
-                    onClick={() => setDeleteTarget({ id: agent.id, name: agent.name })}
-                  >
-                    <Trash2 className="text-muted-foreground" />
-                    <span>Delete agent</span>
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
-            </SidebarMenuItem>
-          ))}
-          {agents.length === 0 && (
-            <span className="px-2 text-xs text-muted-foreground">
-              No agents yet
-            </span>
-          )}
-        </SidebarMenu>
-      </SidebarGroup>
-
-      <SidebarGroup className="group-data-[collapsible=icon]:hidden">
-        <SidebarGroupLabel>Tasks & Sessions</SidebarGroupLabel>
-        <SidebarMenu>
-          {sessions.map((session) => {
-            const agentName = agentNameFor(session.agentId)
+        <SidebarMenu className="gap-1.5">
+          {agents.map((agent) => {
+            const latestId = latestSessionFor(agent.id)
+            const running = hasRunningSession(agent.id)
             return (
-              <SidebarMenuItem key={session.id}>
+              <SidebarMenuItem key={agent.id}>
+                {/* Large agent button: tall row + big avatar. Clicking opens
+                    the agent's most recent conversation. */}
                 <SidebarMenuButton
-                  isActive={session.id === activeSessionId}
-                  onClick={() => onSelectSession(session.id)}
+                  isActive={!!latestId && latestId === activeSessionId}
+                  onClick={() => onOpenAgentChat(agent.id)}
+                  tooltip={agent.purpose || agent.name}
+                  className="h-auto items-center gap-3 py-2.5 pr-10"
                 >
-                  <span className="truncate">{session.title}</span>
-                  {runningIds?.has(session.id) && (
-                    <Spinner className="ml-auto size-3" />
-                  )}
-                  {session.agentId && !runningIds?.has(session.id) && (
-                    <AgentAvatar
-                      seed={session.agentId}
-                      className="ml-auto -mr-7 size-4 max-md:opacity-0 md:group-hover/menu-item:opacity-0 md:group-focus-within/menu-item:opacity-0 md:group-has-data-[state=open]/menu-item:opacity-0"
-                      title={agentName}
-                    />
-                  )}
+                  <div className="relative shrink-0">
+                    <AgentAvatar seed={agent.id} className="size-9" />
+                    {running && (
+                      <span className="absolute -right-0.5 -top-0.5 flex size-3 items-center justify-center rounded-full bg-emerald-500 text-emerald-50">
+                        <Spinner className="size-2" />
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex min-w-0 flex-col">
+                    <span className="truncate text-sm font-medium leading-tight">
+                      {agent.name}
+                    </span>
+                    {agent.purpose && (
+                      <span className="truncate text-xs leading-snug text-muted-foreground">
+                        {agent.purpose}
+                      </span>
+                    )}
+                  </div>
                 </SidebarMenuButton>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <SidebarMenuAction showOnHover>
+                    <SidebarMenuAction showOnHover className="top-1/2 -translate-y-1/2">
                       <MoreHorizontal />
                       <span className="sr-only">More</span>
                     </SidebarMenuAction>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent
-                    className="w-40 rounded-lg"
+                    className="w-44 rounded-lg"
                     side={isMobile ? "bottom" : "right"}
                     align={isMobile ? "end" : "start"}
                   >
-                    {onRename && (
-                      <DropdownMenuItem onClick={() => handleStartRename(session.id, session.title)}>
-                        <Pencil className="text-muted-foreground" />
-                        <span>Rename</span>
+                    <DropdownMenuItem onClick={() => onOpenAgentDashboard(agent.id)}>
+                      <LayoutDashboard className="text-muted-foreground" />
+                      <span>Dashboard</span>
+                    </DropdownMenuItem>
+                    {onOpenAgentSettings && (
+                      <DropdownMenuItem onClick={() => onOpenAgentSettings(agent.id)}>
+                        <Settings2 className="text-muted-foreground" />
+                        <span>Settings…</span>
                       </DropdownMenuItem>
-                    )}
-                    {onMoveSessionToAgent && (
-                      <DropdownMenuSub>
-                        <DropdownMenuSubTrigger>
-                          <Bot className="text-muted-foreground" />
-                          <span>Move to agent</span>
-                        </DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent className="max-h-72 overflow-y-auto">
-                          {agents.length === 0 && (
-                            <DropdownMenuItem disabled>
-                              <span>No agents yet</span>
-                            </DropdownMenuItem>
-                          )}
-                          {agents.map((agent) => (
-                            <DropdownMenuItem
-                              key={agent.id}
-                              onClick={() => onMoveSessionToAgent(session.id, agent.id)}
-                            >
-                              <AgentAvatar seed={agent.id} className="size-4" />
-                              <span className="max-w-48 truncate">{agent.name}</span>
-                              {session.agentId === agent.id && (
-                                <Check className="ml-auto size-3.5" />
-                              )}
-                            </DropdownMenuItem>
-                          ))}
-                          {session.agentId && (
-                            <>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuItem
-                                onClick={() => onMoveSessionToAgent(session.id, null)}
-                              >
-                                <UserMinus className="text-muted-foreground" />
-                                <span>Remove from agent</span>
-                              </DropdownMenuItem>
-                            </>
-                          )}
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
                     )}
                     <DropdownMenuSeparator />
                     <DropdownMenuItem
                       variant="destructive"
-                      onClick={() => onDeleteSession(session.id)}
+                      onClick={() => setDeleteTarget({ id: agent.id, name: agent.name })}
                     >
                       <Trash2 className="text-muted-foreground" />
-                      <span>Delete</span>
+                      <span>Delete agent</span>
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
               </SidebarMenuItem>
             )
           })}
-          {sessions.length === 0 && (
+          {agents.length === 0 && (
             <span className="px-2 text-xs text-muted-foreground">
-              No tasks yet
+              No agents yet
             </span>
           )}
+
+          {/* "New" — opens the main fleet dashboard (create an agent / start a
+              session). This is the only entry point to the main dashboard. */}
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              onClick={onOpenMainDashboard}
+              tooltip="New"
+              className="mt-1 justify-center border border-dashed text-muted-foreground hover:text-foreground"
+            >
+              <Plus />
+              <span>New</span>
+            </SidebarMenuButton>
+          </SidebarMenuItem>
         </SidebarMenu>
       </SidebarGroup>
 
       <AgentAvatarRail
         agents={agents}
         activeAgentId={activeAgentId}
-        onOpenAgentConsole={onOpenAgentConsole}
+        onOpenAgentConsole={onOpenAgentChat}
       />
-
-      <Dialog open={!!renameTarget} onOpenChange={(open) => { if (!open) { setRenameTarget(null); setRenameDraft(""); } }}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle className="flex items-center gap-2">
-              <Pencil className="size-5" />
-              Rename
-            </DialogTitle>
-          </DialogHeader>
-          <div className="flex flex-col gap-4 pt-2">
-            <Input
-              autoFocus
-              value={renameDraft}
-              onChange={(e) => setRenameDraft(e.target.value)}
-              placeholder="Session name"
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleCommitRename()
-                if (e.key === "Escape") { setRenameTarget(null); setRenameDraft("") }
-              }}
-            />
-            <div className="flex justify-end gap-2">
-              <Button variant="outline" size="sm" onClick={() => { setRenameTarget(null); setRenameDraft(""); }}>Cancel</Button>
-              <Button size="sm" disabled={!renameDraft.trim()} onClick={handleCommitRename}>Rename</Button>
-            </div>
-          </div>
-        </DialogContent>
-      </Dialog>
 
       <Dialog open={!!deleteTarget} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}>
         <DialogContent>

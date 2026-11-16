@@ -55,6 +55,8 @@ export interface DeepAgentRunOptions {
     enableFileTools?: boolean;
     /** true adds the shared isolated Playwright browser tools. */
     enableComputerUse?: boolean;
+    /** true adds the open-computer-use desktop control tools (global opt-in). */
+    enableDesktopComputerUse?: boolean;
     /** Restrict skills to these names (sandboxed agents). */
     skillNames?: string[];
     /** Restrict MCP connectors to these connector store keys (sandboxed agents). */
@@ -872,6 +874,7 @@ class AgentController implements AgentControllerApi {
           enableCommandTools: opts.taskProfile?.enableCommandTools,
           enableFileTools: opts.taskProfile?.enableFileTools,
           enableComputerUse: opts.taskProfile?.enableComputerUse,
+          enableDesktopComputerUse: opts.taskProfile?.enableDesktopComputerUse,
           skillNames: opts.taskProfile?.skillNames,
           relevantSkills: retrieval.skillNames,
           mcpNames: opts.taskProfile?.mcpNames,

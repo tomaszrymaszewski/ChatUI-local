@@ -60,6 +60,7 @@ function settings(overrides: Partial<UserSettings> = {}): UserSettings {
     taskFinishNotifications: true,
     promptSuggestions: true,
     agentSuggestions: true,
+    desktopComputerUse: false,
     ...overrides,
   };
 }

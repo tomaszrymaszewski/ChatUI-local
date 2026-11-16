@@ -109,6 +109,8 @@ export interface AgentSessionOptions {
   enableFileTools?: boolean;
   /** Task profile: true exposes isolated Playwright browser controls. */
   enableComputerUse?: boolean;
+  /** Global opt-in: true exposes the open-computer-use desktop control tools (drives the user's real macOS apps). */
+  enableDesktopComputerUse?: boolean;
   /** Restrict loaded skills to these names (sandboxed agents). undefined = all installed. */
   skillNames?: string[];
   /** Task-relevant skill names (RAG hits, relevance order) — advertised before the MRU fill. */
@@ -354,6 +356,13 @@ function buildAgentSystemPrompt(opts: AgentSessionOptions): string {
           "These tools operate in an isolated headless browser session, and the user can keep using their own apps and browser while you work. Never take over the user's visible mouse or keyboard. " +
           "When a service has no connected connector (email, calendar, docs, …), use its website through these tools instead of giving up — the browser profile is persistent, so a sign-in the user did once stays signed in across runs. " +
           "If you hit a login wall or the browser reports the profile is in use, ask the user to sign in once via Settings → Connectors → \"Browser sign-in\" (and to close that window afterwards), then retry.",
+      );
+    }
+    if (opts.enableDesktopComputerUse) {
+      parts.push(
+        "You can also control the user's real native macOS apps with the desktop_* Computer Use tools. Start with desktop_list_apps to see what's open, then desktop_get_app_state (or desktop_query) to read an app's controls and their element_index values. Act with desktop_click, desktop_type_text, desktop_set_value, desktop_press_key, desktop_scroll, desktop_drag, or desktop_select_text, always reusing an element_index from the latest state read of the same app. " +
+          "These run through the accessibility layer in the background: they do not move the user's real mouse, steal keyboard focus, or switch Spaces, so the user keeps working while you act. Prefer the isolated browser (computer_* tools) for websites; use desktop_* only for native apps or logged-in desktop apps the browser can't reach. " +
+          "This drives the user's real session: never open password managers or unrelated private apps, and ask first before sending, deleting, purchasing, uploading, or any other externally visible change.",
       );
     }
     if (opts.enableFileTools) {
@@ -636,6 +645,7 @@ export class DeepAgentSession {
       opts.mcpNames,
       3,
       profile === "task" && opts.enableComputerUse === true,
+      profile === "task" && opts.enableDesktopComputerUse === true,
     );
     // On-demand proxy for the non-hot connectors — including ones connected
     // mid-run from a suggestion card (usable in the SAME run).

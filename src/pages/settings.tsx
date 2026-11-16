@@ -39,6 +39,7 @@ import {
   DialogFooter,
 } from "@/components/ui/dialog";
 import { ProviderForm } from "@/components/provider-form";
+import { ComputerUseSetup } from "@/components/computer-use-setup";
 import { ModelForm } from "@/components/model-form";
 import { ProviderLogo } from "@/components/provider-logos";
 import { UpdatesPanel } from "@/components/updates-panel";
@@ -468,6 +469,22 @@ export function SettingsView({ activeTab }: { activeTab: SettingsTab }) {
                     }
                   />
                 </div>
+                <div className="flex items-center justify-between">
+                  <div className="flex flex-col gap-0.5">
+                    <span className="text-sm">Desktop Computer Use</span>
+                    <span className="text-xs text-muted-foreground">
+                      Let agents and chat control your native macOS apps. Needs the
+                      open-computer-use helper plus Accessibility &amp; Screen Recording permission.
+                    </span>
+                  </div>
+                  <Switch
+                    checked={settings.desktopComputerUse}
+                    onCheckedChange={(v) =>
+                      updateSettings({ desktopComputerUse: v })
+                    }
+                  />
+                </div>
+                {settings.desktopComputerUse && <ComputerUseSetup />}
               </div>
 
               <Separator />

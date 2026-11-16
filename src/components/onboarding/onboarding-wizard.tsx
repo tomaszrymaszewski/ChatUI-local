@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { AccountStep } from "@/components/onboarding/account-step";
 import { WelcomeStep } from "@/components/onboarding/welcome-step";
 import { ThemeStep } from "@/components/onboarding/theme-step";
+import { ComputerUseStep } from "@/components/onboarding/computer-use-step";
 import { ProvidersStep } from "@/components/onboarding/providers-step";
 import { ProviderKeyStep } from "@/components/onboarding/provider-key-step";
 import { ProviderModelsStep } from "@/components/onboarding/provider-models-step";
@@ -29,6 +30,7 @@ type Step =
   | "account"
   | "welcome"
   | "theme"
+  | "computer-use"
   | "providers"
   | "provider-key"
   | "provider-models"
@@ -40,6 +42,7 @@ const ALL_STEPS: Step[] = [
   "account",
   "welcome",
   "theme",
+  "computer-use",
   "providers",
   "provider-key",
   "provider-models",
@@ -52,6 +55,7 @@ const TOP_STEPS: Array<{ label: string; steps: Step[] }> = [
   { label: "Account", steps: ["account"] },
   { label: "Welcome", steps: ["welcome"] },
   { label: "Theme", steps: ["theme"] },
+  { label: "Computer Use", steps: ["computer-use"] },
   { label: "Providers", steps: ["providers", "provider-key", "provider-models", "embeddings"] },
   { label: "Import", steps: ["import"] },
   { label: "Done", steps: ["done"] },
@@ -222,6 +226,15 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
                 headerBox={headerBox}
                 footerBox={footerBox}
                 onBack={() => gotoStep("welcome")}
+                onNext={() => gotoStep("computer-use")}
+              />
+            )}
+
+            {step === "computer-use" && (
+              <ComputerUseStep
+                headerBox={headerBox}
+                footerBox={footerBox}
+                onBack={() => gotoStep("theme")}
                 onNext={() => gotoStep("providers")}
               />
             )}
@@ -233,7 +246,7 @@ export function OnboardingWizard({ onFinish }: { onFinish: () => void }) {
                 footerBox={footerBox}
                 onSelect={handleSelectProvider}
                 onContinue={() => gotoStep("embeddings")}
-                onBack={() => gotoStep("theme")}
+                onBack={() => gotoStep("computer-use")}
               />
             )}
 

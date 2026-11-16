@@ -154,6 +154,10 @@ export async function runHeadlessTask(opts: {
         toolProfile: "task",
         enableCommandTools: agentDef ? agentDef.capabilities.terminal : true,
         enableFileTools: !!agentDef,
+        // Desktop Computer Use is intentionally OFF for headless (scheduled/
+        // background) runs: it drives the user's real apps and must stay
+        // supervised. The global opt-in only takes effect for interactive runs.
+        enableDesktopComputerUse: false,
         mcpNames:
           agentDef && agentDef.connectors.length > 0 ? agentDef.connectors : undefined,
         ...(agentDef && allowedDirectories

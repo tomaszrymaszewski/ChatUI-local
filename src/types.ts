@@ -317,4 +317,10 @@ export interface UserSettings {
   promptSuggestions: boolean;
   /** Recommend which agent to use when starting an agent session. */
   agentSuggestions: boolean;
+  /**
+   * Opt-in desktop Computer Use: let agents and chat drive native macOS apps
+   * through the Open Computer Use accessibility bridge. Chosen at onboarding;
+   * off by default. Requires macOS Accessibility + Screen Recording.
+   */
+  desktopComputerUse: boolean;
 }

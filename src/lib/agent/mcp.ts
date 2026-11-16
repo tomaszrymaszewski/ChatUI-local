@@ -203,6 +203,190 @@ function addSharedBrowserControls(tools: StructuredTool[], getClient: () => Prom
   }
 }
 
+// ─── Desktop Computer Use (open-computer-use, stdio MCP via Rust bridge) ────
+//
+// open-computer-use is a stdio MCP server the webview can't reach directly,
+// so the Rust side owns the process and the webview talks to it through the
+// ocu_mcp_* Tauri commands. These tools let an agent drive the user's real
+// macOS apps through the accessibility layer. The capability is global and
+// opt-in (UserSettings.desktopComputerUse, chosen at onboarding); the caller
+// only registers these when that flag is on.
+
+/** Shape the JSON-RPC result from ocu_mcp_call into tool output text/images. */
+function ocuToolOutput(result: unknown): string | Array<Record<string, unknown>> {
+  const resp = result as {
+    error?: { message?: string };
+    result?: { content?: Array<{ type: string; text?: string; data?: string; mimeType?: string }>; isError?: boolean };
+  };
+  if (resp?.error) {
+    return `Computer Use error: ${resp.error.message ?? JSON.stringify(resp.error)}`;
+  }
+  const blocks = resp?.result?.content ?? [];
+  const text = blocks
+    .filter((b) => b?.type === "text" && typeof b.text === "string")
+    .map((b) => b.text ?? "")
+    .join("\n");
+  const images = blocks
+    .filter((b) => b?.type === "image" && typeof b.data === "string")
+    .map((b) => ({ type: "image", data: b.data as string, mimeType: b.mimeType ?? "image/png" }));
+  if (images.length > 0) {
+    return [{ type: "text", text: text || "Captured desktop state." }, ...images];
+  }
+  return text.slice(0, 12000) || JSON.stringify(resp?.result ?? {}).slice(0, 12000);
+}
+
+function desktopActivityLabel(toolName: string): { label: string } {
+  switch (toolName) {
+    case "list_apps": return { label: "Listing open apps" };
+    case "get_app_state": return { label: "Reading app state" };
+    case "query": return { label: "Finding a control" };
+    case "click": return { label: "Clicking a control" };
+    case "perform_secondary_action": return { label: "Opening a context menu" };
+    case "scroll": return { label: "Scrolling" };
+    case "drag": return { label: "Dragging" };
+    case "type_text": return { label: "Typing" };
+    case "press_key": return { label: "Pressing a key" };
+    case "set_value": return { label: "Setting a field value" };
+    case "select_text": return { label: "Selecting text" };
+    default: return { label: "Using the desktop" };
+  }
+}
+
+/**
+ * Register desktop Computer Use tools. Each tool is a thin wrapper over the
+ * open-computer-use MCP tool of the same name, dispatched through the Rust
+ * bridge (ocu_mcp_call). Tools are prefixed `desktop_` so they never collide
+ * with the browser `computer_*` tools, and the model can tell "drive a native
+ * app" apart from "drive the isolated browser".
+ */
+export async function addDesktopComputerUseTools(tools: StructuredTool[]): Promise<void> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+
+  // Start the server up front; a failure here (not installed, permissions)
+  // means we register nothing rather than hand the model dead tools.
+  try {
+    await invoke("ocu_mcp_start");
+  } catch (error) {
+    console.warn("[chatui] desktop computer use unavailable:", error);
+    return;
+  }
+
+  const call = async (toolName: string, args: Record<string, unknown>) => {
+    const id = crypto.randomUUID();
+    const activity = desktopActivityLabel(toolName);
+    await publishBrowserActivity({ id, active: true, ...activity });
+    try {
+      const result = await invoke("ocu_mcp_call", {
+        method: "tools/call",
+        params: { name: toolName, arguments: args },
+      });
+      return ocuToolOutput(result);
+    } catch (error) {
+      return `Desktop action failed: ${error instanceof Error ? error.message : String(error)}`;
+    } finally {
+      await publishBrowserActivity({ id, active: false, ...activity });
+    }
+  };
+
+  const add = (
+    name: string,
+    description: string,
+    schema: ReturnType<typeof z.object>,
+    toolName: string,
+  ) => {
+    tools.push(new DynamicStructuredTool({
+      name,
+      description,
+      schema,
+      func: (input) => call(toolName, input as Record<string, unknown>),
+    }));
+  };
+
+  add(
+    "desktop_list_apps",
+    "List the running native desktop apps Computer Use can control. Call this first to discover which app to target.",
+    z.object({}),
+    "list_apps",
+  );
+  add(
+    "desktop_get_app_state",
+    "Read a native app's accessibility tree: its windows, controls, and their element_index values. Call this before acting, and reuse the returned element_index values in the same session. Raise text_limit (number or \"max\") for long text like documents or chat history, and max_tree_nodes/max_tree_depth for long lists.",
+    z.object({
+      app: z.string(),
+      text_limit: z.union([z.number(), z.literal("max")]).optional(),
+      max_tree_nodes: z.number().optional(),
+      max_tree_depth: z.number().optional(),
+    }),
+    "get_app_state",
+  );
+  add(
+    "desktop_query",
+    "Find controls in a native app by text and/or role without rendering a full tree (macOS). Cheaper than get_app_state when you already know what you're looking for.",
+    z.object({ app: z.string(), text: z.string().optional(), role: z.string().optional() }),
+    "query",
+  );
+  add(
+    "desktop_click",
+    "Click a control in a native app, identified by element_index from the latest get_app_state. Prefer element-targeted clicks over coordinates.",
+    z.object({ app: z.string(), element_index: z.union([z.string(), z.number()]).optional(), x: z.number().optional(), y: z.number().optional() }),
+    "click",
+  );
+  add(
+    "desktop_secondary_action",
+    "Perform the secondary action (right-click / context menu) on a control identified by element_index.",
+    z.object({ app: z.string(), element_index: z.union([z.string(), z.number()]) }),
+    "perform_secondary_action",
+  );
+  add(
+    "desktop_scroll",
+    "Scroll within a native app. Target a scrollable element by element_index, or give a direction and amount.",
+    z.object({
+      app: z.string(),
+      element_index: z.union([z.string(), z.number()]).optional(),
+      direction: z.enum(["up", "down", "left", "right"]).optional(),
+      amount: z.number().optional(),
+    }),
+    "scroll",
+  );
+  add(
+    "desktop_drag",
+    "Drag from one control/point to another in a native app (e.g. move an item, drag-select).",
+    z.object({ app: z.string() }).passthrough(),
+    "drag",
+  );
+  add(
+    "desktop_type_text",
+    "Type text into a native app's focused control (or a control given by element_index). For replacing a field's whole value, prefer desktop_set_value.",
+    z.object({ app: z.string(), text: z.string(), element_index: z.union([z.string(), z.number()]).optional() }),
+    "type_text",
+  );
+  add(
+    "desktop_press_key",
+    "Press a key or key combo in a native app (for example Return, Tab, Escape, or cmd+a).",
+    z.object({ app: z.string(), key: z.string() }),
+    "press_key",
+  );
+  add(
+    "desktop_set_value",
+    "Set the value of an editable control (text field, checkbox, slider) directly, identified by element_index. Preferred over typing for editable fields.",
+    z.object({ app: z.string(), element_index: z.union([z.string(), z.number()]), value: z.union([z.string(), z.number(), z.boolean()]) }),
+    "set_value",
+  );
+  add(
+    "desktop_select_text",
+    "Select text inside a text element, or place the cursor relative to it (macOS). Pass the text exactly as it appears in the accessibility tree; add prefix/suffix to disambiguate.",
+    z.object({
+      app: z.string(),
+      element_index: z.union([z.string(), z.number()]),
+      text: z.string(),
+      selection: z.enum(["text", "cursor_before", "cursor_after"]).optional(),
+      prefix: z.string().optional(),
+      suffix: z.string().optional(),
+    }),
+    "select_text",
+  );
+}
+
 /** Response of the mcp_http_post Tauri command. */
 interface McpProxyResponse {
   status: number;
@@ -367,6 +551,8 @@ export async function loadMcpTools(
   hotSetLimit = 3,
   /** Agentic runs always get the isolated built-in Playwright browser. */
   includeBuiltInBrowser = false,
+  /** Global opt-in: add the open-computer-use desktop control tools. */
+  includeDesktopComputerUse = false,
 ): Promise<McpToolsResult> {
   const tools: StructuredTool[] = [];
   const clients: Client[] = [];
@@ -454,6 +640,12 @@ export async function loadMcpTools(
       return browserClient;
     };
     addSharedBrowserControls(tools, getBrowserClient);
+  }
+  if (includeDesktopComputerUse) {
+    // The desktop server is owned by the Rust side (stdio bridge), so it is
+    // not one of `clients` and needs no disposal here — it stays alive for
+    // the app session and is torn down on app exit.
+    await addDesktopComputerUseTools(tools);
   }
   return {
     tools,

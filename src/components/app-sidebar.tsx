@@ -10,7 +10,6 @@ import {
   Cpu,
   GalleryVerticalEnd,
   KeyRound,
-  LayoutDashboard,
   LogOut,
   MessageCircle,
   MoreHorizontal,
@@ -198,6 +197,7 @@ export function AppSidebar({
   onOpenDashboard,
   agents = [],
   onOpenAgentConsole,
+  onOpenAgentChat,
   onStartAgentSession,
   onDeleteAgent,
   onOpenAgentSettings,
@@ -239,7 +239,10 @@ export function AppSidebar({
   onTabChange?: (tab: "chat" | "agent") => void
   onOpenDashboard?: () => void
   agents?: AgentDefinition[]
+  /** Open the agent's per-agent dashboard/console (General/Access/Automations + its sessions). */
   onOpenAgentConsole?: (agentId: string) => void
+  /** Open the agent's most recent conversation (the default click on an agent). */
+  onOpenAgentChat?: (agentId: string) => void
   onStartAgentSession?: (agentId: string) => void
   onDeleteAgent?: (id: string) => void
   onOpenAgentSettings?: (id: string) => void
@@ -460,28 +463,14 @@ export function AppSidebar({
       ) : !inPrefsView ? (
         activeTab === "agent" ? (
           <div key="agent" className="flex min-h-0 flex-1 flex-col animate-in fade-in duration-200">
-            <SidebarHeader>
-              <SidebarMenu>
-                <SidebarMenuItem>
-                  <SidebarMenuButton onClick={onOpenDashboard} tooltip="Dashboard">
-                    <LayoutDashboard />
-                    <span className="hidden-xs">Dashboard</span>
-                  </SidebarMenuButton>
-                </SidebarMenuItem>
-              </SidebarMenu>
-            </SidebarHeader>
-
             <SidebarContent>
               <NavAgents
                 agents={agents}
                 sessions={sessions}
                 activeSessionId={activeSessionId}
-                onOpenAgentConsole={(agentId) => onOpenAgentConsole?.(agentId)}
-                onStartAgentSession={(agentId) => onStartAgentSession?.(agentId)}
-                onSelectSession={onSelectSession}
-                onDeleteSession={onDeleteChat}
-                onRenameSession={onRenameChat}
-                onMoveSessionToAgent={onMoveSessionToAgent}
+                onOpenAgentChat={(agentId) => onOpenAgentChat?.(agentId)}
+                onOpenAgentDashboard={(agentId) => onOpenAgentConsole?.(agentId)}
+                onOpenMainDashboard={() => onOpenDashboard?.()}
                 onDeleteAgent={(id) => onDeleteAgent?.(id)}
                 onOpenAgentSettings={(id) => onOpenAgentSettings?.(id)}
                 runningIds={runningIds}

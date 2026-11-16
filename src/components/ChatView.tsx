@@ -906,6 +906,7 @@ export function ChatView() {
       enableCommandTools: boolean;
       enableFileTools: boolean;
       enableComputerUse: boolean;
+      enableDesktopComputerUse: boolean;
       skillNames?: string[];
       mcpNames?: string[];
       sandbox?: AgentSandbox;
@@ -959,6 +960,10 @@ export function ChatView() {
         toolProfile: (desc.isSetup ? "setup" : "task") as "task" | "setup",
         enableCommandTools: agentDef ? agentDef.capabilities.terminal : true,
         enableComputerUse: agentDef ? agentDef.capabilities.computerUse : true,
+        // Desktop Computer Use is a single global opt-in (chosen at onboarding),
+        // applied to both dedicated agents and plain chat — independent of the
+        // per-agent browser capability.
+        enableDesktopComputerUse: settings.desktopComputerUse,
         // Folders-only access model: saved agents always get the file tools;
         // the sandbox (workspace + granted folders + granted projects) is the
         // authorization — granted folders are trusted, no approval cards.
@@ -2746,6 +2751,23 @@ export function ChatView() {
   };
 
   /**
+   * Clicking an agent in the sidebar opens its most recent conversation
+   * directly (not the console). When the agent has no sessions yet, fall
+   * back to its new-session composer so the click always lands somewhere
+   * useful.
+   */
+  const handleOpenAgentChat = (agentId: string) => {
+    const latest = allSessions
+      .filter((s) => s.agentId === agentId)
+      .sort((a, b) => b.updatedAt.getTime() - a.updatedAt.getTime())[0];
+    if (latest) {
+      selectSession(latest.id);
+    } else {
+      handleStartAgentSession(agentId);
+    }
+  };
+
+  /**
    * Enter the open console's new-session page. Works from anywhere in the
    * console — even mid-session: the session is left (it keeps running) and
    * the next send is wired to this agent.
@@ -3380,6 +3402,7 @@ export function ChatView() {
     switchTab,
     handleOpenDashboard,
     handleOpenAgentConsole,
+    handleOpenAgentChat,
     handleStartAgentSession,
     handleDeleteAgent,
     changeAgentConsoleTab: (tab: AgentConsoleTab) => {
@@ -3795,6 +3818,7 @@ export function ChatView() {
         onOpenDashboard={sidebarHandlers.handleOpenDashboard}
         agents={agents}
         onOpenAgentConsole={sidebarHandlers.handleOpenAgentConsole}
+        onOpenAgentChat={sidebarHandlers.handleOpenAgentChat}
         onStartAgentSession={sidebarHandlers.handleStartAgentSession}
         onDeleteAgent={sidebarHandlers.handleDeleteAgent}
         onOpenAgentSettings={setAgentSettingsId}

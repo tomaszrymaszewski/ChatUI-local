@@ -31,6 +31,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   taskFinishNotifications: true,
   promptSuggestions: true,
   agentSuggestions: true,
+  desktopComputerUse: false,
 };
 
 function loadSettings(): UserSettings {

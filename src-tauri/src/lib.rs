@@ -1,9 +1,10 @@
 use std::fs;
 use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
@@ -1119,6 +1120,396 @@ async fn browser_mcp_start() -> Result<(), String> {
 async fn browser_mcp_stop() -> Result<(), String> {
     kill_tracked_browser_mcp();
     Ok(())
+}
+
+// ─── Open Computer Use (desktop control, stdio MCP) ────────────────────────
+//
+// open-computer-use (`ocu mcp`) is a *stdio* MCP server: it speaks
+// newline-delimited JSON-RPC over stdin/stdout, and — unlike the Playwright
+// browser — has no HTTP port the webview could reach. So the app owns the
+// child process here and bridges it: the webview sends a JSON-RPC request
+// string through `ocu_mcp_call`, we write it to the child's stdin and read
+// lines off its stdout until the response with the matching id arrives.
+//
+// The pipes must outlive a single call (the MCP session is stateful — one
+// `initialize` handshake, then many `tools/call`s against element indexes
+// from the same session), so the child, its stdin, and a buffered reader
+// over its stdout are kept alive behind a mutex for the process lifetime.
+
+struct OcuProcess {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+static OCU: Mutex<Option<OcuProcess>> = Mutex::new(None);
+
+fn ocu_log_path() -> Option<PathBuf> {
+    chat_ui_base_dir().ok().map(|b| b.join("logs").join("computer-use.log"))
+}
+
+/// True when `open-computer-use` (or its `ocu` alias) resolves on the user's
+/// login-shell PATH.
+fn ocu_exists() -> bool {
+    login_shell_command()
+        .arg("command -v open-computer-use || command -v ocu")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Read JSON-RPC lines from the child until one carries `id == want_id`.
+/// Skips notifications / unrelated ids (e.g. log messages the server emits).
+fn ocu_read_response(
+    stdout: &mut BufReader<std::process::ChildStdout>,
+    want_id: i64,
+) -> Result<serde_json::Value, String> {
+    // Bound the wait so a wedged server can never hang the IPC thread forever.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err("Computer Use timed out waiting for a response".to_string());
+        }
+        let mut line = String::new();
+        let n = stdout
+            .read_line(&mut line)
+            .map_err(|e| format!("Computer Use read failed: {}", e))?;
+        if n == 0 {
+            return Err("Computer Use server closed the connection".to_string());
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            // Non-JSON stdout (startup banner, stray logging) — ignore.
+            continue;
+        };
+        match value.get("id").and_then(|v| v.as_i64()) {
+            Some(id) if id == want_id => return Ok(value),
+            _ => continue, // notification or a different request's response
+        }
+    }
+}
+
+/// Send one JSON-RPC request object and wait for its response.
+fn ocu_request(proc: &mut OcuProcess, request: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let want_id = request.get("id").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let mut line = serde_json::to_string(request).map_err(|e| e.to_string())?;
+    line.push('\n');
+    proc.stdin
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("Computer Use write failed: {}", e))?;
+    proc.stdin.flush().map_err(|e| e.to_string())?;
+    ocu_read_response(&mut proc.stdout, want_id)
+}
+
+/// Send a JSON-RPC notification (no id, no response expected).
+fn ocu_notify(proc: &mut OcuProcess, notification: &serde_json::Value) -> Result<(), String> {
+    let mut line = serde_json::to_string(notification).map_err(|e| e.to_string())?;
+    line.push('\n');
+    proc.stdin
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("Computer Use write failed: {}", e))?;
+    proc.stdin.flush().map_err(|e| e.to_string())
+}
+
+fn kill_tracked_ocu() {
+    if let Some(mut proc) = OCU.lock().unwrap().take() {
+        let _ = proc.child.kill();
+        let _ = proc.child.wait();
+    }
+}
+
+/// Spawn `open-computer-use mcp` and run the MCP `initialize` handshake.
+/// Leaves the live process in the OCU mutex for `ocu_mcp_call`.
+fn spawn_ocu() -> Result<(), String> {
+    if !ocu_exists() {
+        return Err(
+            "open-computer-use was not found — install it with `npm i -g open-computer-use`"
+                .to_string(),
+        );
+    }
+
+    let mut cmd = login_shell_command();
+    // `exec` replaces the shell so the tracked child is the server itself.
+    cmd.arg("exec open-computer-use mcp");
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+
+    // Capture stderr to a log file so spawn / permission failures are
+    // diagnosable without wedging the stdout JSON-RPC stream.
+    if let Some(log) = ocu_log_path() {
+        if let Some(parent) = log.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log) {
+            cmd.stderr(Stdio::from(file));
+        } else {
+            cmd.stderr(Stdio::null());
+        }
+    } else {
+        cmd.stderr(Stdio::null());
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to start Computer Use: {}", e))?;
+    let stdin = child.stdin.take().ok_or("Computer Use stdin unavailable")?;
+    let stdout = child.stdout.take().ok_or("Computer Use stdout unavailable")?;
+    let mut proc = OcuProcess {
+        child,
+        stdin,
+        stdout: BufReader::new(stdout),
+    };
+
+    // MCP handshake: initialize request, then the initialized notification.
+    let init = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "chatui", "version": "0.1.0" }
+        }
+    });
+    let resp = ocu_request(&mut proc, &init)?;
+    if resp.get("error").is_some() {
+        let _ = proc.child.kill();
+        return Err(format!("Computer Use initialize failed: {}", resp["error"]));
+    }
+    ocu_notify(
+        &mut proc,
+        &serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+    )?;
+
+    *OCU.lock().unwrap() = Some(proc);
+    Ok(())
+}
+
+/// Ensure the Computer Use server is running (idempotent). Called before the
+/// webview issues its first tool call.
+#[tauri::command]
+async fn ocu_mcp_start() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        if OCU.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        spawn_ocu()
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn ocu_mcp_stop() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(kill_tracked_ocu)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// True when the open-computer-use CLI is installed on this machine.
+#[tauri::command]
+async fn ocu_installed() -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(ocu_exists)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Install (or update) the open-computer-use CLI globally via npm. Runs in the
+/// user's login shell so homebrew/nvm node is on PATH, same as the other
+/// helper installers.
+#[tauri::command]
+async fn ocu_install() -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let output = login_shell_command()
+            .arg("npm install -g open-computer-use")
+            .output()
+            .map_err(|e| format!("Failed to run npm: {}", e))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let msg = if stderr.trim().is_empty() { stdout } else { stderr };
+            return Err(format!(
+                "Install failed: {}. If npm is missing, install Node.js first.",
+                msg.trim()
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Report Computer Use readiness: whether the CLI is installed and — on
+/// macOS — whether Accessibility and Screen Recording are granted. Runs
+/// `open-computer-use doctor --json` and surfaces its permission flags.
+/// Running `doctor` also makes macOS open its own permission onboarding UI
+/// when something is missing, which is the intended way to prompt the user.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OcuDoctor {
+    /// The CLI resolves on PATH.
+    installed: bool,
+    /// macOS Accessibility permission granted (None when unknown / non-macOS).
+    accessibility: Option<bool>,
+    /// macOS Screen Recording permission granted (None when unknown / non-macOS).
+    screen_recording: Option<bool>,
+    /// True when the CLI is installed and no known permission is still missing.
+    ready: bool,
+    /// Raw doctor output (trimmed) for display when parsing finds nothing.
+    raw: String,
+}
+
+/// Pull a boolean permission flag out of doctor's JSON, tolerating the
+/// several shapes the flag can take (`accessibility: true`, nested under
+/// `permissions`, or `{ granted: true }`).
+fn ocu_doctor_flag(value: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+    for key in keys {
+        // Top-level and under a "permissions" object.
+        for scope in [Some(value), value.get("permissions")].into_iter().flatten() {
+            if let Some(found) = scope.get(*key) {
+                if let Some(b) = found.as_bool() {
+                    return Some(b);
+                }
+                if let Some(b) = found.get("granted").and_then(|g| g.as_bool()) {
+                    return Some(b);
+                }
+                if let Some(s) = found.as_str() {
+                    let s = s.to_ascii_lowercase();
+                    if s == "granted" || s == "authorized" || s == "ok" {
+                        return Some(true);
+                    }
+                    if s == "denied" || s == "missing" || s == "notdetermined" {
+                        return Some(false);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[tauri::command]
+async fn ocu_doctor() -> Result<OcuDoctor, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let installed = ocu_exists();
+        if !installed {
+            return Ok(OcuDoctor {
+                installed: false,
+                accessibility: None,
+                screen_recording: None,
+                ready: false,
+                raw: String::new(),
+            });
+        }
+        let output = login_shell_command()
+            .arg("open-computer-use doctor --json 2>/dev/null || open-computer-use doctor 2>/dev/null")
+            .output()
+            .map_err(|e| format!("Failed to run doctor: {}", e))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let raw = stdout.trim().to_string();
+
+        let (accessibility, screen_recording) = serde_json::from_str::<serde_json::Value>(&raw)
+            .ok()
+            .map(|v| {
+                (
+                    ocu_doctor_flag(&v, &["accessibility", "accessibilityGranted", "a11y"]),
+                    ocu_doctor_flag(
+                        &v,
+                        &["screenRecording", "screen_recording", "screenCapture", "screenRecordingGranted"],
+                    ),
+                )
+            })
+            .unwrap_or((None, None));
+
+        // Ready when installed and no permission we can read is explicitly off.
+        // Unknown (None) permissions don't block — non-macOS or an older doctor
+        // without JSON shouldn't wedge the feature.
+        let ready = installed
+            && accessibility != Some(false)
+            && screen_recording != Some(false);
+
+        Ok(OcuDoctor {
+            installed,
+            accessibility,
+            screen_recording,
+            ready,
+            raw,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Open the macOS System Settings privacy pane for one Computer Use
+/// permission. `pane` is "accessibility" or "screen-recording". macOS cannot
+/// grant these for the user — only the user can toggle the app in the list —
+/// so this deep-links straight to the right pane. Running `ocu_doctor`
+/// (open-computer-use doctor) is what makes the app appear in that list with
+/// its label, ready to toggle.
+#[tauri::command]
+async fn open_privacy_settings(pane: String) -> Result<(), String> {
+    let anchor = match pane.as_str() {
+        "accessibility" => "Privacy_Accessibility",
+        "screen-recording" => "Privacy_ScreenCapture",
+        other => return Err(format!("Unknown privacy pane: {}", other)),
+    };
+    let url = format!("x-apple.systempreferences:com.apple.preference.security?{anchor}");
+    tauri::async_runtime::spawn_blocking(move || {
+        Command::new("open")
+            .arg(&url)
+            .status()
+            .map_err(|e| format!("Failed to open System Settings: {}", e))
+            .and_then(|s| {
+                if s.success() {
+                    Ok(())
+                } else {
+                    Err("System Settings did not open".to_string())
+                }
+            })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Call one MCP method on the running Computer Use server. `method` is e.g.
+/// "tools/list" or "tools/call"; `params` is the JSON-RPC params object. The
+/// server is started on demand if it is not up yet.
+#[tauri::command]
+async fn ocu_mcp_call(
+    method: String,
+    params: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // Start on demand so a call never fails just because start was skipped.
+        if OCU.lock().unwrap().is_none() {
+            spawn_ocu()?;
+        }
+        // Monotonic request ids per process (1 was the initialize handshake).
+        static OCU_REQ_ID: AtomicU64 = AtomicU64::new(2);
+        let id = OCU_REQ_ID.fetch_add(1, Ordering::SeqCst) as i64;
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params.unwrap_or_else(|| serde_json::json!({})),
+        });
+
+        let mut guard = OCU.lock().unwrap();
+        let proc = guard.as_mut().ok_or("Computer Use is not running")?;
+        let resp = ocu_request(proc, &request);
+        // A write/read error means the pipe is dead — drop the process so the
+        // next call respawns a fresh server instead of reusing a broken one.
+        if resp.is_err() {
+            drop(guard);
+            kill_tracked_ocu();
+        }
+        resp
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// `mcp-chrome-<sha256(root)[:7]>` token for one root path — must match
@@ -5206,6 +5597,13 @@ pub fn run() {
             browser_mcp_start,
             browser_mcp_stop,
             browser_login_open,
+            ocu_mcp_start,
+            ocu_mcp_stop,
+            ocu_mcp_call,
+            ocu_installed,
+            ocu_install,
+            ocu_doctor,
+            open_privacy_settings,
             mcp_http_post,
             relaunch_app,
             run_python,
@@ -5246,6 +5644,7 @@ pub fn run() {
             kill_scaffold_child();
             kill_tracked_headroom();
             kill_tracked_browser_mcp();
+            kill_tracked_ocu();
         }
         // macOS: the Dock icon was clicked. If the process is alive but the
         // window was lost (e.g. after a sleep/wake cycle or a stalled quit),
